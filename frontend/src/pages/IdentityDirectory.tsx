@@ -8,6 +8,26 @@ type Result={items:Entry[];limited:boolean};
 type Profile={id:number;name:string;host:string;base_dn:string;bind_dn:string;enabled:boolean};
 type LinkedIdentity={object_guid:string;directory_username:string;directory_enabled:boolean;identity_id:number;username:string;enabled:boolean};
 type IdentitySync={preview:boolean;status:string;identity_id:number;username:string;previous_directory_username?:string;directory_username?:string;previous_directory_enabled?:boolean;directory_enabled?:boolean;changed:boolean;authorization_applied:boolean};
+type BulkSync={preview:boolean;linked:number;observed:number;changed:number;not_observed:number;incompatible:number;directory_disabled:number;directory_host?:string;failover_used:boolean};
+type SyncHistory={action:string;subject:string;actor:string|null;created_at:string};
+function DirectoryOperations({request,profileId}:{request:Request;profileId:number}){
+ const path='identities/directory-profiles/'+profileId;
+ const history=useData<SyncHistory[]>(request,path+'/sync-history');
+ const a=useAction(history.refresh);
+ const [result,setResult]=useState<BulkSync>();
+ const [health,setHealth]=useState<{directory_host?:string;failover_used?:boolean}>();
+ const run=(preview:boolean)=>a.run(async()=>{setResult(undefined);setResult(await request<BulkSync>(path+'/bulk-sync','POST',{preview}))});
+ return <Space direction="vertical" className="full">
+ <Alert type="info" message="Пакетная сверка AD: только метаданные связанных пользователей. Отсутствующие объекты не блокируются автоматически."/>
+ <Space wrap><Button disabled={a.busy} onClick={()=>run(true)}>Предварительная сверка</Button>
+ <Button disabled={a.busy} onClick={()=>a.run(async()=>{setHealth(undefined);setHealth(await request(path+'/test','POST'))})}>Проверить контроллер</Button>
+ {result?.preview&&<Popconfirm title="Обновить метаданные всех связанных пользователей?" onConfirm={()=>run(false)}><Button type="primary" disabled={a.busy}>Применить сверку</Button></Popconfirm>}</Space>
+ {health&&<Alert type="success" message={'LDAPS: '+(health.directory_host??'OK')+(health.failover_used?' (резервный DC)':'')}/>}
+ {result&&<Alert type={result.not_observed?'warning':'info'} message={'Связано: '+result.linked+'; изменений: '+result.changed+'; отсутствует: '+result.not_observed+'; отключено в AD: '+result.directory_disabled+'; несовместимо: '+result.incompatible+'; DC: '+(result.directory_host??'—')}/>}
+ <Fault error={history.error}/>
+ <Table<SyncHistory> rowKey={r=>r.created_at+'-'+r.action+'-'+(r.actor??'')} dataSource={history.data??[]} columns={[{title:'История',dataIndex:'action'},{title:'Инициатор',dataIndex:'actor'},{title:'Время',dataIndex:'created_at'}]}/>
+ </Space>
+}
 function LinkedIdentities({request,profileId}:{request:Request;profileId:number}){
  const path='identities/directory-profiles/'+profileId;
  const d=useData<LinkedIdentity[]>(request,path+'/linked-identities');
@@ -51,6 +71,6 @@ export default function IdentityDirectory({request}:{request:Request}){
  {result?.limited&&<Alert type="warning" message="Выборка ограничена 200 записями."/>}
  <Table<Entry> rowKey="username" dataSource={result?.items??[]} columns={[{title:'Логин',dataIndex:'username'},{title:'ФИО',dataIndex:'full_name'},{title:'Подразделение',dataIndex:'department'},{title:'AD',render:(_,r)=><Tag color={r.directory_enabled?'green':'red'}>{r.directory_enabled?'Активен':'Отключён / неизвестно'}</Tag>},{title:'Unified Identity',render:(_,r)=>r.local_exists?'Существует':r.compatible?'Кандидат':'Несовместимый логин'},{title:'Импорт',render:(_,r)=><Button disabled={a.busy||!profileId||!r.object_guid||!r.compatible||!r.directory_enabled||r.local_exists} onClick={()=>a.run(async()=>{setPlan(undefined);await request(path+'/'+profileId+'/import','POST',{object_guid:r.object_guid,preview:true});setPlan(r)})}>Проверить</Button>}]}/>
  {plan&&profileId&&<><Alert type="warning" message={'Импорт '+plan.username+': запись будет заблокирована и не получит реквизиты или сервисы.'}/><Popconfirm title="Импортировать пользователя AD?" onConfirm={()=>a.run(async()=>{await request(path+'/'+profileId+'/import','POST',{object_guid:plan.object_guid,preview:false});setPlan(undefined);setResult(await request<Result>('identities/directory-preview?profile_id='+profileId))})}><Button type="primary" disabled={a.busy}>Импортировать</Button></Popconfirm></>}
- {profileId&&<><LinkedIdentities key={profileId} request={request} profileId={profileId}/><DirectoryGroups key={profileId} request={request} profileId={profileId}/></>}
+ {profileId&&<><DirectoryOperations key={profileId} request={request} profileId={profileId}/><LinkedIdentities key={profileId} request={request} profileId={profileId}/><DirectoryGroups key={profileId} request={request} profileId={profileId}/></>}
  </Space>
 }
