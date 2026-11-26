@@ -2304,6 +2304,24 @@ def set_identity_pppoe(conn,identity_id,assignment):
         nas_id=excluded.nas_id,rate_limit=excluded.rate_limit,pool=excluded.pool,interim_seconds=excluded.interim_seconds""",
         (identity_id,assignment.nas_id,assignment.rate_limit,assignment.pool,assignment.interim_seconds))
 
+class IdentityHotspotAssignment(BaseModel):
+    nas_id:int=Field(gt=0)
+    rate_limit:str=Field(pattern=r"^[1-9][0-9]{0,5}M/[1-9][0-9]{0,5}M$")
+    session_seconds:int=Field(default=3600,ge=60,le=86400)
+    idle_seconds:int=Field(default=300,ge=60,le=86400)
+
+def set_identity_hotspot(conn,identity_id,assignment):
+    if assignment.idle_seconds>assignment.session_seconds:
+        raise HTTPException(422,"Idle timeout exceeds session timeout")
+    if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(assignment.nas_id,)).fetchone():
+        raise HTTPException(404,"MikroTik NAS not found")
+    if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='hotspot'",(assignment.nas_id,)).fetchone():
+        raise HTTPException(409,"Assign Hotspot service to NAS first")
+    conn.execute("""INSERT INTO zradius_identity_hotspot(identity_id,nas_id,rate_limit,session_seconds,idle_seconds)
+        VALUES (%s,%s,%s,%s,%s) ON CONFLICT(identity_id) DO UPDATE SET
+        nas_id=excluded.nas_id,rate_limit=excluded.rate_limit,session_seconds=excluded.session_seconds,idle_seconds=excluded.idle_seconds""",
+        (identity_id,assignment.nas_id,assignment.rate_limit,assignment.session_seconds,assignment.idle_seconds))
+
 class IdentityCreate(BaseModel):
     username:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
     full_name:str=Field(default="",max_length=200)
@@ -2312,6 +2330,7 @@ class IdentityCreate(BaseModel):
     device:IdentityDeviceAssignment|None=None
     l2tp:L2tpAssignment|None=None
     pppoe:IdentityPppoeAssignment|None=None
+    hotspot:IdentityHotspotAssignment|None=None
 
 @app.get("/api/v1/identities",dependencies=[Depends(auth)])
 def identities(limit:int=100,offset:int=0):
@@ -2321,14 +2340,18 @@ def identities(limit:int=100,offset:int=0):
         return conn.execute("""SELECT i.id,i.username,i.full_name,i.department,i.enabled,
             d.id AS device_id,d.enabled AS device_enabled,v.id AS l2tp_id,v.enabled AS l2tp_enabled,
             (c.identity_id IS NOT NULL) AS credentials_ready,(c.nt_password IS NOT NULL) AS mschap_ready,
-            pp.identity_id IS NOT NULL AS pppoe_assigned,pp.enabled AS pppoe_enabled
+            pp.identity_id IS NOT NULL AS pppoe_assigned,pp.enabled AS pppoe_enabled,
+            hs.identity_id IS NOT NULL AS hotspot_assigned,hs.enabled AS hotspot_enabled
             FROM zradius_identities i LEFT JOIN zradius_identity_credentials c ON c.identity_id=i.id LEFT JOIN zradius_device_users d ON d.identity_id=i.id
             LEFT JOIN zradius_l2tp_users v ON v.identity_id=i.id
             LEFT JOIN zradius_identity_pppoe pp ON pp.identity_id=i.id
+            LEFT JOIN zradius_identity_hotspot hs ON hs.identity_id=i.id
             ORDER BY i.username LIMIT %s OFFSET %s""",(limit,offset)).fetchall()
 
 @app.post("/api/v1/identities",status_code=201,dependencies=[Depends(auth)])
 def create_identity(body:IdentityCreate):
+    if __import__('re').fullmatch(r'hs-[a-f0-9]{20}',body.username):
+        raise HTTPException(422,'Reserved voucher username')
     try:
         nt,digest=ppp_credentials(body.password.get_secret_value())
         address=static_address(body.l2tp.static_ip) if body.l2tp else None
@@ -2363,6 +2386,8 @@ def create_identity(body:IdentityCreate):
                     VALUES (%s,%s,%s,%s,%s,%s::inet,%s,%s)""",(body.username,v.nas_id,v.profile_id,v.group_id,v.address_space_id,address,v.description,row["id"]))
             if body.pppoe:
                 set_identity_pppoe(conn,row["id"],body.pppoe)
+            if body.hotspot:
+                set_identity_hotspot(conn,row['id'],body.hotspot)
             audit(conn,"identity.create",body.username)
             return row
     except UniqueViolation:
@@ -2683,4 +2708,33 @@ def update_identity_pppoe(identity_id:int,body:IdentityPppoeUpdate):
         if body.enabled and not changed:
             raise HTTPException(422,"PPPoE assignment required")
         audit(conn,"identity.pppoe",row["username"])
+    return {"status":"updated"}
+
+
+class IdentityHotspotUpdate(BaseModel):
+    enabled:bool
+    assignment:IdentityHotspotAssignment|None=None
+
+@app.get("/api/v1/identities/{identity_id}/hotspot",dependencies=[Depends(auth)])
+def identity_hotspot(identity_id:int):
+    with db() as conn:
+        return conn.execute("SELECT nas_id,rate_limit,session_seconds,idle_seconds,enabled FROM zradius_identity_hotspot WHERE identity_id=%s",(identity_id,)).fetchone()
+
+@app.put("/api/v1/identities/{identity_id}/hotspot",dependencies=[Depends(auth)])
+def update_identity_hotspot(identity_id:int,body:IdentityHotspotUpdate):
+    with db() as conn:
+        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Identity not found")
+        if body.enabled:
+            if __import__('re').fullmatch(r'hs-[a-f0-9]{20}',row["username"]):
+                raise HTTPException(422,"Reserved voucher username")
+            if not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s",(identity_id,)).fetchone():
+                raise HTTPException(409,"Set unified password first")
+        if body.assignment:
+            set_identity_hotspot(conn,identity_id,body.assignment)
+        changed=conn.execute("UPDATE zradius_identity_hotspot SET enabled=%s WHERE identity_id=%s RETURNING identity_id",(body.enabled,identity_id)).fetchone()
+        if body.enabled and not changed:
+            raise HTTPException(422,"Hotspot assignment required")
+        audit(conn,"identity.hotspot",row["username"])
     return {"status":"updated"}
