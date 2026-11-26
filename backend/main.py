@@ -248,6 +248,9 @@ def create_nas(body: NAS):
 @app.delete("/api/v1/nas/{nas_id}", dependencies=[Depends(auth)])
 def delete_nas(nas_id: int):
     with db() as conn:
+        conn.execute("SELECT id FROM nas WHERE id=%s FOR UPDATE",(nas_id,))
+        if conn.execute("SELECT 1 FROM zradius_ipoe_bindings WHERE nas_id=%s",(nas_id,)).fetchone():
+            raise HTTPException(409,"Remove IPoE bindings first")
         row=conn.execute("DELETE FROM nas WHERE id=%s RETURNING nasname",(nas_id,)).fetchone()
         if not row:
             raise HTTPException(404,"NAS not found")
@@ -439,3 +442,97 @@ def delete_device_role(group: str):
         conn.execute("DELETE FROM zradius_device_roles WHERE groupname=%s",(group,))
         audit(conn,"group.device_role.delete",group)
     return {"status":"deleted"}
+
+# IPoE inventory and policy preview; never accepts unauthenticated NAS requests.
+from ipoe import normalize_mac, normalize_ip
+
+class IpoeBinding(BaseModel):
+    nas_id: int = Field(gt=0)
+    mac: str = Field(max_length=32)
+    static_ip: str | None = Field(default=None,max_length=15)
+    circuit_id: str | None = Field(default=None,min_length=1,max_length=253)
+    remote_id: str | None = Field(default=None,min_length=1,max_length=253)
+    enabled: bool = True
+    description: str = Field(default="",max_length=200)
+
+def binding_values(body):
+    try:
+        mac=normalize_mac(body.mac)
+        ip=normalize_ip(body.static_ip)
+        for value in (body.circuit_id,body.remote_id):
+            if value is not None and (len(value.encode())>253 or any(ord(c)<32 or ord(c)==127 for c in value)):
+                raise ValueError("Invalid circuit or remote identifier")
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
+    return (body.nas_id,mac,ip,body.circuit_id,body.remote_id,body.enabled,body.description)
+
+def require_ipoe_nas(conn,nas_id):
+    if not conn.execute("SELECT id FROM nas WHERE id=%s FOR UPDATE",(nas_id,)).fetchone():
+        raise HTTPException(404,"NAS not found")
+    if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='ipoe'",(nas_id,)).fetchone():
+        raise HTTPException(409,"Assign IPoE service to NAS first")
+
+IPOE_FIELDS="id,nas_id,mac::text AS mac,host(static_ip) AS static_ip,circuit_id,remote_id,enabled,description,created_at"
+
+@app.get("/api/v1/ipoe/bindings", dependencies=[Depends(auth)])
+def ipoe_bindings(limit: int=100, offset: int=0):
+    if not 1<=limit<=500 or offset<0:
+        raise HTTPException(422,"Invalid pagination")
+    with db() as conn:
+        return conn.execute("SELECT "+IPOE_FIELDS+" FROM zradius_ipoe_bindings ORDER BY id DESC LIMIT %s OFFSET %s",(limit,offset)).fetchall()
+
+@app.post("/api/v1/ipoe/bindings",status_code=201,dependencies=[Depends(auth)])
+def create_ipoe_binding(body:IpoeBinding):
+    values=binding_values(body)
+    try:
+        with db() as conn:
+            require_ipoe_nas(conn,body.nas_id)
+            row=conn.execute("INSERT INTO zradius_ipoe_bindings(nas_id,mac,static_ip,circuit_id,remote_id,enabled,description) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING "+IPOE_FIELDS,values).fetchone()
+            audit(conn,"ipoe.create",str(row["id"]))
+    except UniqueViolation:
+        raise HTTPException(409,"Duplicate MAC or IP on NAS")
+    return row
+
+@app.put("/api/v1/ipoe/bindings/{binding_id}",dependencies=[Depends(auth)])
+def update_ipoe_binding(binding_id:int,body:IpoeBinding):
+    values=binding_values(body)
+    try:
+        with db() as conn:
+            require_ipoe_nas(conn,body.nas_id)
+            row=conn.execute("UPDATE zradius_ipoe_bindings SET nas_id=%s,mac=%s,static_ip=%s,circuit_id=%s,remote_id=%s,enabled=%s,description=%s WHERE id=%s RETURNING "+IPOE_FIELDS,(*values,binding_id)).fetchone()
+            if not row:
+                raise HTTPException(404,"Binding not found")
+            audit(conn,"ipoe.update",str(binding_id))
+    except UniqueViolation:
+        raise HTTPException(409,"Duplicate MAC or IP on NAS")
+    return row
+
+@app.delete("/api/v1/ipoe/bindings/{binding_id}",dependencies=[Depends(auth)])
+def delete_ipoe_binding(binding_id:int):
+    with db() as conn:
+        if not conn.execute("DELETE FROM zradius_ipoe_bindings WHERE id=%s RETURNING id",(binding_id,)).fetchone():
+            raise HTTPException(404,"Binding not found")
+        audit(conn,"ipoe.delete",str(binding_id))
+    return {"status":"deleted"}
+
+class IpoePreview(BaseModel):
+    nas_id:int=Field(gt=0)
+    mac:str=Field(max_length=32)
+    circuit_id:str|None=Field(default=None,max_length=253)
+    remote_id:str|None=Field(default=None,max_length=253)
+
+@app.post("/api/v1/ipoe/preview",dependencies=[Depends(auth)])
+def preview_ipoe(body:IpoePreview):
+    try:
+        mac=normalize_mac(body.mac)
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
+    with db() as conn:
+        row=conn.execute("""SELECT b.enabled,host(b.static_ip) AS static_ip,b.circuit_id,b.remote_id
+        FROM zradius_ipoe_bindings b JOIN zradius_nas_services s
+        ON s.nas_id=b.nas_id AND s.service_code='ipoe'
+        WHERE b.nas_id=%s AND b.mac=%s""",(body.nas_id,mac)).fetchone()
+    allowed=bool(row and row["enabled"] and
+        (row["circuit_id"] is None or row["circuit_id"]==body.circuit_id) and
+        (row["remote_id"] is None or row["remote_id"]==body.remote_id))
+    return {"decision":"allow" if allowed else "deny","reply":{"Framed-IP-Address":row["static_ip"]} if allowed and row["static_ip"] else {},"runtime_enforced":False}

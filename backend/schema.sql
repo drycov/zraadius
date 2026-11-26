@@ -95,3 +95,19 @@ CREATE TABLE IF NOT EXISTS zradius_device_roles (
  groupname varchar(64) PRIMARY KEY REFERENCES zradius_groups(name) ON DELETE CASCADE,
  mikrotik_group varchar(64) NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS zradius_ipoe_bindings (
+ id bigserial PRIMARY KEY,
+ nas_id bigint NOT NULL REFERENCES nas(id) ON DELETE RESTRICT,
+ mac macaddr NOT NULL,
+ static_ip inet,
+ circuit_id varchar(253),
+ remote_id varchar(253),
+ enabled boolean NOT NULL DEFAULT true,
+ description varchar(200) NOT NULL DEFAULT '',
+ created_at timestamptz NOT NULL DEFAULT now(),
+ UNIQUE(nas_id,mac),
+ CHECK (static_ip IS NULL OR (family(static_ip)=4 AND masklen(static_ip)=32))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS zradius_ipoe_static_ip_idx
+ ON zradius_ipoe_bindings(nas_id,static_ip) WHERE static_ip IS NOT NULL;
