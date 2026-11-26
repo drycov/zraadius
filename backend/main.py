@@ -2184,3 +2184,48 @@ def apply_ppp_import(body:PppImportRequest):
             return {"profiles":created_profiles,"users_disabled":created_users}
     except UniqueViolation:
         raise HTTPException(409,"Concurrent import conflict; run preview again")
+
+
+from routeros_ppp import generate as generate_routeros_ppp, local_secret_commands
+
+class RouterosPppConfig(BaseModel):
+    nas_id:int=Field(gt=0)
+    radius_ip:IPvAnyAddress
+    api_egress_ip:IPvAnyAddress|None=None
+    interim_seconds:int=Field(default=300,ge=60,le=86400)
+    disconnect:bool=False
+    user_id:int|None=Field(default=None,gt=0)
+
+@app.post("/api/v1/ppp/routeros-config",dependencies=[Depends(auth)])
+def routeros_ppp_config(body:RouterosPppConfig,response:Response):
+    response.headers["Cache-Control"]="no-store"
+    with db() as conn:
+        nas=conn.execute("""SELECT n.id,n.nasname,n.shortname FROM nas n JOIN zradius_nas_services s ON s.nas_id=n.id
+            WHERE n.id=%s AND n.type='mikrotik' AND s.service_code='l2tp'""",(body.nas_id,)).fetchone()
+        if not nas:
+            raise HTTPException(409,"Registered MikroTik NAS with L2TP service required")
+        try:
+            sections=generate_routeros_ppp(str(body.radius_ip),nas["nasname"],str(body.api_egress_ip) if body.api_egress_ip else None,body.interim_seconds,body.disconnect)
+        except ValueError:
+            raise HTTPException(422,"Valid IPv4 endpoints and API egress IP required")
+        user=None
+        if body.user_id is not None:
+            user=conn.execute("SELECT username,enabled FROM zradius_l2tp_users WHERE id=%s AND nas_id=%s",(body.user_id,body.nas_id)).fetchone()
+            if not user:
+                raise HTTPException(404,"VPN user not assigned to NAS")
+            if not user["enabled"]:
+                raise HTTPException(409,"Set password and enable VPN user before generating cutover")
+            try:
+                commands=local_secret_commands(user["username"])
+            except ValueError:
+                raise HTTPException(422,"Unsupported local username")
+            sections.append({"name":"user_cutover","commands":"\n".join(commands.values())})
+        audit(conn,"ppp.routeros.config.generate",str(body.nas_id))
+        return {"nas":nas["shortname"],"sections":sections,"warnings":[
+            "Review commands individually. All changes are commented out; no router connection is performed.",
+            "Replace secret manually using the secure NAS credential source; stored shared secrets are never returned.",
+            "PPP AAA and service=ppp affect other PPP protocols. A realm is not proof of L2TP.",
+            "Keep local secret until test authorization succeeds using a separate test identity. Record previous settings before cutover.",
+            "Disconnect requires actual API egress reachability, COA_ENABLED and COA_ALLOWED_NETWORKS.",
+            "PPP profiles and named pools must already exist on RouterOS. No automatic creation or deletion."
+        ]}
