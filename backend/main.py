@@ -2062,3 +2062,125 @@ def vpn_disconnect_history():
 def vpn_disconnect_capabilities(principal=Depends(auth)):
     return {"enabled":os.environ.get("COA_ENABLED","false").lower()=="true",
             "permitted":principal["role"] in ("admin","operator")}
+
+
+# RouterOS PPP import: read-only preview; explicit atomic commit creates disabled users.
+from ppp_import import parse_export as parse_ppp_export
+from pydantic import ValidationError
+
+class PppImportRequest(BaseModel):
+    export:SecretStr=Field(min_length=1,max_length=262144)
+    nas_id:int=Field(gt=0)
+    address_space_id:int|None=Field(default=None,gt=0)
+
+def plan_ppp_import(conn,body):
+    try:
+        rows=parse_ppp_export(body.export.get_secret_value())
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
+    if not conn.execute("SELECT 1 FROM nas n JOIN zradius_nas_services s ON s.nas_id=n.id WHERE n.id=%s AND n.type='mikrotik' AND s.service_code='l2tp'",(body.nas_id,)).fetchone():
+        raise HTTPException(409,"Assign L2TP service first")
+    if body.address_space_id is not None and not conn.execute("SELECT 1 FROM zradius_vpn_address_spaces WHERE id=%s",(body.address_space_id,)).fetchone():
+        raise HTTPException(404,"Address space not found")
+    profiles={r["name"]:r for r in conn.execute("SELECT id,name,pool FROM zradius_ppp_profiles").fetchall()}
+    seen_profiles=set()
+    seen_users=set()
+    seen_ips=set()
+    for r in rows:
+        if r["kind"]!="profile" or r["issues"]:
+            continue
+        name=r["name"]
+        if name in seen_profiles:
+            r["issues"].append("Duplicate profile in export")
+            continue
+        seen_profiles.add(name)
+        pool=r["remote_address"]
+        # Profile remote-address may be an IP, not a pool; do not guess.
+        if pool:
+            try:
+                import ipaddress
+                ipaddress.ip_address(pool)
+                r["issues"].append("Fixed remote-address in profile requires manual mapping")
+            except ValueError:
+                pass
+        try:
+            PppProfileCreate(name=name,pool=pool,description=r["comment"])
+        except ValidationError:
+            r["issues"].append("Invalid profile name or pool")
+        if name in profiles:
+            if profiles[name]["pool"]!=pool:
+                r["issues"].append("Existing profile pool differs")
+            r["action"]="reuse"
+        elif not r["issues"]:
+            profiles[name]={"id":None,"name":name,"pool":pool}
+            r["action"]="create"
+        if r.get("ignored_fields"):
+            r["warning"]="Other profile properties remain on RouterOS"
+    for r in rows:
+        if r["kind"]!="secret" or r["issues"]:
+            continue
+        name=r["name"]
+        if name in seen_users or conn.execute("SELECT 1 FROM zradius_l2tp_users WHERE username=%s",(name,)).fetchone():
+            r["issues"].append("Duplicate or existing username")
+        seen_users.add(name)
+        profile=profiles.get(r["profile"])
+        if profile is None:
+            r["issues"].append("PPP profile not found")
+            continue
+        try:
+            address=static_address(r["remote_address"])
+        except ValueError:
+            r["issues"].append("Secret remote-address must be static IPv4 or omitted")
+            continue
+        r["static_ip"]=address
+        if address:
+            if address in seen_ips or conn.execute("""SELECT 1 FROM zradius_l2tp_users WHERE (nas_id=%s OR address_space_id=%s)
+                AND static_ip=%s::inet""",(body.nas_id,body.address_space_id,address)).fetchone():
+                r["issues"].append("Duplicate static IPv4")
+            seen_ips.add(address)
+            if conn.execute("""SELECT 1 FROM zradius_vpn_pools WHERE (nas_id=%s OR address_space_id=%s)
+                AND %s::inet BETWEEN first_ip AND last_ip""",(body.nas_id,body.address_space_id,address)).fetchone():
+                r["issues"].append("Static IPv4 overlaps registered pool")
+        elif not profile["pool"]:
+            r["issues"].append("No static IPv4 or profile pool")
+        else:
+            pool=conn.execute("SELECT address_space_id FROM zradius_vpn_pools WHERE nas_id=%s AND name=%s",(body.nas_id,profile["pool"])).fetchone()
+            if pool and pool["address_space_id"]!=body.address_space_id:
+                r["issues"].append("Pool address space differs")
+        r["action"]="create_disabled"
+    return rows
+
+@app.post("/api/v1/ppp/import/preview",dependencies=[Depends(auth)])
+def preview_ppp_import(body:PppImportRequest):
+    with db() as conn:
+        rows=plan_ppp_import(conn,body)
+    return {"rows":rows,"can_apply":not any(r["issues"] for r in rows)}
+
+@app.post("/api/v1/ppp/import/apply",dependencies=[Depends(auth)])
+def apply_ppp_import(body:PppImportRequest):
+    try:
+        with db() as conn:
+            lock_ppp_policy(conn)
+            rows=plan_ppp_import(conn,body)
+            if any(r["issues"] for r in rows):
+                raise HTTPException(409,"Import has conflicts; run preview again")
+            created_profiles=created_users=0
+            for r in rows:
+                if r["kind"]=="profile" and r.get("action")=="create":
+                    conn.execute("INSERT INTO zradius_ppp_profiles(name,pool,description) VALUES (%s,%s,%s)",(r["name"],r["remote_address"],r["comment"]))
+                    created_profiles+=1
+            for r in rows:
+                if r["kind"]!="secret":
+                    continue
+                profile=conn.execute("SELECT id FROM zradius_ppp_profiles WHERE name=%s",(r["profile"],)).fetchone()
+                assignment=L2tpAssignment(nas_id=body.nas_id,address_space_id=body.address_space_id,profile_id=profile["id"],static_ip=r["static_ip"],description=r["comment"])
+                validate_l2tp_assignment(conn,assignment,r["static_ip"])
+                # Random unknown credential, never returned. Explicit password reset required before use.
+                nt,digest=ppp_credentials(secrets.token_urlsafe(48))
+                conn.execute("""INSERT INTO zradius_l2tp_users(username,nt_password,password_hash,nas_id,profile_id,address_space_id,static_ip,description,enabled)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s::inet,%s,false)""",(r["name"],nt,digest,body.nas_id,profile["id"],body.address_space_id,r["static_ip"],r["comment"]))
+                created_users+=1
+            audit(conn,"ppp.import.apply",f"{created_profiles}:{created_users}")
+            return {"profiles":created_profiles,"users_disabled":created_users}
+    except UniqueViolation:
+        raise HTTPException(409,"Concurrent import conflict; run preview again")
