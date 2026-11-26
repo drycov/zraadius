@@ -20,6 +20,7 @@ services:
       PGDATABASE: radius
       PGUSER: radius
       PGPASSWORD: ${POSTGRES_PASSWORD:?required}
+      ZRADIUS_SECRET_KEY: ${ZRADIUS_SECRET_KEY:?required}
       ZRADIUS_API_DB_PASSWORD: ${ZRADIUS_API_DB_PASSWORD:?required}
       ZRADIUS_RUNTIME_DB_PASSWORD: ${ZRADIUS_RUNTIME_DB_PASSWORD:?required}
     depends_on:
@@ -29,6 +30,7 @@ services:
   radius:
     build: ./freeradius
     environment:
+      ZRADIUS_SECRET_KEY: ${ZRADIUS_SECRET_KEY:?required}
       RADIUS_DB_PASSWORD: ${ZRADIUS_RUNTIME_DB_PASSWORD:?required}
       RADIUS_TEST_SECRET: ${RADIUS_TEST_SECRET:?required}
       TZ: UTC
@@ -48,6 +50,7 @@ services:
     environment:
       PGHOST: postgres
       PGDATABASE: radius
+      ZRADIUS_SECRET_KEY: ${ZRADIUS_SECRET_KEY:?required}
       PGUSER: zradius_api
       PGPASSWORD: ${ZRADIUS_API_DB_PASSWORD:?required}
       RADIUS_ENABLE_SQLIPPOOL: ${RADIUS_ENABLE_SQLIPPOOL:-false}

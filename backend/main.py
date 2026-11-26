@@ -12,6 +12,8 @@ from typing import Literal
 from psycopg.errors import UniqueViolation
 from coa import send, destination_allowed
 from schema_version import require_schema
+from secret_crypto import key as secret_key, seal, unseal
+from cryptography.exceptions import InvalidTag
 
 ROOT = Path(__file__).parent
 bearer = HTTPBearer(auto_error=False)
@@ -24,6 +26,7 @@ async def lifespan(app):
     token = os.environ.get("ADMIN_TOKEN", "")
     if len(token) < 32 or token.startswith("replace_with"):
         raise RuntimeError("Set a random ADMIN_TOKEN of at least 32 characters")
+    secret_key()
     with db() as conn:
         require_schema(conn)
     yield
@@ -240,7 +243,7 @@ def create_nas(body: NAS):
     if not secret.isascii() or not secret.isalnum():
         raise HTTPException(422,"Use an alphanumeric random shared secret")
     with db() as conn:
-        row=conn.execute("INSERT INTO nas(nasname,shortname,type,secret,description) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id,nasname,shortname,type,description",(address,body.name,body.vendor,secret,body.description)).fetchone()
+        row=conn.execute("INSERT INTO nas(nasname,shortname,type,secret,description) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id,nasname,shortname,type,description",(address,body.name,body.vendor,seal(secret,'nas:'+address),body.description)).fetchone()
         if not row:
             raise HTTPException(409,"NAS address or name already exists")
         audit(conn,"nas.create",address)
@@ -311,8 +314,8 @@ def session_action(session_id: int, rate: str | None = None):
     except UniqueViolation:
         raise HTTPException(409,"Session already has a pending request")
     try:
-        status=send(row["address"],row["secret"],row["username"],row["acctsessionid"],rate)
-    except (ValueError,TypeError):
+        status=send(row["address"],unseal(row["secret"],"nas:"+row["address"]),row["username"],row["acctsessionid"],rate)
+    except (ValueError,TypeError,InvalidTag):
         status="unknown"
     with db() as conn:
         conn.execute("UPDATE zradius_coa_requests SET status=%s,completed_at=now() WHERE id=%s",(status,request_id))
@@ -1027,7 +1030,7 @@ def create_proxy_realm(body:ProxyRealm):
         raise HTTPException(422,"Invalid realm or shared secret")
     with db() as conn:
         row=conn.execute("""INSERT INTO zradius_proxy_realms(realm,home_ip,secret) VALUES (%s,%s,%s)
-            ON CONFLICT DO NOTHING RETURNING id,realm,host(home_ip) AS home_ip,enabled""",(body.realm,str(ip),body.secret.get_secret_value())).fetchone()
+            ON CONFLICT DO NOTHING RETURNING id,realm,host(home_ip) AS home_ip,enabled""",(body.realm,str(ip),seal(body.secret.get_secret_value(),'zradius_proxy_realms:'+body.realm))).fetchone()
         if not row:
             raise HTTPException(409,"Realm exists")
         audit(conn,"proxy.realm.create",body.realm)
