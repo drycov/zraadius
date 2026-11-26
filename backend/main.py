@@ -348,7 +348,7 @@ class RateChange(BaseModel):
     upload_mbps: int = Field(ge=1,le=100000)
     download_mbps: int = Field(ge=1,le=100000)
 
-def session_action(session_id: int, rate: str | None = None, vpn_only: bool = False):
+def session_action(session_id: int, rate: str | None = None, vpn_only: bool = False, identity_id: int | None = None):
     if os.environ.get("COA_ENABLED","false").lower() != "true":
         raise HTTPException(409,"CoA is disabled")
     action = "coa" if rate else "disconnect"
@@ -357,8 +357,14 @@ def session_action(session_id: int, rate: str | None = None, vpn_only: bool = Fa
             row = conn.execute("""SELECT a.username,a.acctsessionid,host(a.nasipaddress) AS address,n.secret,n.type
               FROM radacct a JOIN nas n ON n.nasname=host(a.nasipaddress)
               WHERE a.radacctid=%s AND a.acctstoptime IS NULL
+                AND (%s::bigint IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=%s AND a.username=i.username AND a.acctstarttime>=i.created_at AND (
+    (a.zradius_service='l2tp' AND EXISTS(SELECT 1 FROM zradius_l2tp_users v WHERE v.identity_id=i.id AND v.nas_id=n.id))
+    OR (a.zradius_service='pppoe' AND EXISTS(SELECT 1 FROM zradius_identity_pppoe p WHERE p.identity_id=i.id AND p.nas_id=n.id))
+    OR (a.zradius_service='hotspot' AND EXISTS(SELECT 1 FROM zradius_identity_hotspot h WHERE h.identity_id=i.id AND h.nas_id=n.id))
+) AND NOT EXISTS(SELECT 1 FROM radcheck r WHERE r.username=i.username)
+                  AND n.type='mikrotik' AND EXISTS(SELECT 1 FROM zradius_nas_services ns WHERE ns.nas_id=n.id AND ns.service_code=a.zradius_service)))
                 AND (NOT %s OR (a.zradius_service='l2tp' AND n.type='mikrotik'
-                  AND EXISTS(SELECT 1 FROM zradius_nas_services s WHERE s.nas_id=n.id AND s.service_code='l2tp')))""",(session_id,vpn_only)).fetchone()
+                  AND EXISTS(SELECT 1 FROM zradius_nas_services s WHERE s.nas_id=n.id AND s.service_code='l2tp')))""",(session_id,identity_id,identity_id,vpn_only)).fetchone()
             if not row:
                 raise HTTPException(404,"Open session with registered NAS not found")
             if rate and row["type"]!="mikrotik":
@@ -2866,3 +2872,64 @@ def update_identity_console(identity_id:int,body:IdentityConsoleUpdate,principal
             conn.execute("INSERT INTO zradius_admin_users(username,password_hash,role,identity_id) VALUES (%s,%s,%s,%s)",(row["username"],hash_password(secrets.token_urlsafe(48)),body.role,identity_id))
         audit(conn,"identity.console",row["username"])
     return {"status":"updated"}
+
+
+@app.get("/api/v1/identities/{identity_id}/sessions")
+def identity_sessions(identity_id:int,limit:int=100,principal=Depends(auth)):
+    if not 1<=limit<=200:
+        raise HTTPException(422,"Invalid limit")
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone():
+            raise HTTPException(404,"Identity not found")
+        network=conn.execute("""SELECT a.radacctid,a.zradius_service AS service,n.shortname,
+            host(a.nasipaddress) AS nasipaddress,host(a.framedipaddress) AS framedipaddress,
+            a.acctstarttime,a.acctupdatetime,
+            a.acctinputoctets::text AS input_bytes,a.acctoutputoctets::text AS output_bytes,
+            CASE WHEN a.acctupdatetime IS NULL THEN 'unknown'
+                 WHEN a.acctupdatetime<now()-interval '15 minutes' THEN 'stale'
+                 ELSE 'reported_open' END AS state,
+            n.type='mikrotik' AND EXISTS(SELECT 1 FROM zradius_nas_services ns WHERE ns.nas_id=n.id AND ns.service_code=a.zradius_service) AS disconnectable,
+            (SELECT c.status FROM zradius_coa_requests c WHERE c.radacctid=a.radacctid AND c.action='disconnect' ORDER BY c.id DESC LIMIT 1) AS disconnect_status
+            FROM radacct a JOIN nas n ON n.nasname=host(a.nasipaddress)
+            JOIN zradius_identities i ON i.id=%s AND a.username=i.username AND a.acctstarttime>=i.created_at AND (
+    (a.zradius_service='l2tp' AND EXISTS(SELECT 1 FROM zradius_l2tp_users v WHERE v.identity_id=i.id AND v.nas_id=n.id))
+    OR (a.zradius_service='pppoe' AND EXISTS(SELECT 1 FROM zradius_identity_pppoe p WHERE p.identity_id=i.id AND p.nas_id=n.id))
+    OR (a.zradius_service='hotspot' AND EXISTS(SELECT 1 FROM zradius_identity_hotspot h WHERE h.identity_id=i.id AND h.nas_id=n.id))
+) AND NOT EXISTS(SELECT 1 FROM radcheck r WHERE r.username=i.username)
+            WHERE a.acctstoptime IS NULL ORDER BY a.radacctid DESC LIMIT %s""",(identity_id,limit+1)).fetchall()
+        web=[]
+        is_admin=principal.get("role")=="admin" and bool(principal.get("id"))
+        if is_admin:
+            web=conn.execute("""SELECT s.session_id,s.created_at,s.expires_at FROM zradius_admin_sessions s
+                JOIN zradius_admin_users u ON u.id=s.user_id WHERE u.identity_id=%s AND s.expires_at>now()
+                ORDER BY s.created_at DESC LIMIT %s""",(identity_id,limit+1)).fetchall()
+        return {"network":network[:limit],"network_more":len(network)>limit,"web":web[:limit],"web_more":len(web)>limit,
+            "web_permitted":is_admin,"disconnect_permitted":principal.get("role")=="admin" and os.getenv("COA_ENABLED","false").lower()=="true"}
+
+@app.post("/api/v1/identities/{identity_id}/sessions/{session_id}/disconnect")
+def disconnect_identity_session(identity_id:int,session_id:int,principal=Depends(auth)):
+    if principal.get("role")!="admin":
+        raise HTTPException(403,"Administrator required")
+    return session_action(session_id,identity_id=identity_id)
+
+@app.delete("/api/v1/identities/{identity_id}/web-sessions/{session_id}")
+def revoke_identity_web_session(identity_id:int,session_id:UUID,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        row=conn.execute("""DELETE FROM zradius_admin_sessions s USING zradius_admin_users u
+            WHERE s.user_id=u.id AND u.identity_id=%s AND s.session_id=%s RETURNING s.session_id""",(identity_id,session_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"Session not found")
+        audit(conn,"identity.web.session.revoke",str(session_id))
+    return {"status":"revoked"}
+
+@app.delete("/api/v1/identities/{identity_id}/web-sessions")
+def revoke_identity_web_sessions(identity_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone():
+            raise HTTPException(404,"Identity not found")
+        count=conn.execute("""DELETE FROM zradius_admin_sessions s USING zradius_admin_users u
+            WHERE s.user_id=u.id AND u.identity_id=%s""",(identity_id,)).rowcount
+        audit(conn,"identity.web.sessions.revoke",str(identity_id))
+    return {"revoked":count}
