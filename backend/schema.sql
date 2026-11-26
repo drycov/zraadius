@@ -39,3 +39,13 @@ CREATE TABLE IF NOT EXISTS radpostauth (
  id bigserial PRIMARY KEY, username text NOT NULL, pass text,
  reply text, authdate timestamptz DEFAULT now(), class text
 );
+
+CREATE TABLE IF NOT EXISTS zradius_disabled_users (
+ username varchar(64) PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS nas (
+ id bigserial PRIMARY KEY, nasname varchar(128) NOT NULL UNIQUE,
+ shortname varchar(64) NOT NULL UNIQUE, type varchar(30) NOT NULL DEFAULT 'other',
+ ports integer, secret varchar(253) NOT NULL, server varchar(64),
+ community varchar(64), description varchar(200)
+);
