@@ -999,6 +999,8 @@ def upsert_eap_user(username:str,body:EapUser):
     if username!=body.username or not re.fullmatch(r"[0-9a-f]{32}",digest):
         raise HTTPException(422,"Invalid identity or NT hash")
     with db() as conn:
+        if conn.execute("SELECT 1 FROM zradius_identities WHERE username=%s",(username,)).fetchone():
+            raise HTTPException(409,"Use unified identity editor")
         conn.execute("""INSERT INTO zradius_eap_users(username,nt_password,vlan_id) VALUES (%s,%s,%s)
             ON CONFLICT(username) DO UPDATE SET nt_password=excluded.nt_password,vlan_id=excluded.vlan_id""",(username,digest,body.vlan_id))
         audit(conn,"eap.user.upsert",username)
@@ -2322,6 +2324,20 @@ def set_identity_hotspot(conn,identity_id,assignment):
         nas_id=excluded.nas_id,rate_limit=excluded.rate_limit,session_seconds=excluded.session_seconds,idle_seconds=excluded.idle_seconds""",
         (identity_id,assignment.nas_id,assignment.rate_limit,assignment.session_seconds,assignment.idle_seconds))
 
+class IdentityEapAssignment(BaseModel):
+    nas_id:int=Field(gt=0)
+    vlan_id:int|None=Field(default=None,ge=1,le=4094)
+
+def set_identity_eap(conn,identity_id,service,assignment):
+    if not conn.execute("SELECT id FROM nas WHERE id=%s FOR UPDATE",(assignment.nas_id,)).fetchone():
+        raise HTTPException(404,"NAS not found")
+    services=conn.execute("SELECT service_code FROM zradius_nas_services WHERE nas_id=%s AND service_code IN ('dot1x','wpa-enterprise')",(assignment.nas_id,)).fetchall()
+    if {r["service_code"] for r in services}!={service}:
+        raise HTTPException(409,"NAS must have exactly the selected EAP service")
+    conn.execute("""INSERT INTO zradius_identity_eap(identity_id,service_code,nas_id,vlan_id)
+        VALUES (%s,%s,%s,%s) ON CONFLICT(identity_id,service_code) DO UPDATE SET nas_id=excluded.nas_id,vlan_id=excluded.vlan_id""",
+        (identity_id,service,assignment.nas_id,assignment.vlan_id))
+
 class IdentityCreate(BaseModel):
     username:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
     full_name:str=Field(default="",max_length=200)
@@ -2331,6 +2347,8 @@ class IdentityCreate(BaseModel):
     l2tp:L2tpAssignment|None=None
     pppoe:IdentityPppoeAssignment|None=None
     hotspot:IdentityHotspotAssignment|None=None
+    dot1x:IdentityEapAssignment|None=None
+    wpa_enterprise:IdentityEapAssignment|None=None
 
 @app.get("/api/v1/identities",dependencies=[Depends(auth)])
 def identities(limit:int=100,offset:int=0):
@@ -2341,11 +2359,15 @@ def identities(limit:int=100,offset:int=0):
             d.id AS device_id,d.enabled AS device_enabled,v.id AS l2tp_id,v.enabled AS l2tp_enabled,
             (c.identity_id IS NOT NULL) AS credentials_ready,(c.nt_password IS NOT NULL) AS mschap_ready,
             pp.identity_id IS NOT NULL AS pppoe_assigned,pp.enabled AS pppoe_enabled,
-            hs.identity_id IS NOT NULL AS hotspot_assigned,hs.enabled AS hotspot_enabled
+            hs.identity_id IS NOT NULL AS hotspot_assigned,hs.enabled AS hotspot_enabled,
+            dx.identity_id IS NOT NULL AS dot1x_assigned,dx.enabled AS dot1x_enabled,
+            we.identity_id IS NOT NULL AS wpa_assigned,we.enabled AS wpa_enabled
             FROM zradius_identities i LEFT JOIN zradius_identity_credentials c ON c.identity_id=i.id LEFT JOIN zradius_device_users d ON d.identity_id=i.id
             LEFT JOIN zradius_l2tp_users v ON v.identity_id=i.id
             LEFT JOIN zradius_identity_pppoe pp ON pp.identity_id=i.id
             LEFT JOIN zradius_identity_hotspot hs ON hs.identity_id=i.id
+            LEFT JOIN zradius_identity_eap dx ON dx.identity_id=i.id AND dx.service_code='dot1x'
+            LEFT JOIN zradius_identity_eap we ON we.identity_id=i.id AND we.service_code='wpa-enterprise'
             ORDER BY i.username LIMIT %s OFFSET %s""",(limit,offset)).fetchall()
 
 @app.post("/api/v1/identities",status_code=201,dependencies=[Depends(auth)])
@@ -2388,6 +2410,9 @@ def create_identity(body:IdentityCreate):
                 set_identity_pppoe(conn,row["id"],body.pppoe)
             if body.hotspot:
                 set_identity_hotspot(conn,row['id'],body.hotspot)
+            for service,assignment in (("dot1x",body.dot1x),("wpa-enterprise",body.wpa_enterprise)):
+                if assignment:
+                    set_identity_eap(conn,row["id"],service,assignment)
             audit(conn,"identity.create",body.username)
             return row
     except UniqueViolation:
@@ -2737,4 +2762,30 @@ def update_identity_hotspot(identity_id:int,body:IdentityHotspotUpdate):
         if body.enabled and not changed:
             raise HTTPException(422,"Hotspot assignment required")
         audit(conn,"identity.hotspot",row["username"])
+    return {"status":"updated"}
+
+
+class IdentityEapUpdate(BaseModel):
+    enabled:bool
+    assignment:IdentityEapAssignment|None=None
+
+@app.get("/api/v1/identities/{identity_id}/eap/{service}",dependencies=[Depends(auth)])
+def identity_eap(identity_id:int,service:Literal["dot1x","wpa-enterprise"]):
+    with db() as conn:
+        return conn.execute("SELECT nas_id,vlan_id,enabled FROM zradius_identity_eap WHERE identity_id=%s AND service_code=%s",(identity_id,service)).fetchone()
+
+@app.put("/api/v1/identities/{identity_id}/eap/{service}",dependencies=[Depends(auth)])
+def update_identity_eap(identity_id:int,service:Literal["dot1x","wpa-enterprise"],body:IdentityEapUpdate):
+    with db() as conn:
+        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Identity not found")
+        if body.enabled and not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s AND nt_password IS NOT NULL",(identity_id,)).fetchone():
+            raise HTTPException(409,"Reset unified password first")
+        if body.assignment:
+            set_identity_eap(conn,identity_id,service,body.assignment)
+        changed=conn.execute("UPDATE zradius_identity_eap SET enabled=%s WHERE identity_id=%s AND service_code=%s RETURNING identity_id",(body.enabled,identity_id,service)).fetchone()
+        if body.enabled and not changed:
+            raise HTTPException(422,"EAP assignment required")
+        audit(conn,"identity.eap."+service,row["username"])
     return {"status":"updated"}
