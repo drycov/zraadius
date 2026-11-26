@@ -24,10 +24,13 @@ server zradius {
     reject
    }
    update control {
-    SSHA512-Password := "%{sql:SELECT u.password_hash FROM zradius_device_users u JOIN zradius_device_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+    Tmp-String-0 := "%{sql:SELECT u.password_hash FROM zradius_device_users u JOIN zradius_device_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
    }
-   if (!&control:SSHA512-Password || &control:SSHA512-Password == "") {
+   if (!&control:Tmp-String-0 || &control:Tmp-String-0 !~ /^[A-Za-z0-9+\/]{107}=$/) {
     reject
+   }
+   update control {
+    Password-With-Header := "{ssha512}%{control:Tmp-String-0}"
    }
    pap
   }
@@ -36,10 +39,13 @@ server zradius {
     reject
    }
    update control {
-    SSHA512-Password := "%{sql:SELECT v.password_hash FROM zradius_hotspot_vouchers v JOIN nas n ON n.id=v.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='hotspot' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND v.username='%{User-Name}' AND v.enabled AND v.expires_at>now()}"
+    Tmp-String-0 := "%{sql:SELECT v.password_hash FROM zradius_hotspot_vouchers v JOIN nas n ON n.id=v.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='hotspot' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND v.username='%{User-Name}' AND v.enabled AND v.expires_at>now()}"
    }
-   if (!&control:SSHA512-Password || &control:SSHA512-Password == "") {
+   if (!&control:Tmp-String-0 || &control:Tmp-String-0 !~ /^[A-Za-z0-9+\/]{107}=$/) {
     reject
+   }
+   update control {
+    Password-With-Header := "{ssha512}%{control:Tmp-String-0}"
    }
    pap
   }
