@@ -1,5 +1,21 @@
 #!/bin/sh
 set -eu
+# Reset package defaults on every startup, including reused containers.
+conf=/etc/freeradius/3.0
+umask 027
+rm -f "$conf/mods-enabled/eap" "$conf/mods-enabled/sqlippool"
+rm -f "$conf/sites-enabled/"*
+ln -s ../sites-available/zradius "$conf/sites-enabled/zradius"
+ln -sf ../mods-available/sql "$conf/mods-enabled/sql"
+grep -Eq '^[[:space:]]*client_table[[:space:]]*=[[:space:]]*"nas"' "$conf/mods-available/sql" || { echo 'ZRADIUS: SQL client_table missing; rebuild image' >&2; exit 1; }
+for flag in RADIUS_ENABLE_NAS RADIUS_ENABLE_SQLIPPOOL RADIUS_ENABLE_EAP RADIUS_ENABLE_EAP_TLS RADIUS_ENABLE_PROXY; do
+  value=$(printenv "$flag" || true)
+  case "$value" in true|false|"") ;; *) echo "Invalid boolean: $flag" >&2; exit 1;; esac
+done
+if [ "${RADIUS_ENABLE_EAP_TLS:-false}" = true ] && [ "${RADIUS_ENABLE_EAP:-false}" != true ]; then
+  echo 'ZRADIUS: EAP-TLS requires EAP' >&2; exit 1
+fi
+printf 'ZRADIUS startup: NAS=%s SQLIPPOOL=%s EAP=%s EAP_TLS=%s PROXY=%s\n' "${RADIUS_ENABLE_NAS:-false}" "${RADIUS_ENABLE_SQLIPPOOL:-false}" "${RADIUS_ENABLE_EAP:-false}" "${RADIUS_ENABLE_EAP_TLS:-false}" "${RADIUS_ENABLE_PROXY:-false}"
 case "${RADIUS_TEST_SECRET:-}" in
   ""|replace_with*|*[!a-zA-Z0-9]*) echo "Set a random alphanumeric RADIUS_TEST_SECRET" >&2; exit 1;;
 esac
@@ -74,6 +90,24 @@ if [ "${RADIUS_ENABLE_PROXY:-false}" = true ]; then
   sed '/# ZRADIUS_PROXY_AUTHORIZE/r /etc/freeradius/3.0/zradius-proxy-policy' /tmp/zradius-proxy-site | sed '/# ZRADIUS_PROXY_ACCOUNTING/r /etc/freeradius/3.0/zradius-proxy-accounting' > /etc/freeradius/3.0/sites-available/zradius-proxy-runtime
   ln -sf ../sites-available/zradius-proxy-runtime /etc/freeradius/3.0/sites-enabled/zradius
 fi
+# Verify the actual linked configuration before invoking FreeRADIUS.
+if [ "${RADIUS_ENABLE_EAP:-false}" = true ]; then
+  test -L "$conf/mods-enabled/eap"
+  grep -Eq '^[[:space:]]*Auth-Type EAP[[:space:]]*\{' "$conf/sites-enabled/zradius" || { echo 'ZRADIUS: missing outer Auth-Type EAP' >&2; exit 1; }
+  test -L "$conf/sites-enabled/zradius-inner-tunnel"
+else
+  test ! -e "$conf/mods-enabled/eap"
+  test ! -L "$conf/mods-enabled/eap"
+fi
+chgrp freerad "$conf/clients.conf" "$conf/proxy.conf"
+chmod 640 "$conf/clients.conf" "$conf/proxy.conf"
+for f in "$conf/sites-available"/zradius-*-runtime "$conf/mods-available"/zradius-eap-tls-runtime; do
+  [ -f "$f" ] || continue
+  chgrp freerad "$f"
+  chmod 640 "$f"
+done
 unset PGPASSWORD ZRADIUS_SECRET_KEY
+echo 'ZRADIUS: validating configuration'
 freeradius -C
+echo 'ZRADIUS: configuration validation complete'
 exec freeradius -f -l stdout

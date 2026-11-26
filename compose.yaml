@@ -44,6 +44,12 @@ services:
     ports:
       - "${RADIUS_BIND_IP:-127.0.0.1}:1812:1812/udp"
       - "${RADIUS_BIND_IP:-127.0.0.1}:1813:1813/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "printf 'User-Name = zradius-healthcheck-invalid\\nUser-Password = invalid\\nMessage-Authenticator = 0x00\\n' | radclient -r 1 -t 2 127.0.0.1:1812 auth \"$RADIUS_TEST_SECRET\" 2>&1 | grep -q 'Access-Reject'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 150s
     restart: unless-stopped
   api:
     build: ./backend
