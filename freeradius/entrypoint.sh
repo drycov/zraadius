@@ -49,7 +49,7 @@ wait_schema() {
     sleep 2
   done
 }
-wait_schema "SELECT NOT EXISTS (SELECT 1 FROM unnest(ARRAY['radcheck','radreply','radgroupcheck','radgroupreply','radusergroup','radacct','radpostauth','nas','nasreload','zradius_device_auth_log','zradius_hotspot_vouchers','zradius_ipoe_bindings','zradius_nas_services','zradius_device_users','zradius_device_grants','zradius_device_user_members','zradius_device_group_grants','zradius_device_effective_grants','zradius_nas_group_members','zradius_nas_group_networks','zradius_device_nas_group_grants','zradius_nas_group_effective_members','zradius_ppp_profiles','zradius_l2tp_users']) AS t(name) WHERE to_regclass('public.'||name) IS NULL OR NOT COALESCE(has_table_privilege(current_user,to_regclass('public.'||name),'SELECT'),false))"
+wait_schema "SELECT NOT EXISTS (SELECT 1 FROM unnest(ARRAY['radcheck','radreply','radgroupcheck','radgroupreply','radusergroup','radacct','radpostauth','nas','nasreload','zradius_device_auth_log','zradius_hotspot_vouchers','zradius_ipoe_bindings','zradius_nas_services','zradius_device_users','zradius_device_grants','zradius_device_user_members','zradius_device_group_grants','zradius_device_effective_grants','zradius_nas_group_members','zradius_nas_group_networks','zradius_device_nas_group_grants','zradius_nas_group_effective_members','zradius_ppp_profiles','zradius_l2tp_users','zradius_vpn_groups','zradius_l2tp_effective_profiles']) AS t(name) WHERE to_regclass('public.'||name) IS NULL OR NOT COALESCE(has_table_privilege(current_user,to_regclass('public.'||name),'SELECT'),false))"
 
 if [ "${RADIUS_ENABLE_NAS:-false}" = true ]; then
   umask 027

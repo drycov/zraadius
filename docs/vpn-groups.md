@@ -1,0 +1,2 @@
+# VPN groups
+Migration 0014 preserves existing direct profiles and introduces optional single VPN group per user. Effective profile is individual override or group default. NAS binding and per-NAS unique static IPv4 remain unchanged. Assignments can be edited without password reset. Shared advisory lock serializes edits and prevents removal of required pools. RouterOS profile names remain immutable references. No cross-NAS IPAM checks or active session termination. Deploy API, web and radius together. Build and runtime tests pending.

@@ -1695,13 +1695,38 @@ class PppProfileCreate(BaseModel):
     interim_seconds:int=Field(default=300,ge=60,le=86400)
     description:str=Field(default="",max_length=200)
 
-class L2tpUserCreate(BaseModel):
-    username:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.@-]+$")
-    password:SecretStr=Field(min_length=16,max_length=128)
+class L2tpAssignment(BaseModel):
     nas_id:int=Field(gt=0)
-    profile_id:int=Field(gt=0)
+    profile_id:int|None=Field(default=None,gt=0)
+    group_id:int|None=Field(default=None,gt=0)
     static_ip:str|None=Field(default=None,max_length=15)
     description:str=Field(default="",max_length=200)
+
+class L2tpUserCreate(L2tpAssignment):
+    username:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.@-]+$")
+    password:SecretStr=Field(min_length=16,max_length=128)
+
+def lock_ppp_policy(conn):
+    conn.execute("SELECT pg_advisory_xact_lock(7281192214)")
+
+def validate_l2tp_assignment(conn,body,address):
+    if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(body.nas_id,)).fetchone():
+        raise HTTPException(404,"MikroTik NAS not found")
+    if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='l2tp'",(body.nas_id,)).fetchone():
+        raise HTTPException(409,"Assign L2TP service first")
+    group=None
+    if body.group_id is not None:
+        group=conn.execute("SELECT profile_id FROM zradius_vpn_groups WHERE id=%s",(body.group_id,)).fetchone()
+        if not group:
+            raise HTTPException(404,"VPN group not found")
+    profile_id=body.profile_id or (group["profile_id"] if group else None)
+    if profile_id is None:
+        raise HTTPException(422,"Choose a profile or VPN group")
+    profile=conn.execute("SELECT pool FROM zradius_ppp_profiles WHERE id=%s",(profile_id,)).fetchone()
+    if not profile:
+        raise HTTPException(404,"PPP profile not found")
+    if address is None and not profile["pool"]:
+        raise HTTPException(422,"Static IPv4 or named NAS pool required")
 
 @app.get("/api/v1/ppp/profiles",dependencies=[Depends(auth)])
 def ppp_profiles():
@@ -1724,9 +1749,11 @@ def l2tp_users(limit:int=100,offset:int=0):
     if not 1<=limit<=500 or offset<0:
         raise HTTPException(422,"Invalid pagination")
     with db() as conn:
-        return conn.execute("""SELECT u.id,u.username,u.enabled,u.nas_id,n.shortname AS nas,u.profile_id,p.name AS profile,
+        return conn.execute("""SELECT u.id,u.username,u.enabled,u.nas_id,n.shortname AS nas,u.profile_id,u.group_id,g.name AS vpn_group,p.name AS profile,
+            CASE WHEN u.profile_id IS NULL THEN 'group' ELSE 'direct' END AS profile_source,
             host(u.static_ip) AS static_ip,p.pool,u.description FROM zradius_l2tp_users u
-            JOIN nas n ON n.id=u.nas_id JOIN zradius_ppp_profiles p ON p.id=u.profile_id
+            JOIN nas n ON n.id=u.nas_id JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id
+            LEFT JOIN zradius_vpn_groups g ON g.id=u.group_id
             ORDER BY u.username LIMIT %s OFFSET %s""",(limit,offset)).fetchall()
 
 @app.post("/api/v1/ppp/l2tp/users",status_code=201,dependencies=[Depends(auth)])
@@ -1738,18 +1765,11 @@ def create_l2tp_user(body:L2tpUserCreate):
         raise HTTPException(422,"Invalid password encoding/length or static IPv4")
     try:
         with db() as conn:
-            if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(body.nas_id,)).fetchone():
-                raise HTTPException(404,"MikroTik NAS not found")
-            if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='l2tp'",(body.nas_id,)).fetchone():
-                raise HTTPException(409,"Assign L2TP service first")
-            profile=conn.execute("SELECT id,pool FROM zradius_ppp_profiles WHERE id=%s",(body.profile_id,)).fetchone()
-            if not profile:
-                raise HTTPException(404,"PPP profile not found")
-            if address is None and not profile["pool"]:
-                raise HTTPException(422,"Static IPv4 or named NAS pool required")
-            row=conn.execute("""INSERT INTO zradius_l2tp_users(username,nt_password,password_hash,nas_id,profile_id,static_ip,description)
-                VALUES (%s,%s,%s,%s,%s,%s::inet,%s) RETURNING id,username,enabled""",
-                (body.username,nt,digest,body.nas_id,body.profile_id,address,body.description)).fetchone()
+            lock_ppp_policy(conn)
+            validate_l2tp_assignment(conn,body,address)
+            row=conn.execute("""INSERT INTO zradius_l2tp_users(username,nt_password,password_hash,nas_id,profile_id,group_id,static_ip,description)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::inet,%s) RETURNING id,username,enabled""",
+                (body.username,nt,digest,body.nas_id,body.profile_id,body.group_id,address,body.description)).fetchone()
             audit(conn,"ppp.l2tp.create",body.username)
             return row
     except UniqueViolation:
@@ -1779,3 +1799,91 @@ def l2tp_password(user_id:int,body:PppPassword):
             raise HTTPException(404,"L2TP user not found")
         audit(conn,"ppp.l2tp.password",row["username"])
     return {"status":"updated"}
+
+
+class VpnGroupCreate(BaseModel):
+    name:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    description:str=Field(default="",max_length=200)
+    profile_id:int=Field(gt=0)
+
+@app.get("/api/v1/ppp/groups",dependencies=[Depends(auth)])
+def vpn_groups():
+    with db() as conn:
+        return conn.execute("""SELECT g.id,g.name,g.description,g.profile_id,p.name AS profile,
+            (SELECT count(*) FROM zradius_l2tp_users u WHERE u.group_id=g.id) AS members
+            FROM zradius_vpn_groups g JOIN zradius_ppp_profiles p ON p.id=g.profile_id ORDER BY g.name""").fetchall()
+
+@app.post("/api/v1/ppp/groups",status_code=201,dependencies=[Depends(auth)])
+def create_vpn_group(body:VpnGroupCreate):
+    with db() as conn:
+        lock_ppp_policy(conn)
+        if not conn.execute("SELECT id FROM zradius_ppp_profiles WHERE id=%s",(body.profile_id,)).fetchone():
+            raise HTTPException(404,"PPP profile not found")
+        row=conn.execute("INSERT INTO zradius_vpn_groups(name,description,profile_id) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id,name",(body.name,body.description,body.profile_id)).fetchone()
+        if not row:
+            raise HTTPException(409,"VPN group exists")
+        audit(conn,"ppp.group.create",body.name)
+        return row
+
+@app.put("/api/v1/ppp/groups/{group_id}",dependencies=[Depends(auth)])
+def update_vpn_group(group_id:int,body:VpnGroupCreate):
+    try:
+        with db() as conn:
+            lock_ppp_policy(conn)
+            profile=conn.execute("SELECT pool FROM zradius_ppp_profiles WHERE id=%s",(body.profile_id,)).fetchone()
+            if not profile:
+                raise HTTPException(404,"PPP profile not found")
+            if not profile["pool"] and conn.execute("SELECT 1 FROM zradius_l2tp_users WHERE group_id=%s AND profile_id IS NULL AND static_ip IS NULL LIMIT 1",(group_id,)).fetchone():
+                raise HTTPException(409,"Inherited users require a dynamic pool")
+            row=conn.execute("UPDATE zradius_vpn_groups SET name=%s,description=%s,profile_id=%s WHERE id=%s RETURNING id",(body.name,body.description,body.profile_id,group_id)).fetchone()
+            if not row:
+                raise HTTPException(404,"VPN group not found")
+            audit(conn,"ppp.group.update",str(group_id))
+            return row
+    except UniqueViolation:
+        raise HTTPException(409,"VPN group name exists")
+
+@app.get("/api/v1/ppp/groups/{group_id}/members",dependencies=[Depends(auth)])
+def vpn_group_members(group_id:int,limit:int=100,offset:int=0):
+    if not 1<=limit<=500 or offset<0:
+        raise HTTPException(422,"Invalid pagination")
+    with db() as conn:
+        return conn.execute("""SELECT u.id,u.username,u.enabled,n.shortname AS nas,p.name AS profile,host(u.static_ip) AS static_ip
+            FROM zradius_l2tp_users u JOIN nas n ON n.id=u.nas_id
+            JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id WHERE u.group_id=%s
+            ORDER BY u.username LIMIT %s OFFSET %s""",(group_id,limit,offset)).fetchall()
+
+@app.put("/api/v1/ppp/profiles/{profile_id}",dependencies=[Depends(auth)])
+def update_ppp_profile(profile_id:int,body:PppProfileCreate):
+    with db() as conn:
+        lock_ppp_policy(conn)
+        current=conn.execute("SELECT name FROM zradius_ppp_profiles WHERE id=%s",(profile_id,)).fetchone()
+        if not current:
+            raise HTTPException(404,"PPP profile not found")
+        if body.name!=current["name"]:
+            raise HTTPException(422,"RouterOS profile name is immutable; create a new profile")
+        if not body.pool and conn.execute("""SELECT 1 FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id
+            WHERE p.profile_id=%s AND u.static_ip IS NULL LIMIT 1""",(profile_id,)).fetchone():
+            raise HTTPException(409,"Assigned users require a dynamic pool")
+        conn.execute("UPDATE zradius_ppp_profiles SET pool=%s,interim_seconds=%s,description=%s WHERE id=%s",(body.pool,body.interim_seconds,body.description,profile_id))
+        audit(conn,"ppp.profile.update",str(profile_id))
+        return {"id":profile_id}
+
+@app.put("/api/v1/ppp/l2tp/users/{user_id}/assignment",dependencies=[Depends(auth)])
+def update_l2tp_assignment(user_id:int,body:L2tpAssignment):
+    try:
+        address=static_address(body.static_ip)
+    except ValueError:
+        raise HTTPException(422,"Invalid static IPv4")
+    try:
+        with db() as conn:
+            lock_ppp_policy(conn)
+            validate_l2tp_assignment(conn,body,address)
+            row=conn.execute("""UPDATE zradius_l2tp_users SET nas_id=%s,profile_id=%s,group_id=%s,static_ip=%s::inet,description=%s
+                WHERE id=%s RETURNING id,username""",(body.nas_id,body.profile_id,body.group_id,address,body.description,user_id)).fetchone()
+            if not row:
+                raise HTTPException(404,"L2TP user not found")
+            audit(conn,"ppp.l2tp.assignment",row["username"])
+            return row
+    except UniqueViolation:
+        raise HTTPException(409,"Static IP on NAS already assigned")

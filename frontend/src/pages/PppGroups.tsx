@@ -1,0 +1,15 @@
+import {useState} from 'react';
+import {Alert,Button,Form,Input,Select,Space,Table} from '../ui';
+import Disclosure,{GroupList} from '../ui/Disclosure';
+import {useData,useAction,Fault} from '../hooks';
+import type {Request} from '../api';
+export type VpnGroup={id:number;name:string;description:string;profile_id:number;profile:string;members:number};
+type Profile={id:number;name:string};
+function Details({request,group,profiles,refresh}:{request:Request;group:VpnGroup;profiles:Profile[];refresh:()=>void}){
+ const [offset,setOffset]=useState(0);const d=useData<{id:number;username:string;nas:string;profile:string;static_ip:string|null}[]>(request,'ppp/groups/'+group.id+'/members?limit=100&offset='+offset);const a=useAction(()=>{d.refresh();refresh()});const [form]=Form.useForm();
+ return <Space direction="vertical"><Fault error={d.error}/><Alert type="warning" message="Изменение группового профиля влияет на новые подключения участников без индивидуального профиля."/><Form form={form} layout="inline" initialValues={{name:group.name,description:group.description,profile_id:group.profile_id}} onFinish={v=>a.run(()=>request('ppp/groups/'+group.id,'PUT',v))}><Form.Item name="name" label="Имя" rules={[{required:true}]}><Input/></Form.Item><Form.Item name="description" label="Описание"><Input/></Form.Item><Form.Item name="profile_id" label="PPP Profile" rules={[{required:true}]}><Select options={profiles.map(p=>({value:p.id,label:p.name}))}/></Form.Item><Button type="primary" htmlType="submit" loading={a.busy}>Сохранить группу</Button></Form><Table rowKey="id" dataSource={d.data??[]} loading={d.loading} columns={[{title:'Username',dataIndex:'username'},{title:'NAS',dataIndex:'nas'},{title:'Profile',dataIndex:'profile'},{title:'IPv4',dataIndex:'static_ip'}]}/><Space><Button disabled={!offset||d.loading} onClick={()=>setOffset(v=>Math.max(0,v-100))}>Назад</Button><Button disabled={d.loading||(d.data?.length??0)<100} onClick={()=>setOffset(v=>v+100)}>Далее</Button></Space></Space>
+}
+export default function PppGroups({request,groups,profiles,loading,refresh}:{request:Request;groups:VpnGroup[];profiles:Profile[];loading:boolean;refresh:()=>void}){
+ const [form]=Form.useForm();const a=useAction(refresh);
+ return <Disclosure title="VPN Groups" meta={String(groups.length)}><Form form={form} layout="inline" onFinish={v=>a.run(()=>request('ppp/groups','POST',v),()=>form.resetFields())}><Form.Item name="name" label="Группа" rules={[{required:true}]}><Input placeholder="OFFICES"/></Form.Item><Form.Item name="description" label="Описание"><Input/></Form.Item><Form.Item name="profile_id" label="PPP Profile" rules={[{required:true}]}><Select options={profiles.map(p=>({value:p.id,label:p.name}))}/></Form.Item><Button type="primary" htmlType="submit" loading={a.busy}>Создать группу</Button></Form><GroupList items={groups.map(g=>({...g,description:g.description+' · '+g.profile+' · '+g.members+' уч.'}))} loading={loading} render={g=><Details key={g.id} request={request} group={groups.find(x=>x.id===g.id)!} profiles={profiles} refresh={refresh}/>}/></Disclosure>
+}
