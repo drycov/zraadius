@@ -2638,6 +2638,7 @@ class DirectoryRevoke(BaseModel):
     object_guid:UUID
     preview:bool=True
     confirm:bool=False
+    disconnect_sessions:bool=False
     model_config={"extra":"forbid"}
 
 @app.post("/api/v1/identities/directory-profiles/{profile_id}/revoke-disabled")
@@ -2672,7 +2673,29 @@ def directory_revoke_disabled(profile_id:int,body:DirectoryRevoke,principal=Depe
             conn.execute("UPDATE zradius_identities SET enabled=false,updated_at=now() WHERE id=%s",(row["id"],))
             conn.execute("UPDATE zradius_directory_identities SET directory_enabled=false WHERE identity_id=%s",(row["id"],))
             audit(conn,"directory.identity.revoke",str(row["id"]))
-        return {"preview":body.preview,"identity_id":row["id"],"username":row["username"],"previous_enabled":row["enabled"],"network_disconnected":False}
+        response={"preview":body.preview,"identity_id":row["id"],"username":row["username"],"previous_enabled":row["enabled"],"network_disconnected":False}
+    if not body.preview and body.disconnect_sessions:
+        # The database block is committed before any external NAS request.
+        if os.getenv("COA_ENABLED","false").lower()!="true":
+            return {**response,"disconnect_status":"disabled","disconnect_results":[]}
+        try:
+            sessions=identity_sessions(row["id"],limit=100,principal=principal)
+        except Exception:
+            return {**response,"disconnect_status":"inventory_failed","disconnect_results":[]}
+        results=[]
+        for session in sessions["network"]:
+            if not session["disconnectable"]:
+                continue
+            sid=session["radacctid"]
+            try:
+                result=session_action(sid,identity_id=row["id"])
+                results.append({"session_id":sid,"status":result["status"]})
+            except HTTPException as exc:
+                results.append({"session_id":sid,"status":"rejected","http_status":exc.status_code})
+            except Exception:
+                results.append({"session_id":sid,"status":"unknown"})
+        return {**response,"disconnect_status":"attempted","disconnect_results":results,"network_more":sessions["network_more"]}
+    return response
 
 @app.get("/api/v1/identities/directory-profiles/{profile_id}/groups")
 def directory_groups(profile_id:int,principal=Depends(auth)):
