@@ -8,7 +8,7 @@ test('login, navigation and NAS creation with numeric/string payload preservatio
  return route.fulfill({json:[]})});
  await page.goto('/');await page.getByLabel('Логин').fill('admin');await page.getByLabel('Пароль').fill('test-password');await page.getByRole('button',{name:'Войти'}).click();
  await expect(page.getByRole('heading',{name:'Dashboard'})).toBeVisible();
- await page.getByRole('button',{name:'NAS',exact:true}).click();await expect(page).toHaveURL(/#\/nas$/);
+ await page.getByRole('button',{name:'Сетевая инфраструктура',exact:true}).click();await page.getByRole('button',{name:'NAS',exact:true}).click();await expect(page).toHaveURL(/#\/nas$/);
  await page.getByLabel('IP',{exact:true}).fill('192.0.2.10');await page.getByLabel('Имя',{exact:true}).fill('BNG-01');await page.getByLabel('Shared Secret').fill('a'.repeat(32));await page.getByRole('button',{name:'Добавить',exact:true}).click();
  await expect.poll(()=>created).toMatchObject({address:'192.0.2.10',name:'BNG-01',vendor:'mikrotik'});
  await page.goBack();await expect(page.getByRole('heading',{name:'Dashboard'})).toBeVisible();
@@ -48,4 +48,26 @@ test('subscriber groups expand inline, load on demand and filter',async({page})=
  await second.click();await expect(first).toHaveAttribute('aria-expanded','false');await expect(second).toHaveAttribute('aria-expanded','true');
  await second.click();await expect(second).toHaveAttribute('aria-expanded','false');
  await page.getByRole('searchbox',{name:'Поиск групп'}).fill('500M');await expect(first).toHaveCount(0);await expect(second).toBeVisible();
+});
+
+test('sidebar groups collapse, expand active route and keep IAM restricted',async({page})=>{
+ await page.route('**/api/v1/**',async route=>{
+  const path=new URL(route.request().url()).pathname;
+  if(path.endsWith('/iam/login'))return route.fulfill({json:{access_token:'test-session',username:'operator',role:'operator'}});
+  if(path.endsWith('/dashboard'))return route.fulfill({json:{users:1,nas:0,groups:0,disabled_users:0,open_sessions:0,accounting_records:0,audit_24h:0}});
+  return route.fulfill({json:[]});
+ });
+ await page.goto('/#/nas');await page.getByLabel('Логин').fill('operator');await page.getByLabel('Пароль').fill('test-password');await page.getByRole('button',{name:'Войти'}).click();
+ const network=page.getByRole('button',{name:'Сетевая инфраструктура',exact:true});
+ const admin=page.getByRole('button',{name:'Администрирование',exact:true});
+ const nas=page.getByRole('button',{name:'NAS',exact:true});
+ await expect(network).toHaveAttribute('aria-expanded','true');
+ await expect(nas).toHaveAttribute('aria-current','page');
+ await network.click();await expect(nas).toBeHidden();
+ await network.click();await expect(nas).toBeVisible();
+ await admin.click();await expect(page.getByRole('button',{name:'Моя учётная запись'})).toBeVisible();
+ await expect(page.getByRole('button',{name:'Администраторы / IAM'})).toHaveCount(0);
+ await page.getByRole('button',{name:'Dashboard',exact:true}).click();
+ await expect(page).toHaveURL(/#\/overview$/);
+ await page.goBack();await expect(nas).toHaveAttribute('aria-current','page');
 });

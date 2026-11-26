@@ -20,3 +20,28 @@
 .zr-disclosure-panel:not([hidden]){display:grid;gap:12px;padding:16px;border-top:1px solid var(--tg-border);min-width:0}
 @media(max-width:600px){.zr-disclosure-trigger{padding:12px;gap:8px}.zr-disclosure-panel:not([hidden]){padding:10px}.zr-disclosure-symbol{flex-basis:30px;height:30px}.zr-group-toolbar{gap:8px}}
 @media(prefers-reduced-motion:reduce){.zr-disclosure-chevron{transition:none}}
+
+/* Sidebar navigation groups use the existing design-kit palette. */
+.zr-sidebar-menu{display:flex;flex:1;flex-direction:column;min-height:0;min-width:0;overflow:hidden}
+.zr-sidebar .zr-grouped-nav{display:flex;flex-direction:column;gap:6px;min-height:0;overflow-y:auto;overflow-x:hidden;padding:8px}
+.zr-nav-group{flex-shrink:0;min-width:0;border-radius:var(--radius-sm)}
+.zr-nav-group-trigger,.zr-mobile-nav-toggle{display:flex;align-items:center;gap:10px;width:100%;padding:10px 12px;border:0;border-radius:var(--radius-sm);background:transparent;color:var(--tg-text);font:inherit;font-size:var(--text-sm);text-align:left;cursor:pointer}
+.zr-nav-group-trigger span,.zr-mobile-nav-toggle span{flex:1;min-width:0;overflow-wrap:anywhere;font-weight:600}
+.zr-nav-group-trigger svg,.zr-mobile-nav-toggle svg{flex-shrink:0}
+.zr-nav-group-trigger:hover,.zr-mobile-nav-toggle:hover{background:var(--tg-tertiary)}
+.zr-nav-group.has-active>.zr-nav-group-trigger{color:var(--tg-button)}
+.zr-nav-group-trigger:focus-visible,.zr-mobile-nav-toggle:focus-visible{outline:2px solid var(--tg-button);outline-offset:-2px}
+.zr-nav-chevron{margin-inline-start:auto;transition:transform .15s ease}
+[aria-expanded=true]>.zr-nav-chevron{transform:rotate(180deg)}
+.zr-nav-group-items:not([hidden]){display:grid;gap:3px;margin:4px 0 4px 21px;padding-inline-start:7px;border-inline-start:1px solid var(--tg-border)}
+.zr-grouped-nav .dk-nav-link{flex-shrink:0;width:100%;white-space:normal;text-align:left}
+.zr-grouped-nav .dk-nav-link span{min-width:0;overflow-wrap:anywhere}
+.zr-mobile-nav-toggle{display:none}
+@media(max-width:900px){
+ .zr-sidebar-menu{overflow:visible}
+ .zr-mobile-nav-toggle{display:flex;width:calc(100% - 16px);margin:0 8px 8px;background:var(--tg-secondary)}
+ .zr-sidebar .zr-grouped-nav{display:none;max-height:min(55dvh,520px)}
+ .zr-sidebar .zr-grouped-nav.is-mobile-open{display:flex}
+ .zr-sidebar .zr-grouped-nav .dk-nav-link{width:100%;white-space:normal}
+}
+@media(prefers-reduced-motion:reduce){.zr-nav-chevron{transition:none}}
