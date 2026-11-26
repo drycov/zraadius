@@ -1,4 +1,5 @@
 import {useState} from 'react';
+import DirectoryGroups from './DirectoryGroups';
 import {Alert,Button,Checkbox,Form,Input,Space,Table,Tag,Popconfirm} from '../ui';
 import {useAction,useData,Fault} from '../hooks';
 import type {Request} from '../api';
@@ -28,5 +29,6 @@ export default function IdentityDirectory({request}:{request:Request}){
  {result?.limited&&<Alert type="warning" message="Выборка ограничена 200 записями."/>}
  <Table<Entry> rowKey="username" dataSource={result?.items??[]} columns={[{title:'Логин',dataIndex:'username'},{title:'ФИО',dataIndex:'full_name'},{title:'Подразделение',dataIndex:'department'},{title:'AD',render:(_,r)=><Tag color={r.directory_enabled?'green':'red'}>{r.directory_enabled?'Активен':'Отключён / неизвестно'}</Tag>},{title:'Unified Identity',render:(_,r)=>r.local_exists?'Существует':r.compatible?'Кандидат':'Несовместимый логин'},{title:'Импорт',render:(_,r)=><Button disabled={a.busy||!profileId||!r.object_guid||!r.compatible||!r.directory_enabled||r.local_exists} onClick={()=>a.run(async()=>{setPlan(undefined);await request(path+'/'+profileId+'/import','POST',{object_guid:r.object_guid,preview:true});setPlan(r)})}>Проверить</Button>}]}/>
  {plan&&profileId&&<><Alert type="warning" message={'Импорт '+plan.username+': запись будет заблокирована и не получит реквизиты или сервисы.'}/><Popconfirm title="Импортировать пользователя AD?" onConfirm={()=>a.run(async()=>{await request(path+'/'+profileId+'/import','POST',{object_guid:plan.object_guid,preview:false});setPlan(undefined);setResult(await request<Result>('identities/directory-preview?profile_id='+profileId))})}><Button type="primary" disabled={a.busy}>Импортировать</Button></Popconfirm></>}
+ {profileId&&<DirectoryGroups key={profileId} request={request} profileId={profileId}/>}
  </Space>
 }

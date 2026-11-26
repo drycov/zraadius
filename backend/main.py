@@ -2522,6 +2522,105 @@ def directory_import(profile_id:int,body:DirectoryImport,principal=Depends(auth)
         audit(conn,"directory.identity.import",username)
         return {**response,"identity_id":row["id"]}
 
+def read_directory_inventory(config,**kwargs):
+    from directory_ldap import discover
+    from ldap3.core.exceptions import LDAPException
+    try:
+        return discover(config,**kwargs)
+    except (ValueError,LDAPException,OSError):
+        raise HTTPException(502,"Directory query failed or result exceeded server limits")
+
+@app.get("/api/v1/identities/directory-profiles/{profile_id}/groups")
+def directory_groups(profile_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    return read_directory_inventory(directory_profile_config(profile_id),groups=True)
+
+@app.get("/api/v1/identities/directory-profiles/{profile_id}/group-inventory")
+def directory_group_inventory(profile_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        return conn.execute("""SELECT g.id,g.object_guid,g.name,g.distinguished_name,g.observed_at,
+            (SELECT count(*) FROM zradius_directory_group_members m WHERE m.group_id=g.id) AS imported_members
+            FROM zradius_directory_groups g WHERE g.profile_id=%s ORDER BY g.name,g.id LIMIT 500""",(profile_id,)).fetchall()
+
+class DirectoryGroupSync(BaseModel):
+    object_guid:UUID
+    preview:bool=True
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/identities/directory-profiles/{profile_id}/group-sync")
+def directory_group_sync(profile_id:int,body:DirectoryGroupSync,principal=Depends(auth)):
+    personal_admin(principal)
+    config=directory_profile_config(profile_id)
+    result=read_directory_inventory(config,groups=True,object_guid=body.object_guid)
+    if result["limited"] or len(result["items"])!=1 or result["items"][0]["object_guid"]!=str(body.object_guid):
+        raise HTTPException(404,"Unique security group not found")
+    group=result["items"][0]
+    members=read_directory_inventory(config,member_dn=group["distinguished_name"])
+    if members["limited"] or any(not m["object_guid"] for m in members["items"]):
+        raise HTTPException(409,"Incomplete membership snapshot; no changes applied")
+    # Recheck GUID and DN before storing a bounded direct-membership observation.
+    again=read_directory_inventory(config,groups=True,object_guid=body.object_guid)
+    if again["limited"] or again["items"]!=[group]:
+        raise HTTPException(409,"Directory group changed; retry")
+    guids=list({UUID(m["object_guid"]) for m in members["items"]})
+    with db() as conn:
+        profile=conn.execute("SELECT host,base_dn,bind_dn,bind_secret,enabled FROM zradius_directory_profiles WHERE id=%s FOR UPDATE",(profile_id,)).fetchone()
+        if not profile or not profile["enabled"]:
+            raise HTTPException(409,"Directory profile changed")
+        from directory_crypto import open_bind
+        try:
+            password=open_bind(profile["bind_secret"],profile_id,profile["host"],profile["bind_dn"])
+        except (ValueError,InvalidTag):
+            raise HTTPException(503,"Directory credential unavailable")
+        if any(profile[k]!=config[k] for k in ("host","base_dn","bind_dn")) or password!=config["password"]:
+            raise HTTPException(409,"Directory profile changed; retry")
+        linked=conn.execute("SELECT identity_id FROM zradius_directory_identities WHERE profile_id=%s AND object_guid=ANY(%s::uuid[])",(profile_id,guids)).fetchall()
+        response={"preview":body.preview,"name":group["name"],"observed_members":len(guids),"imported_members":len(linked)}
+        if body.preview:
+            return response
+        row=conn.execute("""INSERT INTO zradius_directory_groups(profile_id,object_guid,name,distinguished_name)
+            VALUES (%s,%s,%s,%s) ON CONFLICT(profile_id,object_guid) DO UPDATE SET
+            name=excluded.name,distinguished_name=excluded.distinguished_name,observed_at=now() RETURNING id""",
+            (profile_id,body.object_guid,group["name"],group["distinguished_name"])).fetchone()
+        conn.execute("DELETE FROM zradius_directory_group_members WHERE group_id=%s",(row["id"],))
+        for member in linked:
+            conn.execute("INSERT INTO zradius_directory_group_members(group_id,identity_id) VALUES (%s,%s)",(row["id"],member["identity_id"]))
+        audit(conn,"directory.group.sync",str(row["id"]))
+        return {**response,"group_id":row["id"]}
+
+class DirectoryMappingSet(BaseModel):
+    group_ids:list[int]=Field(max_length=100)
+    model_config={"extra":"forbid"}
+
+@app.get("/api/v1/identities/directory-groups/{group_id}/mapping")
+def directory_group_mapping(group_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM zradius_directory_groups WHERE id=%s",(group_id,)).fetchone():
+            raise HTTPException(404,"Directory group not found")
+        groups=conn.execute("""SELECT g.id,g.name FROM zradius_directory_group_mappings m JOIN zradius_identity_groups g ON g.id=m.identity_group_id WHERE m.directory_group_id=%s ORDER BY g.name""",(group_id,)).fetchall()
+        members=conn.execute("""SELECT i.id,i.username,i.enabled FROM zradius_directory_group_members m JOIN zradius_identities i ON i.id=m.identity_id WHERE m.group_id=%s ORDER BY i.username""",(group_id,)).fetchall()
+        return {"groups":groups,"members":members,"authorization_applied":False}
+
+@app.put("/api/v1/identities/directory-groups/{group_id}/mapping")
+def set_directory_group_mapping(group_id:int,body:DirectoryMappingSet,principal=Depends(auth)):
+    personal_admin(principal)
+    ids=sorted(set(body.group_ids))
+    if len(ids)!=len(body.group_ids) or any(i<=0 for i in ids):
+        raise HTTPException(422,"Invalid group IDs")
+    with db() as conn:
+        if not conn.execute("SELECT id FROM zradius_directory_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone():
+            raise HTTPException(404,"Directory group not found")
+        groups=conn.execute("SELECT id FROM zradius_identity_groups WHERE id=ANY(%s::bigint[]) ORDER BY id FOR KEY SHARE",(ids,)).fetchall()
+        if len(groups)!=len(ids):
+            raise HTTPException(404,"Local group not found")
+        conn.execute("DELETE FROM zradius_directory_group_mappings WHERE directory_group_id=%s",(group_id,))
+        for target in ids:
+            conn.execute("INSERT INTO zradius_directory_group_mappings(directory_group_id,identity_group_id) VALUES (%s,%s)",(group_id,target))
+        audit(conn,"directory.group.mapping",str(group_id))
+        return {"group_ids":ids,"authorization_applied":False}
+
 @app.get("/api/v1/identities/directory-preview")
 def directory_preview(profile_id:int|None=None,principal=Depends(auth)):
     personal_admin(principal)
