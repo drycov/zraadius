@@ -1,0 +1,2 @@
+# Device AAA NAS grants
+Create a MikroTik NAS, assign device-aaa via Services AAA > NAS (preserve other service codes), create the device user and grant read/write/full. The API deliberately rejects unbound NAS with HTTP 409. The Device AAA UI now filters eligible NAS, and NAS listing exposes service codes without secrets. New NAS clients require RADIUS_ENABLE_NAS=true and a radius restart to load generated clients. Existing grant/authorization policy remains unchanged; no database migration. Do not disable local emergency access.

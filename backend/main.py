@@ -290,7 +290,7 @@ def get_profile(group: str):
 @app.get("/api/v1/nas", dependencies=[Depends(auth)])
 def list_nas():
     with db() as conn:
-        return conn.execute("SELECT id,nasname,shortname,type,description FROM nas ORDER BY id").fetchall()
+        return conn.execute("SELECT n.id,n.nasname,n.shortname,n.type,n.description,             ARRAY(SELECT s.service_code FROM zradius_nas_services s WHERE s.nas_id=n.id ORDER BY s.service_code) AS services             FROM nas n ORDER BY n.id").fetchall()
 
 @app.post("/api/v1/nas", status_code=201, dependencies=[Depends(auth)])
 def create_nas(body: NAS):
