@@ -1543,3 +1543,111 @@ def effective_device_grants(user_id:int):
         return conn.execute("""SELECT g.nas_id,n.shortname,g.role,g.filter_id,g.source
             FROM zradius_device_effective_grants g JOIN nas n ON n.id=g.nas_id
             WHERE g.user_id=%s ORDER BY n.shortname""",(user_id,)).fetchall()
+
+
+# NAS selectors never register clients or change shared secrets.
+class NasNetwork(BaseModel):
+    network:str=Field(min_length=3,max_length=64)
+
+def canonical_network(value):
+    import ipaddress
+    try:
+        network=ipaddress.ip_network(value,strict=True)
+        if network.prefixlen==0:
+            raise ValueError()
+        return str(network)
+    except ValueError:
+        raise HTTPException(422,"Use canonical IPv4/IPv6 CIDR with nonzero prefix")
+
+@app.get("/api/v1/nas/groups",dependencies=[Depends(auth)])
+def nas_groups():
+    with db() as conn:
+        return conn.execute("SELECT id,name,description FROM zradius_nas_groups ORDER BY name").fetchall()
+
+@app.post("/api/v1/nas/groups",status_code=201,dependencies=[Depends(auth)])
+def create_nas_group(body:DeviceRoleCreate):
+    with db() as conn:
+        row=conn.execute("INSERT INTO zradius_nas_groups(name,description) VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING id,name,description",(body.name,body.description)).fetchone()
+        if not row:
+            raise HTTPException(409,"NAS group exists")
+        audit(conn,"nas.group.create",str(row["id"]))
+        return row
+
+def lock_nas_group(conn,group_id):
+    if not conn.execute("SELECT id FROM zradius_nas_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone():
+        raise HTTPException(404,"NAS group not found")
+
+@app.get("/api/v1/nas/groups/{group_id}/members",dependencies=[Depends(auth)])
+def nas_group_members(group_id:int):
+    with db() as conn:
+        return conn.execute("""SELECT n.id,n.shortname,n.nasname,n.type,
+            EXISTS(SELECT 1 FROM zradius_nas_group_members m WHERE m.group_id=%s AND m.nas_id=n.id) AS explicit
+            FROM zradius_nas_group_effective_members e JOIN nas n ON n.id=e.nas_id
+            WHERE e.group_id=%s ORDER BY n.shortname""",(group_id,group_id)).fetchall()
+
+@app.put("/api/v1/nas/groups/{group_id}/members/{nas_id}",dependencies=[Depends(auth)])
+def add_nas_group_member(group_id:int,nas_id:int):
+    with db() as conn:
+        lock_nas_group(conn,group_id)
+        if not conn.execute("SELECT id FROM nas WHERE id=%s FOR UPDATE",(nas_id,)).fetchone():
+            raise HTTPException(404,"NAS not found")
+        conn.execute("INSERT INTO zradius_nas_group_members VALUES (%s,%s) ON CONFLICT DO NOTHING",(group_id,nas_id))
+        audit(conn,"nas.group.member.add",f"{group_id}:{nas_id}")
+    return {"status":"assigned"}
+
+@app.delete("/api/v1/nas/groups/{group_id}/members/{nas_id}",dependencies=[Depends(auth)])
+def remove_nas_group_member(group_id:int,nas_id:int):
+    with db() as conn:
+        lock_nas_group(conn,group_id)
+        conn.execute("DELETE FROM zradius_nas_group_members WHERE group_id=%s AND nas_id=%s",(group_id,nas_id))
+        audit(conn,"nas.group.member.remove",f"{group_id}:{nas_id}")
+    return {"status":"removed"}
+
+@app.get("/api/v1/nas/groups/{group_id}/networks",dependencies=[Depends(auth)])
+def nas_group_networks(group_id:int):
+    with db() as conn:
+        return conn.execute("SELECT network::text AS network FROM zradius_nas_group_networks WHERE group_id=%s ORDER BY network",(group_id,)).fetchall()
+
+@app.post("/api/v1/nas/groups/{group_id}/networks",status_code=201,dependencies=[Depends(auth)])
+def add_nas_group_network(group_id:int,body:NasNetwork):
+    network=canonical_network(body.network)
+    with db() as conn:
+        lock_nas_group(conn,group_id)
+        conn.execute("INSERT INTO zradius_nas_group_networks VALUES (%s,%s::cidr) ON CONFLICT DO NOTHING",(group_id,network))
+        audit(conn,"nas.group.network.add",f"{group_id}:{network}")
+    return {"network":network}
+
+@app.delete("/api/v1/nas/groups/{group_id}/networks/{network:path}",dependencies=[Depends(auth)])
+def remove_nas_group_network(group_id:int,network:str):
+    network=canonical_network(network)
+    with db() as conn:
+        lock_nas_group(conn,group_id)
+        conn.execute("DELETE FROM zradius_nas_group_networks WHERE group_id=%s AND network=%s::cidr",(group_id,network))
+        audit(conn,"nas.group.network.remove",f"{group_id}:{network}")
+    return {"status":"removed"}
+
+@app.get("/api/v1/device-aaa/groups/{group_id}/nas-group-grants",dependencies=[Depends(auth)])
+def nas_group_grants(group_id:int):
+    with db() as conn:
+        return conn.execute("""SELECT g.nas_group_id,n.name,g.role,g.filter_id FROM zradius_device_nas_group_grants g
+            JOIN zradius_nas_groups n ON n.id=g.nas_group_id WHERE g.group_id=%s ORDER BY n.name""",(group_id,)).fetchall()
+
+@app.put("/api/v1/device-aaa/groups/{group_id}/nas-group-grants/{nas_group_id}",dependencies=[Depends(auth)])
+def set_nas_group_grant(group_id:int,nas_group_id:int,body:DeviceGrant):
+    with db() as conn:
+        if not conn.execute("SELECT id FROM zradius_device_user_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone():
+            raise HTTPException(404,"Device group not found")
+        lock_nas_group(conn,nas_group_id)
+        if not conn.execute("SELECT 1 FROM zradius_device_role_catalog WHERE name=%s",(body.role,)).fetchone():
+            raise HTTPException(422,"Unknown RouterOS role")
+        conn.execute("""INSERT INTO zradius_device_nas_group_grants(group_id,nas_group_id,role,filter_id) VALUES (%s,%s,%s,%s)
+            ON CONFLICT(group_id,nas_group_id) DO UPDATE SET role=excluded.role,filter_id=excluded.filter_id""",(group_id,nas_group_id,body.role,body.filter_id))
+        audit(conn,"device.nas.group.grant.set",f"{group_id}:{nas_group_id}:{body.role}")
+    return {"role":body.role,"filter_id":body.filter_id}
+
+@app.delete("/api/v1/device-aaa/groups/{group_id}/nas-group-grants/{nas_group_id}",dependencies=[Depends(auth)])
+def remove_nas_group_grant(group_id:int,nas_group_id:int):
+    with db() as conn:
+        conn.execute("DELETE FROM zradius_device_nas_group_grants WHERE group_id=%s AND nas_group_id=%s",(group_id,nas_group_id))
+        audit(conn,"device.nas.group.grant.remove",f"{group_id}:{nas_group_id}")
+    return {"status":"removed"}
