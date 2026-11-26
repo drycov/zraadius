@@ -2388,6 +2388,26 @@ class IdentityCreate(BaseModel):
     wpa_enterprise:IdentityEapAssignment|None=None
     console_role:Literal["admin","operator","auditor"]|None=None
 
+@app.get("/api/v1/identities/directory-preview")
+def directory_preview(principal=Depends(auth)):
+    personal_admin(principal)
+    from directory_ldap import discover
+    from ldap3.core.exceptions import LDAPException
+    try:
+        result=discover()
+    except ValueError:
+        raise HTTPException(503,"LDAP discovery not configured or invalid configuration")
+    except (LDAPException,OSError):
+        raise HTTPException(502,"LDAP connection or search failed")
+    with db() as conn:
+        names=[r["username"] for r in result["items"]]
+        existing=conn.execute("SELECT username FROM zradius_identities WHERE username=ANY(%s)",(names,)).fetchall()
+        known={r["username"] for r in existing}
+        for row in result["items"]:
+            row["local_exists"]=row["username"] in known
+        audit(conn,"directory.preview","active-directory")
+    return result
+
 @app.get("/api/v1/identities",dependencies=[Depends(auth)])
 def identities(limit:int=100,offset:int=0,q:str="",enabled:bool|None=None):
     if not 1<=limit<=500 or offset<0:

@@ -1,5 +1,6 @@
 import {useState} from 'react';
 import Tabs from '../ui/Tabs';
+import IdentityDirectory from './IdentityDirectory';
 import IdentityAudit from './IdentityAudit';
 import IdentityLegacy from './IdentityLegacy';
 import IdentityBulkState from './IdentityBulkState';
@@ -34,6 +35,7 @@ export default function UnifiedUsers({request}:{request:Request}){
  {id:'bulk',label:'Массовое назначение',content:<IdentityBulk request={request} refresh={d.refresh}/>},
  {id:'bulk-state',label:'Массовая блокировка',content:<IdentityBulkState request={request} refresh={d.refresh}/>},
  {id:'legacy',label:'Миграция Legacy',content:<IdentityLegacy request={request} refresh={d.refresh}/>},
+ {id:'directory',label:'Active Directory',content:<IdentityDirectory request={request}/>},
  {id:'groups',label:'Глобальные группы',content:<IdentityGroups request={request}/>}
  ]}/><Modal wide title={editing?.username} open={!!editing} onCancel={()=>setEditing(undefined)} footer={null}>{editing&&<Tabs key={editing.id} label="Настройки пользователя" items={[
  {id:'metadata',label:'Персональные данные',content:<IdentityMetadata key={editing.id} request={request} identity={editing} onSaved={value=>{setEditing(current=>current?.id===value.id?{...current,...value}:current);d.refresh()}}/>},

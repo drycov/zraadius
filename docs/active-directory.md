@@ -1,0 +1,3 @@
+# Active Directory discovery (66.0.1)
+
+Read-only preview, personal admin only. Configure API container environment ZRADIUS_LDAP_ENABLED=true, ZRADIUS_LDAP_HOST (DNS name), ZRADIUS_LDAP_BASE_DN, ZRADIUS_LDAP_BIND_DN, ZRADIUS_LDAP_BIND_PASSWORD and optional ZRADIUS_LDAP_CA_FILE (mounted PEM CA). LDAPS TCP 636 only, certificate validation required, referrals disabled, bounded query. Use least-privilege read-only bind account and secret injection, never commit credentials. Search is AD-specific; generic LDAP support, pagination, immutable objectGUID mapping, import and authentication are future work. Existing local login indicator is exact-case and is not conflict clearance. No password or directory changes, no database migration. Build and live AD tests pending.
