@@ -11,6 +11,8 @@ COPY zradius-ipoe /etc/freeradius/3.0/sites-available/zradius-ipoe
 RUN sed -i 's/\r$//' /etc/freeradius/3.0/sites-available/zradius-ipoe
 COPY zradius-hotspot /etc/freeradius/3.0/sites-available/zradius-hotspot
 RUN sed -i 's/\r$//' /etc/freeradius/3.0/sites-available/zradius-hotspot
+COPY zradius-device-aaa /etc/freeradius/3.0/sites-available/zradius-device-aaa
+RUN sed -i 's/\r$//' /etc/freeradius/3.0/sites-available/zradius-device-aaa
 COPY entrypoint.sh /usr/local/bin/zradius-entrypoint
 RUN sed -i 's/\r$//' /etc/freeradius/3.0/mods-available/sqlippool /etc/freeradius/3.0/zradius-pool-postauth
 RUN sed -i 's/\r$//' /usr/local/bin/zradius-entrypoint /etc/freeradius/3.0/mods-available/sql /etc/freeradius/3.0/sites-available/zradius && /bin/sh -n /usr/local/bin/zradius-entrypoint && chmod 755 /usr/local/bin/zradius-entrypoint && rm -f /etc/freeradius/3.0/mods-enabled/eap && rm -f /etc/freeradius/3.0/sites-enabled/* && ln -s ../sites-available/zradius /etc/freeradius/3.0/sites-enabled/zradius && ln -sf ../mods-available/sql /etc/freeradius/3.0/mods-enabled/sql

@@ -1,0 +1,48 @@
+server zradius-device-aaa {
+ listen {
+  type = auth
+  ipaddr = *
+  port = 18122
+ }
+ authorize {
+  if (!&User-Name || &User-Name !~ /^[a-zA-Z0-9_.-]{1,64}$/ || !&User-Password || &CHAP-Password || &EAP-Message || &MS-CHAP-Challenge) {
+   reject
+  }
+  if (!&Service-Type || (&Service-Type != Login-User && &Service-Type != Administrative-User && &Service-Type != NAS-Prompt-User)) {
+   reject
+  }
+  update control {
+   SSHA512-Password := "%{sql:SELECT u.password_hash FROM zradius_device_users u JOIN zradius_device_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+  }
+  if (!&control:SSHA512-Password || &control:SSHA512-Password == "") {
+   reject
+  }
+  pap
+ }
+ authenticate {
+  Auth-Type PAP {
+   pap
+  }
+ }
+ post-auth {
+  update control {
+   Tmp-String-0 := "%{sql:SELECT g.role FROM zradius_device_users u JOIN zradius_device_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+  }
+  if (&control:Tmp-String-0 !~ /^(read|write|full)$/) {
+   reject
+  }
+  update reply {
+   Mikrotik-Group := "%{control:Tmp-String-0}"
+  }
+  update control {
+   Tmp-String-1 := "%{sql:INSERT INTO zradius_device_auth_log(username,source_ip,result) VALUES ('%{User-Name}','%{Packet-Src-IP-Address}','accept')}"
+  }
+  Post-Auth-Type REJECT {
+   if (&User-Name && &User-Name =~ /^[a-zA-Z0-9_.-]{1,64}$/) {
+    update control {
+     Tmp-String-1 := "%{sql:INSERT INTO zradius_device_auth_log(username,source_ip,result) VALUES ('%{User-Name}','%{Packet-Src-IP-Address}','reject')}"
+    }
+   }
+  }
+ }
+}

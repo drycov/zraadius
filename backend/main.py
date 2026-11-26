@@ -805,3 +805,77 @@ def revoke_hotspot_voucher(voucher_id:int):
             raise HTTPException(404,"Voucher not found")
         audit(conn,"hotspot.voucher.revoke",row["username"])
     return {"status":"revoked","existing_sessions_terminated":False}
+
+from hotspot import voucher_credentials as device_credentials
+
+class DeviceUserCreate(BaseModel):
+    username:str=Field(min_length=1,max_length=64,pattern=r"^[a-zA-Z0-9_.-]+$")
+
+class DeviceGrant(BaseModel):
+    role:Literal["read","write","full"]
+
+@app.get("/api/v1/device-aaa/users",dependencies=[Depends(auth)])
+def device_users():
+    with db() as conn:
+        return conn.execute("SELECT id,username,enabled,created_at FROM zradius_device_users ORDER BY username").fetchall()
+
+@app.post("/api/v1/device-aaa/users",status_code=201,dependencies=[Depends(auth)])
+def create_device_user(body:DeviceUserCreate):
+    _,password,digest=device_credentials()
+    with db() as conn:
+        row=conn.execute("INSERT INTO zradius_device_users(username,password_hash) VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING id,username,enabled",(body.username,digest)).fetchone()
+        if not row:
+            raise HTTPException(409,"Device user exists")
+        audit(conn,"device.user.create",body.username)
+    return {**row,"password":password}
+
+@app.put("/api/v1/device-aaa/users/{user_id}/state",dependencies=[Depends(auth)])
+def device_user_state(user_id:int,body:UserState):
+    with db() as conn:
+        row=conn.execute("UPDATE zradius_device_users SET enabled=%s WHERE id=%s RETURNING id,username,enabled",(body.enabled,user_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"Device user not found")
+        audit(conn,"device.user.state",row["username"])
+    return row
+
+@app.post("/api/v1/device-aaa/users/{user_id}/rotate-password",dependencies=[Depends(auth)])
+def rotate_device_password(user_id:int):
+    _,password,digest=device_credentials()
+    with db() as conn:
+        row=conn.execute("UPDATE zradius_device_users SET password_hash=%s WHERE id=%s RETURNING username",(digest,user_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"Device user not found")
+        audit(conn,"device.user.rotate",row["username"])
+    return {"username":row["username"],"password":password}
+
+@app.get("/api/v1/device-aaa/users/{user_id}/grants",dependencies=[Depends(auth)])
+def device_grants(user_id:int):
+    with db() as conn:
+        return conn.execute("SELECT g.nas_id,n.shortname,g.role FROM zradius_device_grants g JOIN nas n ON n.id=g.nas_id WHERE g.user_id=%s ORDER BY n.shortname",(user_id,)).fetchall()
+
+@app.put("/api/v1/device-aaa/users/{user_id}/grants/{nas_id}",dependencies=[Depends(auth)])
+def set_device_grant(user_id:int,nas_id:int,body:DeviceGrant):
+    with db() as conn:
+        if not conn.execute("SELECT id FROM zradius_device_users WHERE id=%s FOR UPDATE",(user_id,)).fetchone():
+            raise HTTPException(404,"Device user not found")
+        if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(nas_id,)).fetchone():
+            raise HTTPException(404,"MikroTik NAS not found")
+        if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='device-aaa'",(nas_id,)).fetchone():
+            raise HTTPException(409,"Assign Device AAA service first")
+        conn.execute("INSERT INTO zradius_device_grants VALUES (%s,%s,%s) ON CONFLICT(user_id,nas_id) DO UPDATE SET role=excluded.role",(user_id,nas_id,body.role))
+        audit(conn,"device.grant.set",f"{user_id}:{nas_id}:{body.role}")
+    return {"role":body.role}
+
+@app.delete("/api/v1/device-aaa/users/{user_id}/grants/{nas_id}",dependencies=[Depends(auth)])
+def delete_device_grant(user_id:int,nas_id:int):
+    with db() as conn:
+        conn.execute("DELETE FROM zradius_device_grants WHERE user_id=%s AND nas_id=%s",(user_id,nas_id))
+        audit(conn,"device.grant.remove",f"{user_id}:{nas_id}")
+    return {"status":"removed","existing_sessions_terminated":False}
+
+@app.get("/api/v1/device-aaa/auth-log",dependencies=[Depends(auth)])
+def device_auth_log(limit:int=100,offset:int=0):
+    if not 1<=limit<=500 or offset<0:
+        raise HTTPException(422,"Invalid pagination")
+    with db() as conn:
+        return conn.execute("SELECT id,username,host(source_ip) AS source_ip,result,created_at FROM zradius_device_auth_log ORDER BY id DESC LIMIT %s OFFSET %s",(limit,offset)).fetchall()

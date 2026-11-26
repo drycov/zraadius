@@ -225,3 +225,22 @@ CREATE TABLE IF NOT EXISTS zradius_hotspot_vouchers (
 );
 CREATE INDEX IF NOT EXISTS zradius_hotspot_nas_idx ON zradius_hotspot_vouchers(nas_id);
 UPDATE zradius_services SET maturity='experimental' WHERE code='hotspot' AND maturity='planned';
+
+CREATE TABLE IF NOT EXISTS zradius_device_users (
+ id bigserial PRIMARY KEY, username varchar(64) UNIQUE NOT NULL,
+ password_hash text NOT NULL, enabled boolean NOT NULL DEFAULT true,
+ created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS zradius_device_grants (
+ user_id bigint REFERENCES zradius_device_users(id) ON DELETE CASCADE,
+ nas_id bigint REFERENCES nas(id) ON DELETE CASCADE,
+ role text NOT NULL CHECK(role IN ('read','write','full')),
+ PRIMARY KEY(user_id,nas_id)
+);
+CREATE TABLE IF NOT EXISTS zradius_device_auth_log (
+ id bigserial PRIMARY KEY, username text NOT NULL, source_ip inet NOT NULL,
+ result text NOT NULL CHECK(result IN ('accept','reject')),
+ created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS zradius_device_auth_time_idx ON zradius_device_auth_log(created_at);
+UPDATE zradius_services SET maturity='experimental' WHERE code='device-aaa' AND maturity='planned';
