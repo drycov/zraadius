@@ -2589,6 +2589,38 @@ def directory_group_sync(profile_id:int,body:DirectoryGroupSync,principal=Depend
         audit(conn,"directory.group.sync",str(row["id"]))
         return {**response,"group_id":row["id"]}
 
+class DirectoryMappingSet(BaseModel):
+    group_ids:list[int]=Field(max_length=100)
+    model_config={"extra":"forbid"}
+
+@app.get("/api/v1/identities/directory-groups/{group_id}/mapping")
+def directory_group_mapping(group_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM zradius_directory_groups WHERE id=%s",(group_id,)).fetchone():
+            raise HTTPException(404,"Directory group not found")
+        groups=conn.execute("""SELECT g.id,g.name FROM zradius_directory_group_mappings m JOIN zradius_identity_groups g ON g.id=m.identity_group_id WHERE m.directory_group_id=%s ORDER BY g.name""",(group_id,)).fetchall()
+        members=conn.execute("""SELECT i.id,i.username,i.enabled FROM zradius_directory_group_members m JOIN zradius_identities i ON i.id=m.identity_id WHERE m.group_id=%s ORDER BY i.username""",(group_id,)).fetchall()
+        return {"groups":groups,"members":members,"authorization_applied":False}
+
+@app.put("/api/v1/identities/directory-groups/{group_id}/mapping")
+def set_directory_group_mapping(group_id:int,body:DirectoryMappingSet,principal=Depends(auth)):
+    personal_admin(principal)
+    ids=sorted(set(body.group_ids))
+    if len(ids)!=len(body.group_ids) or any(i<=0 for i in ids):
+        raise HTTPException(422,"Invalid group IDs")
+    with db() as conn:
+        if not conn.execute("SELECT id FROM zradius_directory_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone():
+            raise HTTPException(404,"Directory group not found")
+        groups=conn.execute("SELECT id FROM zradius_identity_groups WHERE id=ANY(%s::bigint[]) ORDER BY id FOR KEY SHARE",(ids,)).fetchall()
+        if len(groups)!=len(ids):
+            raise HTTPException(404,"Local group not found")
+        conn.execute("DELETE FROM zradius_directory_group_mappings WHERE directory_group_id=%s",(group_id,))
+        for target in ids:
+            conn.execute("INSERT INTO zradius_directory_group_mappings(directory_group_id,identity_group_id) VALUES (%s,%s)",(group_id,target))
+        audit(conn,"directory.group.mapping",str(group_id))
+        return {"group_ids":ids,"authorization_applied":False}
+
 @app.get("/api/v1/identities/directory-preview")
 def directory_preview(profile_id:int|None=None,principal=Depends(auth)):
     personal_admin(principal)
