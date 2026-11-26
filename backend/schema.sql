@@ -244,3 +244,32 @@ CREATE TABLE IF NOT EXISTS zradius_device_auth_log (
 );
 CREATE INDEX IF NOT EXISTS zradius_device_auth_time_idx ON zradius_device_auth_log(created_at);
 UPDATE zradius_services SET maturity='experimental' WHERE code='device-aaa' AND maturity='planned';
+
+CREATE TABLE IF NOT EXISTS zradius_eap_users (
+ username varchar(64) PRIMARY KEY,
+ nt_password varchar(32) NOT NULL CHECK(nt_password ~ '^[0-9a-f]{32}$'),
+ enabled boolean NOT NULL DEFAULT true,
+ vlan_id integer CHECK(vlan_id BETWEEN 1 AND 4094),
+ created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS zradius_eap_grants (
+ username varchar(64) REFERENCES zradius_eap_users(username) ON DELETE CASCADE,
+ nas_id bigint REFERENCES nas(id) ON DELETE CASCADE,
+ PRIMARY KEY(username,nas_id)
+);
+UPDATE zradius_services SET maturity='experimental' WHERE code IN ('dot1x','wpa-enterprise') AND maturity='planned';
+
+CREATE TABLE IF NOT EXISTS zradius_pki_certificates (
+ fingerprint varchar(64) PRIMARY KEY,
+ purpose text NOT NULL CHECK(purpose IN ('ca','server','client')),
+ subject text NOT NULL, issuer text NOT NULL, serial text NOT NULL,
+ not_before timestamptz NOT NULL, not_after timestamptz NOT NULL,
+ pem text NOT NULL, revoked_at timestamptz,
+ created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS zradius_pki_grants (
+ fingerprint varchar(64) REFERENCES zradius_pki_certificates(fingerprint) ON DELETE CASCADE,
+ nas_id bigint REFERENCES nas(id) ON DELETE CASCADE,
+ vlan_id integer CHECK(vlan_id BETWEEN 1 AND 4094),
+ PRIMARY KEY(fingerprint,nas_id)
+);

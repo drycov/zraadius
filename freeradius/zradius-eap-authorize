@@ -1,0 +1,10 @@
+  if (&EAP-Message) {
+   update control {
+    Tmp-String-2 := "%{sql:SELECT count(*) FROM nas n WHERE n.nasname='%{Packet-Src-IP-Address}' AND EXISTS (SELECT 1 FROM zradius_nas_services s WHERE s.nas_id=n.id AND s.service_code IN ('dot1x','wpa-enterprise'))}"
+   }
+   if (&control:Tmp-String-2 != "1") {
+    reject
+   }
+   eap
+   return
+  }

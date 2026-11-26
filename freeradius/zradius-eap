@@ -1,0 +1,26 @@
+eap {
+ default_eap_type = peap
+ timer_expire = 60
+ ignore_unknown_eap_types = no
+ tls-config tls-common {
+  private_key_file = /run/zradius-pki/server.key
+  certificate_file = /run/zradius-pki/server.pem
+  ca_file = /run/zradius-pki/ca.pem
+  tls_min_version = "1.2"
+  tls_max_version = "1.2"
+  fragment_size = 1024
+  include_length = yes
+  cache {
+   enable = no
+  }
+ }
+ peap {
+  tls = tls-common
+  default_eap_type = mschapv2
+  copy_request_to_tunnel = no
+  use_tunneled_reply = yes
+  virtual_server = zradius-inner-tunnel
+ }
+ mschapv2 {
+ }
+}

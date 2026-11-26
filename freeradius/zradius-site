@@ -11,6 +11,7 @@ server zradius {
   port = 1813
  }
  authorize {
+  # ZRADIUS_EAP_AUTHORIZE
   if (&EAP-Message) {
    reject
   }
@@ -101,6 +102,7 @@ server zradius {
   }
  }
  authenticate {
+  # ZRADIUS_EAP_AUTHENTICATE
   Auth-Type PAP {
    pap
   }

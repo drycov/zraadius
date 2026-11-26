@@ -1,0 +1,45 @@
+# No listen section: accessible only from EAP tunnel.
+server zradius-inner-tunnel {
+ authorize {
+  if (!&User-Name || &User-Name !~ /^[a-zA-Z0-9_.-]{1,64}$/) {
+   reject
+  }
+  if (!&outer.request:Packet-Src-IP-Address) {
+   reject
+  }
+  update control {
+   Tmp-String-1 := "%{sql:SELECT u.nt_password FROM zradius_eap_users u JOIN zradius_eap_grants g ON g.username=u.username JOIN nas n ON n.id=g.nas_id WHERE u.username='%{User-Name}' AND u.enabled AND n.nasname='%{outer.request:Packet-Src-IP-Address}' AND EXISTS (SELECT 1 FROM zradius_nas_services s WHERE s.nas_id=n.id AND s.service_code IN ('dot1x','wpa-enterprise'))}"
+  }
+  if (&control:Tmp-String-1 !~ /^[0-9a-f]{32}$/) {
+   reject
+  }
+  update control {
+   NT-Password := "0x%{control:Tmp-String-1}"
+  }
+  mschap
+  eap
+ }
+ authenticate {
+  Auth-Type MS-CHAP {
+   mschap
+  }
+  Auth-Type EAP {
+   eap
+  }
+ }
+ post-auth {
+  update control {
+   Tmp-String-0 := "%{sql:SELECT COALESCE(u.vlan_id::text,'0') FROM zradius_eap_users u JOIN zradius_eap_grants g ON g.username=u.username JOIN nas n ON n.id=g.nas_id WHERE u.username='%{User-Name}' AND u.enabled AND n.nasname='%{outer.request:Packet-Src-IP-Address}' AND EXISTS (SELECT 1 FROM zradius_nas_services s WHERE s.nas_id=n.id AND s.service_code IN ('dot1x','wpa-enterprise'))}"
+  }
+  if (&control:Tmp-String-0 !~ /^[0-9]+$/) {
+   reject
+  }
+  if (&control:Tmp-String-0 != "0") {
+   update reply {
+    Tunnel-Type := VLAN
+    Tunnel-Medium-Type := IEEE-802
+    Tunnel-Private-Group-Id := "%{control:Tmp-String-0}"
+   }
+  }
+ }
+}
