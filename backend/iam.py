@@ -20,7 +20,7 @@ def new_token():
     token=secrets.token_urlsafe(32)
     return token,token_digest(token)
 # Explicit resource/action allowlist; unknown endpoints deny non-admin roles.
-READ_RESOURCES=frozenset({"dashboard","users","groups","nas","accounting","coa","services","dictionaries","audit","ipoe","ipam","hotspot","device-aaa","ppp","eap","pki","proxy"})
+READ_RESOURCES=frozenset({"identities","dashboard","users","groups","nas","accounting","coa","services","dictionaries","audit","ipoe","ipam","hotspot","device-aaa","ppp","eap","pki","proxy"})
 def permission(method,path):
     parts=path.strip("/").split("/")
     if len(parts)<3 or parts[:2]!=["api","v1"]:

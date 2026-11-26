@@ -24,7 +24,7 @@ server zradius {
     reject
    }
    update control {
-    Tmp-String-0 := "%{sql:SELECT u.password_hash FROM zradius_device_users u JOIN zradius_device_effective_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+    Tmp-String-0 := "%{sql:SELECT u.password_hash FROM zradius_device_users u JOIN zradius_device_effective_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))}"
    }
    if (!&control:Tmp-String-0 || &control:Tmp-String-0 !~ /^[A-Za-z0-9+\/]{107}=$/) {
     reject
@@ -79,7 +79,7 @@ server zradius {
    # Only PAP or MS-CHAPv2; no subscriber fallback.
    if (&User-Password && !&MS-CHAP-Challenge && !&MS-CHAP2-Response && !&MS-CHAP-Response) {
     update control {
-     Tmp-String-0 := "%{sql:SELECT u.password_hash FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+     Tmp-String-0 := "%{sql:SELECT u.password_hash FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))}"
     }
     if (&control:Tmp-String-0 !~ /^[A-Za-z0-9+\/]{107}=$/) {
      reject
@@ -91,7 +91,7 @@ server zradius {
    }
    elsif (!&User-Password && &MS-CHAP-Challenge && &MS-CHAP2-Response && !&MS-CHAP-Response) {
     update control {
-     Tmp-String-0 := "%{sql:SELECT u.nt_password FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+     Tmp-String-0 := "%{sql:SELECT u.nt_password FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))}"
     }
     if (&control:Tmp-String-0 !~ /^[0-9a-f]{32}$/) {
      reject
@@ -189,7 +189,7 @@ server zradius {
  post-auth {
   if (&Mikrotik-Realm == "device-aaa") {
    update control {
-    Tmp-String-0 := "%{sql:SELECT g.role || ':' || COALESCE(g.filter_id,'') FROM zradius_device_users u JOIN zradius_device_effective_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+    Tmp-String-0 := "%{sql:SELECT g.role || ':' || COALESCE(g.filter_id,'') FROM zradius_device_users u JOIN zradius_device_effective_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))}"
    }
    if (&control:Tmp-String-0 =~ /^([A-Za-z0-9_.-]{1,64}):([A-Za-z0-9_.-]{0,64})$/) {
     update reply {
@@ -233,7 +233,7 @@ server zradius {
   }
   elsif (&Mikrotik-Realm == "l2tp") {
    update control {
-    Tmp-String-0 := "%{sql:SELECT p.name || ':' || COALESCE(host(u.static_ip),'') || ':' || COALESCE(p.pool,'') || ':' || p.interim_seconds FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+    Tmp-String-0 := "%{sql:SELECT p.name || ':' || COALESCE(host(u.static_ip),'') || ':' || COALESCE(p.pool,'') || ':' || p.interim_seconds FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))}"
    }
    if (&control:Tmp-String-0 =~ /^([A-Za-z0-9_.-]{1,64}):([0-9.]{0,15}):([A-Za-z0-9_.-]{0,64}):([0-9]{2,5})$/) {
     update reply {

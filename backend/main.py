@@ -939,6 +939,8 @@ def device_user_state(user_id:int,body:UserState):
 def rotate_device_password(user_id:int):
     _,password,digest=device_credentials()
     with db() as conn:
+        if conn.execute("SELECT 1 FROM zradius_device_users WHERE id=%s AND identity_id IS NOT NULL FOR UPDATE",(user_id,)).fetchone():
+            raise HTTPException(409,"Use unified identity password reset")
         row=conn.execute("UPDATE zradius_device_users SET password_hash=%s WHERE id=%s RETURNING username",(digest,user_id)).fetchone()
         if not row:
             raise HTTPException(404,"Device user not found")
@@ -1808,6 +1810,8 @@ def l2tp_password(user_id:int,body:PppPassword):
     except ValueError:
         raise HTTPException(422,"Invalid password encoding/length")
     with db() as conn:
+        if conn.execute("SELECT 1 FROM zradius_l2tp_users WHERE id=%s AND identity_id IS NOT NULL FOR UPDATE",(user_id,)).fetchone():
+            raise HTTPException(409,"Use unified identity password reset")
         row=conn.execute("UPDATE zradius_l2tp_users SET nt_password=%s,password_hash=%s WHERE id=%s RETURNING username",(nt,digest,user_id)).fetchone()
         if not row:
             raise HTTPException(404,"L2TP user not found")
@@ -2279,3 +2283,106 @@ def vpn_monitoring():
             GROUP BY c.status ORDER BY c.status""").fetchall()
         return {"generated_at":conn.execute("SELECT now() AS ts").fetchone()["ts"],
                 "inventory":inventory,"sessions":sessions,"by_nas":by_nas,"disconnect_24h":disconnect}
+
+
+class IdentityDeviceAssignment(DeviceGrant):
+    nas_id:int=Field(gt=0)
+
+class IdentityCreate(BaseModel):
+    username:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    full_name:str=Field(default="",max_length=200)
+    department:str=Field(default="",max_length=200)
+    password:SecretStr=Field(min_length=16,max_length=128)
+    device:IdentityDeviceAssignment|None=None
+    l2tp:L2tpAssignment|None=None
+
+@app.get("/api/v1/identities",dependencies=[Depends(auth)])
+def identities(limit:int=100,offset:int=0):
+    if not 1<=limit<=500 or offset<0:
+        raise HTTPException(422,"Invalid pagination")
+    with db() as conn:
+        return conn.execute("""SELECT i.id,i.username,i.full_name,i.department,i.enabled,
+            d.id AS device_id,d.enabled AS device_enabled,v.id AS l2tp_id,v.enabled AS l2tp_enabled
+            FROM zradius_identities i LEFT JOIN zradius_device_users d ON d.identity_id=i.id
+            LEFT JOIN zradius_l2tp_users v ON v.identity_id=i.id
+            ORDER BY i.username LIMIT %s OFFSET %s""",(limit,offset)).fetchall()
+
+@app.post("/api/v1/identities",status_code=201,dependencies=[Depends(auth)])
+def create_identity(body:IdentityCreate):
+    try:
+        nt,digest=ppp_credentials(body.password.get_secret_value())
+        address=static_address(body.l2tp.static_ip) if body.l2tp else None
+    except ValueError:
+        raise HTTPException(422,"Invalid password or IPv4")
+    try:
+        with db() as conn:
+            lock_ppp_policy(conn)
+            # Never merge or adopt a pre-existing service login by name.
+            if conn.execute("""SELECT 1 FROM zradius_device_users WHERE username=%s
+                UNION ALL SELECT 1 FROM zradius_l2tp_users WHERE username=%s
+                UNION ALL SELECT 1 FROM radcheck WHERE username=%s
+                UNION ALL SELECT 1 FROM zradius_eap_users WHERE username=%s
+                UNION ALL SELECT 1 FROM zradius_admin_users WHERE username=%s
+                UNION ALL SELECT 1 FROM zradius_hotspot_vouchers WHERE username=%s LIMIT 1""",(body.username,)*6).fetchone():
+                raise HTTPException(409,"Existing service login requires explicit migration")
+            row=conn.execute("INSERT INTO zradius_identities(username,full_name,department) VALUES (%s,%s,%s) RETURNING id,username,enabled",(body.username,body.full_name,body.department)).fetchone()
+            if body.device:
+                d=body.device
+                if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(d.nas_id,)).fetchone():
+                    raise HTTPException(404,"MikroTik NAS not found")
+                if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='device-aaa'",(d.nas_id,)).fetchone():
+                    raise HTTPException(409,"Assign Device AAA service first")
+                role,filter_id,profile_id=resolve_device_grant(conn,d)
+                device=conn.execute("INSERT INTO zradius_device_users(username,password_hash,identity_id) VALUES (%s,%s,%s) RETURNING id",(body.username,digest,row["id"])).fetchone()
+                conn.execute("INSERT INTO zradius_device_grants(user_id,nas_id,role,filter_id,profile_id) VALUES (%s,%s,%s,%s,%s)",(device["id"],d.nas_id,role,filter_id,profile_id))
+            if body.l2tp:
+                v=body.l2tp
+                validate_l2tp_assignment(conn,v,address)
+                conn.execute("""INSERT INTO zradius_l2tp_users(username,nt_password,password_hash,nas_id,profile_id,group_id,address_space_id,static_ip,description,identity_id)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s::inet,%s,%s)""",(body.username,nt,digest,v.nas_id,v.profile_id,v.group_id,v.address_space_id,address,v.description,row["id"]))
+            audit(conn,"identity.create",body.username)
+            return row
+    except UniqueViolation:
+        raise HTTPException(409,"Identity, username or static IP already assigned")
+
+@app.put("/api/v1/identities/{identity_id}/state",dependencies=[Depends(auth)])
+def identity_state(identity_id:int,body:UserState):
+    with db() as conn:
+        row=conn.execute("UPDATE zradius_identities SET enabled=%s,updated_at=now() WHERE id=%s RETURNING id,username,enabled",(body.enabled,identity_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"Identity not found")
+        audit(conn,"identity.state",row["username"])
+        return row
+
+@app.put("/api/v1/identities/{identity_id}/password",dependencies=[Depends(auth)])
+def identity_password(identity_id:int,body:PppPassword):
+    try:
+        nt,digest=ppp_credentials(body.password.get_secret_value())
+    except ValueError:
+        raise HTTPException(422,"Invalid password")
+    with db() as conn:
+        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Identity not found")
+        conn.execute("UPDATE zradius_device_users SET password_hash=%s WHERE identity_id=%s",(digest,identity_id))
+        conn.execute("UPDATE zradius_l2tp_users SET nt_password=%s,password_hash=%s WHERE identity_id=%s",(nt,digest,identity_id))
+        conn.execute("UPDATE zradius_identities SET updated_at=now() WHERE id=%s",(identity_id,))
+        audit(conn,"identity.password",row["username"])
+    return {"status":"updated"}
+
+class IdentityServices(BaseModel):
+    device:bool=False
+    l2tp:bool=False
+
+@app.put("/api/v1/identities/{identity_id}/services",dependencies=[Depends(auth)])
+def identity_services(identity_id:int,body:IdentityServices):
+    with db() as conn:
+        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Identity not found")
+        for table,enabled in (("zradius_device_users",body.device),("zradius_l2tp_users",body.l2tp)):
+            changed=conn.execute(f"UPDATE {table} SET enabled=%s WHERE identity_id=%s RETURNING id",(enabled,identity_id)).fetchone()
+            if enabled and not changed:
+                raise HTTPException(409,"Service assignment must be configured first")
+        audit(conn,"identity.services",row["username"])
+    return {"status":"updated"}
