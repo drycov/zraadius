@@ -1,9 +1,13 @@
 # ZRADIUS
 
-Self-hosted FreeRADIUS management platform. Initial development release; not production-ready.
+Self-hosted FreeRADIUS management platform — 0.1.0-alpha.
 
-## Development
+## Run management prototype
 
-Copy `.env.example` to `.env`, replace all secrets and run `docker compose up --build -d`. Management UI binds to localhost:8080. API documentation: http://localhost:8080/docs.
+Copy .env.example to .env and replace both secrets with independent random values (e.g. openssl rand -hex 32). Run:
 
-Initial scope: PostgreSQL-backed RADIUS users, groups and accounting inspection. Single administrative token; full RBAC, NAS management, CoA and configuration deployment are future milestones. FreeRADIUS integration must be validated before connecting production NAS.
+    docker compose up --build -d
+
+Open http://localhost:8080 and enter ADMIN_TOKEN. API documentation: http://localhost:8080/docs.
+
+Implemented: management API, PostgreSQL bootstrap, create/list RADIUS users and groups, group assignment API, audit and health endpoints, minimal browser console. Single administrative token. No production NAS should connect yet: FreeRADIUS runtime, full upstream SQL schema, RBAC, accounting and CoA are not implemented. See docs/architecture.md.
