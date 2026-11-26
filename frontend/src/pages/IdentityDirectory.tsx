@@ -6,6 +6,28 @@ import type {Request} from '../api';
 type Entry={object_guid:string|null;username:string;full_name:string;department:string;directory_enabled:boolean;compatible:boolean;local_exists:boolean};
 type Result={items:Entry[];limited:boolean};
 type Profile={id:number;name:string;host:string;base_dn:string;bind_dn:string;enabled:boolean};
+type LinkedIdentity={object_guid:string;directory_username:string;directory_enabled:boolean;identity_id:number;username:string;enabled:boolean};
+type IdentitySync={preview:boolean;status:string;identity_id:number;username:string;previous_directory_username?:string;directory_username?:string;previous_directory_enabled?:boolean;directory_enabled?:boolean;changed:boolean;authorization_applied:boolean};
+function LinkedIdentities({request,profileId}:{request:Request;profileId:number}){
+ const path='identities/directory-profiles/'+profileId;
+ const d=useData<LinkedIdentity[]>(request,path+'/linked-identities');
+ const a=useAction(d.refresh);
+ const [plan,setPlan]=useState<{guid:string;result:IdentitySync}>();
+ return <Space direction="vertical" className="full">
+ <Alert type="info" message="Связанные пользователи AD. Синхронизация обновляет только метаданные каталога, не локальный логин и не сетевой доступ. Список ограничен 1000 записями."/>
+ <Fault error={d.error}/>
+ <Table<LinkedIdentity> rowKey="identity_id" dataSource={d.data??[]} columns={[
+ {title:'Локальный логин',dataIndex:'username'},
+ {title:'Логин AD',dataIndex:'directory_username'},
+ {title:'AD (сохранённое)',render:(_,r)=><Tag color={r.directory_enabled?'green':'red'}>{r.directory_enabled?'Активен':'Отключён / неизвестно'}</Tag>},
+ {title:'Локальная запись',render:(_,r)=><Tag color={r.enabled?'green':'red'}>{r.enabled?'Активна':'Отключена'}</Tag>},
+ {title:'Действия',render:(_,r)=><Button disabled={a.busy} onClick={()=>a.run(async()=>{setPlan(undefined);const result=await request<IdentitySync>(path+'/identity-sync','POST',{object_guid:r.object_guid,preview:true});setPlan({guid:r.object_guid,result})})}>Проверить состояние</Button>}
+ ]}/>
+ {plan&&<><Alert type={plan.result.status==='observed'?'info':'warning'} message={plan.result.status==='not_observed'?'Объект не найден в области поиска AD; это не подтверждение удаления.':plan.result.status==='incompatible_login'?'Несовместимый доменный логин; локальный логин не изменяется.':'Состояние AD: '+(plan.result.directory_enabled?'активен':'отключён / неизвестно')}/>
+ {plan.result.directory_username!==undefined&&<span>Логин AD: {plan.result.previous_directory_username} → {plan.result.directory_username}</span>}
+ <Space wrap>{plan.result.changed&&<Popconfirm title="Обновить только метаданные AD?" onConfirm={()=>a.run(async()=>{const result=await request<IdentitySync>(path+'/identity-sync','POST',{object_guid:plan.guid,preview:false});setPlan({guid:plan.guid,result})})}><Button type="primary" disabled={a.busy||!plan.result.preview}>Сохранить состояние</Button></Popconfirm>}<Button disabled={a.busy} onClick={()=>setPlan(undefined)}>Закрыть</Button></Space></>}
+ </Space>
+}
 export default function IdentityDirectory({request}:{request:Request}){
  const d=useData<Profile[]>(request,'identities/directory-profiles');
  const [result,setResult]=useState<Result>();const [profileId,setProfileId]=useState<number>();const [plan,setPlan]=useState<Entry>();const [editing,setEditing]=useState<Profile>();const [enabled,setEnabled]=useState(false);const [form]=Form.useForm();
@@ -29,6 +51,6 @@ export default function IdentityDirectory({request}:{request:Request}){
  {result?.limited&&<Alert type="warning" message="Выборка ограничена 200 записями."/>}
  <Table<Entry> rowKey="username" dataSource={result?.items??[]} columns={[{title:'Логин',dataIndex:'username'},{title:'ФИО',dataIndex:'full_name'},{title:'Подразделение',dataIndex:'department'},{title:'AD',render:(_,r)=><Tag color={r.directory_enabled?'green':'red'}>{r.directory_enabled?'Активен':'Отключён / неизвестно'}</Tag>},{title:'Unified Identity',render:(_,r)=>r.local_exists?'Существует':r.compatible?'Кандидат':'Несовместимый логин'},{title:'Импорт',render:(_,r)=><Button disabled={a.busy||!profileId||!r.object_guid||!r.compatible||!r.directory_enabled||r.local_exists} onClick={()=>a.run(async()=>{setPlan(undefined);await request(path+'/'+profileId+'/import','POST',{object_guid:r.object_guid,preview:true});setPlan(r)})}>Проверить</Button>}]}/>
  {plan&&profileId&&<><Alert type="warning" message={'Импорт '+plan.username+': запись будет заблокирована и не получит реквизиты или сервисы.'}/><Popconfirm title="Импортировать пользователя AD?" onConfirm={()=>a.run(async()=>{await request(path+'/'+profileId+'/import','POST',{object_guid:plan.object_guid,preview:false});setPlan(undefined);setResult(await request<Result>('identities/directory-preview?profile_id='+profileId))})}><Button type="primary" disabled={a.busy}>Импортировать</Button></Popconfirm></>}
- {profileId&&<DirectoryGroups key={profileId} request={request} profileId={profileId}/>}
+ {profileId&&<><LinkedIdentities key={profileId} request={request} profileId={profileId}/><DirectoryGroups key={profileId} request={request} profileId={profileId}/></>}
  </Space>
 }
