@@ -5,7 +5,7 @@ from pathlib import Path
 import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, Depends, HTTPException, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, SecretStr, IPvAnyAddress
 from typing import Literal
@@ -39,6 +39,10 @@ async def lifespan(app):
     yield
 
 app = FastAPI(title="ZRADIUS", version="0.1.0-alpha", lifespan=lifespan)
+
+@app.exception_handler(UniqueViolation)
+async def unique_conflict(request:Request, exc:UniqueViolation):
+    return JSONResponse(status_code=409,content={"detail":"Login namespace conflict" if exc.diag.constraint_name=="zradius_login_namespace" else "Record already exists or conflicts with existing data"})
 
 async def auth(request:Request, credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
     if not credentials or len(credentials.credentials)>512:
