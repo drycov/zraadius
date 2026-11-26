@@ -80,6 +80,36 @@ services:
     expose:
       - "8080"
     restart: unless-stopped
+  directory-worker:
+    profiles: [directory-sync]
+    command: ["python", "directory_worker.py"]
+    build: ./backend
+    environment:
+      ZRADIUS_DIRECTORY_SYNC_INTERVAL: ${ZRADIUS_DIRECTORY_SYNC_INTERVAL:-900}
+      PGHOST: postgres
+      PGDATABASE: radius
+      ZRADIUS_SECRET_KEY: ${ZRADIUS_SECRET_KEY:?required}
+      PGUSER: zradius_api
+      PGPASSWORD: ${ZRADIUS_API_DB_PASSWORD:?required}
+      RADIUS_ENABLE_SQLIPPOOL: ${RADIUS_ENABLE_SQLIPPOOL:-false}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      ZRADIUS_LEGACY_TOKEN_ENABLED: ${ZRADIUS_LEGACY_TOKEN_ENABLED:-false}
+      COA_ENABLED: ${COA_ENABLED:-false}
+      COA_ALLOWED_NETWORKS: ${COA_ALLOWED_NETWORKS:-}
+      ZRADIUS_LDAP_ENABLED: ${ZRADIUS_LDAP_ENABLED:-false}
+      ZRADIUS_LDAP_ALLOWED_HOSTS: ${ZRADIUS_LDAP_ALLOWED_HOSTS:-}
+      ZRADIUS_LDAP_FAILOVER_MAP: ${ZRADIUS_LDAP_FAILOVER_MAP:-}
+      ZRADIUS_LDAP_CA_FILE: ${ZRADIUS_LDAP_CA_FILE:-}
+      ZRADIUS_LDAP_HOST: ${ZRADIUS_LDAP_HOST:-}
+      ZRADIUS_LDAP_BASE_DN: ${ZRADIUS_LDAP_BASE_DN:-}
+      ZRADIUS_LDAP_BIND_DN: ${ZRADIUS_LDAP_BIND_DN:-}
+      ZRADIUS_LDAP_BIND_PASSWORD: ${ZRADIUS_LDAP_BIND_PASSWORD:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
   web:
     build: ./frontend
     depends_on:
