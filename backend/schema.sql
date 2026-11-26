@@ -207,3 +207,6 @@ $$;
 DROP TRIGGER IF EXISTS zradius_accounting_lease_trigger ON radacct;
 CREATE TRIGGER zradius_accounting_lease_trigger AFTER INSERT OR UPDATE ON radacct
 FOR EACH ROW EXECUTE FUNCTION zradius_accounting_lease();
+
+-- IPoE runtime exists as opt-in static IPv4 authentication, not validated on hardware.
+UPDATE zradius_services SET maturity='experimental' WHERE code='ipoe' AND maturity='planned';

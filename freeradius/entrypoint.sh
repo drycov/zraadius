@@ -39,6 +39,12 @@ else
   rm -f /etc/freeradius/3.0/mods-enabled/sqlippool
   ln -sf ../sites-available/zradius /etc/freeradius/3.0/sites-enabled/zradius
 fi
+if [ "${RADIUS_ENABLE_IPOE:-false}" = true ]; then
+  until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.zradius_ipoe_bindings') IS NOT NULL AND to_regclass('public.zradius_nas_services') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
+  ln -sf ../sites-available/zradius-ipoe /etc/freeradius/3.0/sites-enabled/zradius-ipoe
+else
+  rm -f /etc/freeradius/3.0/sites-enabled/zradius-ipoe
+fi
 unset PGPASSWORD
 freeradius -C
 exec freeradius -f -l stdout

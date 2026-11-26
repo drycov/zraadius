@@ -1,0 +1,7 @@
+# Opt-in overlay: docker compose -f compose.yaml -f compose.ipoe.yaml up -d
+services:
+  radius:
+    environment:
+      RADIUS_ENABLE_IPOE: "true"
+    ports:
+      - "${RADIUS_IPOE_BIND_IP:-127.0.0.1}:18120:18120/udp"

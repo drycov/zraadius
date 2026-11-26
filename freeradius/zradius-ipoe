@@ -1,0 +1,31 @@
+# Dedicated IPv4 DHCP/MAC RADIUS listener. Never calls PPP SQL authorize.
+server zradius-ipoe {
+ listen {
+  type = auth
+  ipaddr = *
+  port = 18120
+ }
+ authorize {
+  if (!&User-Name || &User-Name !~ /^(?:[0-9A-Fa-f]{12}|[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{2}(-[0-9A-Fa-f]{2}){5})$/) {
+   reject
+  }
+  if (&EAP-Message || &CHAP-Password || &MS-CHAP-Challenge) {
+   reject
+  }
+  # Use actual packet source, never the claimed NAS-IP-Address.
+  # The first runtime supports static IPv4 only; bindings requiring Option 82 fail closed.
+  update control {
+   Tmp-String-0 := "%{sql:SELECT host(b.static_ip) FROM zradius_ipoe_bindings b JOIN nas n ON n.id=b.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='ipoe' WHERE n.nasname='%{Packet-Src-IP-Address}' AND b.mac='%{User-Name}'::macaddr AND b.enabled AND b.static_ip IS NOT NULL AND b.circuit_id IS NULL AND b.remote_id IS NULL}"
+  }
+  if (&control:Tmp-String-0 !~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$/) {
+   reject
+  }
+  update reply {
+   Framed-IP-Address := "%{control:Tmp-String-0}"
+  }
+  # MAC identity, not a reusable PPP password. Trust registered NAS and secured access edge.
+  update control {
+   Auth-Type := Accept
+  }
+ }
+}
