@@ -326,3 +326,56 @@ def change_rate(session_id: int, body: RateChange):
 def coa_history():
     with db() as conn:
         return conn.execute("SELECT * FROM zradius_coa_requests ORDER BY id DESC LIMIT 100").fetchall()
+
+@app.get("/api/v1/services", dependencies=[Depends(auth)])
+def service_catalog():
+    with db() as conn:
+        return conn.execute("SELECT code,name,methods,maturity FROM zradius_services ORDER BY code").fetchall()
+
+class ServiceBindings(BaseModel):
+    services: list[str] = Field(max_length=8)
+
+def validate_services(conn, codes):
+    codes=sorted(set(codes))
+    found=conn.execute("SELECT code FROM zradius_services WHERE code=ANY(%s)",(codes,)).fetchall()
+    if len(found)!=len(codes):
+        raise HTTPException(422,"Unknown service")
+    return codes
+
+@app.get("/api/v1/nas/{nas_id}/services", dependencies=[Depends(auth)])
+def nas_services(nas_id: int):
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM nas WHERE id=%s",(nas_id,)).fetchone():
+            raise HTTPException(404,"NAS not found")
+        return {"services":[x["service_code"] for x in conn.execute("SELECT service_code FROM zradius_nas_services WHERE nas_id=%s ORDER BY service_code",(nas_id,)).fetchall()],"runtime_enforced":False}
+
+@app.put("/api/v1/nas/{nas_id}/services", dependencies=[Depends(auth)])
+def set_nas_services(nas_id: int, body: ServiceBindings):
+    with db() as conn:
+        if not conn.execute("SELECT id FROM nas WHERE id=%s FOR UPDATE",(nas_id,)).fetchone():
+            raise HTTPException(404,"NAS not found")
+        codes=validate_services(conn,body.services)
+        conn.execute("DELETE FROM zradius_nas_services WHERE nas_id=%s",(nas_id,))
+        for code in codes:
+            conn.execute("INSERT INTO zradius_nas_services VALUES (%s,%s)",(nas_id,code))
+        audit(conn,"nas.services",str(nas_id))
+    return {"services":codes,"runtime_enforced":False}
+
+@app.get("/api/v1/groups/{group}/services", dependencies=[Depends(auth)])
+def group_services(group: str):
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM zradius_groups WHERE name=%s",(group,)).fetchone():
+            raise HTTPException(404,"Group not found")
+        return {"services":[x["service_code"] for x in conn.execute("SELECT service_code FROM zradius_group_services WHERE groupname=%s ORDER BY service_code",(group,)).fetchall()],"runtime_enforced":False}
+
+@app.put("/api/v1/groups/{group}/services", dependencies=[Depends(auth)])
+def set_group_services(group: str, body: ServiceBindings):
+    with db() as conn:
+        if not conn.execute("SELECT name FROM zradius_groups WHERE name=%s FOR UPDATE",(group,)).fetchone():
+            raise HTTPException(404,"Group not found")
+        codes=validate_services(conn,body.services)
+        conn.execute("DELETE FROM zradius_group_services WHERE groupname=%s",(group,))
+        for code in codes:
+            conn.execute("INSERT INTO zradius_group_services VALUES (%s,%s)",(group,code))
+        audit(conn,"group.services",group)
+    return {"services":codes,"runtime_enforced":False}

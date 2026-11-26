@@ -65,3 +65,28 @@ CREATE TABLE IF NOT EXISTS nasreload (
  reloadtime timestamptz NOT NULL
 );
 CREATE INDEX IF NOT EXISTS radacct_nas_open_idx ON radacct(nasipaddress) WHERE acctstoptime IS NULL;
+
+CREATE TABLE IF NOT EXISTS zradius_services (
+ code text PRIMARY KEY, name text NOT NULL, methods text NOT NULL,
+ maturity text NOT NULL CHECK (maturity IN ('experimental','planned','validated'))
+);
+INSERT INTO zradius_services(code,name,methods,maturity) VALUES
+('pppoe','PPPoE','PAP / CHAP / MS-CHAPv2','experimental'),
+('ipoe','IPoE','DHCP / MAC Auth','planned'),
+('l2tp','L2TP','PAP / CHAP / MS-CHAPv2','experimental'),
+('hotspot','Hotspot','Captive Portal','planned'),
+('dot1x','802.1X','EAP','planned'),
+('wpa-enterprise','WPA Enterprise','PEAP / EAP-TLS','planned'),
+('device-aaa','Device AAA','SSH / WinBox','planned'),
+('proxy','RADIUS Proxy','Realm routing','planned')
+ON CONFLICT (code) DO NOTHING;
+CREATE TABLE IF NOT EXISTS zradius_nas_services (
+ nas_id bigint REFERENCES nas(id) ON DELETE CASCADE,
+ service_code text REFERENCES zradius_services(code),
+ PRIMARY KEY(nas_id,service_code)
+);
+CREATE TABLE IF NOT EXISTS zradius_group_services (
+ groupname varchar(64) REFERENCES zradius_groups(name) ON DELETE CASCADE,
+ service_code text REFERENCES zradius_services(code),
+ PRIMARY KEY(groupname,service_code)
+);
