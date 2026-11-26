@@ -2590,6 +2590,90 @@ def directory_identity_sync(profile_id:int,body:DirectoryIdentitySync,principal=
             audit(conn,"directory.identity.sync",str(row["identity_id"]))
         return response
 
+class DirectoryBulkSync(BaseModel):
+    preview:bool=True
+    model_config={"extra":"forbid"}
+
+def reconcile_directory_profile(profile_id,preview=True):
+    from directory_reconcile import plan_identities
+    from directory_crypto import open_bind
+    config=directory_profile_config(profile_id)
+    snapshot=read_directory_inventory(config,limit=10000)
+    with db() as conn:
+        profile=conn.execute("SELECT host,base_dn,bind_dn,bind_secret,enabled FROM zradius_directory_profiles WHERE id=%s FOR UPDATE",(profile_id,)).fetchone()
+        if not profile or not profile["enabled"]:
+            raise HTTPException(409,"Directory profile changed")
+        try:
+            password=open_bind(profile["bind_secret"],profile_id,profile["host"],profile["bind_dn"])
+        except (ValueError,InvalidTag):
+            raise HTTPException(503,"Directory credential unavailable")
+        if any(profile[k]!=config[k] for k in ("host","base_dn","bind_dn")) or password!=config["password"]:
+            raise HTTPException(409,"Directory profile changed; retry")
+        linked=conn.execute("SELECT identity_id,object_guid,directory_username,directory_enabled FROM zradius_directory_identities WHERE profile_id=%s ORDER BY identity_id FOR UPDATE",(profile_id,)).fetchall()
+        try:
+            changes,summary=plan_identities(linked,snapshot)
+        except (ValueError,TypeError,KeyError):
+            raise HTTPException(409,"Incomplete or invalid directory snapshot; no changes applied")
+        if not preview:
+            for identity_id,name,enabled in changes:
+                conn.execute("UPDATE zradius_directory_identities SET directory_username=%s,directory_enabled=%s WHERE identity_id=%s",(name,enabled,identity_id))
+                audit(conn,"directory.identity.sync",str(identity_id))
+            audit(conn,"directory.bulk.sync",str(profile_id))
+        return {**summary,"preview":preview,"authorization_applied":False,"directory_host":snapshot.get("directory_host"),"failover_used":snapshot.get("failover_used",False)}
+
+@app.post("/api/v1/identities/directory-profiles/{profile_id}/bulk-sync")
+def directory_bulk_sync(profile_id:int,body:DirectoryBulkSync,principal=Depends(auth)):
+    personal_admin(principal)
+    return reconcile_directory_profile(profile_id,body.preview)
+
+@app.get("/api/v1/identities/directory-profiles/{profile_id}/sync-history")
+def directory_sync_history(profile_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        return conn.execute("""SELECT action,subject,actor,created_at FROM zradius_audit
+            WHERE subject=%s AND action IN ('directory.bulk.sync','directory.bulk.failed','directory.profile.test')
+            ORDER BY created_at DESC LIMIT 100""",(str(profile_id),)).fetchall()
+
+class DirectoryRevoke(BaseModel):
+    object_guid:UUID
+    preview:bool=True
+    confirm:bool=False
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/identities/directory-profiles/{profile_id}/revoke-disabled")
+def directory_revoke_disabled(profile_id:int,body:DirectoryRevoke,principal=Depends(auth)):
+    personal_admin(principal)
+    from directory_crypto import open_bind
+    config=directory_profile_config(profile_id)
+    snapshot=read_directory_inventory(config,object_guid=body.object_guid)
+    entries=snapshot["items"]
+    if snapshot["limited"] or len(entries)!=1 or entries[0]["object_guid"]!=str(body.object_guid) or entries[0]["directory_enabled"] or not entries[0].get("directory_state_known",False):
+        raise HTTPException(409,"Explicit disabled AD state not verified")
+    with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        profile=conn.execute("SELECT host,base_dn,bind_dn,bind_secret,enabled FROM zradius_directory_profiles WHERE id=%s FOR UPDATE",(profile_id,)).fetchone()
+        if not profile or not profile["enabled"]:
+            raise HTTPException(409,"Directory profile changed")
+        try:
+            password=open_bind(profile["bind_secret"],profile_id,profile["host"],profile["bind_dn"])
+        except (ValueError,InvalidTag):
+            raise HTTPException(503,"Directory credential unavailable")
+        if any(profile[k]!=config[k] for k in ("host","base_dn","bind_dn")) or password!=config["password"]:
+            raise HTTPException(409,"Directory profile changed; retry")
+        row=conn.execute("""SELECT i.id,i.username,i.enabled FROM zradius_directory_identities d
+            JOIN zradius_identities i ON i.id=d.identity_id WHERE d.profile_id=%s AND d.object_guid=%s FOR UPDATE OF d,i""",(profile_id,body.object_guid)).fetchone()
+        if not row:
+            raise HTTPException(404,"Directory identity not linked")
+        if conn.execute("SELECT 1 FROM zradius_admin_users WHERE identity_id=%s",(row["id"],)).fetchone():
+            raise HTTPException(409,"Management identities require manual review")
+        if not body.preview:
+            if not body.confirm:
+                raise HTTPException(409,"Explicit revocation confirmation required")
+            conn.execute("UPDATE zradius_identities SET enabled=false,updated_at=now() WHERE id=%s",(row["id"],))
+            conn.execute("UPDATE zradius_directory_identities SET directory_enabled=false WHERE identity_id=%s",(row["id"],))
+            audit(conn,"directory.identity.revoke",str(row["id"]))
+        return {"preview":body.preview,"identity_id":row["id"],"username":row["username"],"previous_enabled":row["enabled"],"network_disconnected":False}
+
 @app.get("/api/v1/identities/directory-profiles/{profile_id}/groups")
 def directory_groups(profile_id:int,principal=Depends(auth)):
     personal_admin(principal)
