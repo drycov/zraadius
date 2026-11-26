@@ -24,7 +24,7 @@ server zradius {
     reject
    }
    update control {
-    Tmp-String-0 := "%{sql:SELECT u.password_hash FROM zradius_device_users u JOIN zradius_device_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+    Tmp-String-0 := "%{sql:SELECT u.password_hash FROM zradius_device_users u JOIN zradius_device_effective_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
    }
    if (!&control:Tmp-String-0 || &control:Tmp-String-0 !~ /^[A-Za-z0-9+\/]{107}=$/) {
     reject
@@ -149,16 +149,18 @@ server zradius {
  post-auth {
   if (&Mikrotik-Realm == "device-aaa") {
    update control {
-    Tmp-String-0 := "%{sql:SELECT g.role || ':' || COALESCE(g.filter_id,'') FROM zradius_device_users u JOIN zradius_device_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+    Tmp-String-0 := "%{sql:SELECT g.role || ':' || COALESCE(g.filter_id,'') FROM zradius_device_users u JOIN zradius_device_effective_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
    }
-   if (&control:Tmp-String-0 !~ /^([A-Za-z0-9_.-]{1,64}):([A-Za-z0-9_.-]{0,64})$/) {
+   if (&control:Tmp-String-0 =~ /^([A-Za-z0-9_.-]{1,64}):([A-Za-z0-9_.-]{0,64})$/) {
+    update reply {
+     Mikrotik-Group := "%{1}"
+    }
+    update control {
+     Tmp-String-3 := "%{2}"
+    }
+   }
+   else {
     reject
-   }
-   update reply {
-    Mikrotik-Group := "%{1}"
-   }
-   update control {
-    Tmp-String-3 := "%{2}"
    }
    if (&control:Tmp-String-3 != "") {
     update reply {

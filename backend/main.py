@@ -1468,3 +1468,78 @@ def revoke_service_token(account_id:int,token_id:UUID,principal=Depends(auth)):
             raise HTTPException(404,"Token not found")
         audit(conn,"iam.service.token.revoke",str(token_id))
         return {"revoked":True}
+
+
+# Device user groups are separate from subscriber RADIUS groups and IAM roles.
+@app.get("/api/v1/device-aaa/groups",dependencies=[Depends(auth)])
+def device_user_groups():
+    with db() as conn:
+        return conn.execute("SELECT id,name,description FROM zradius_device_user_groups ORDER BY name").fetchall()
+
+@app.post("/api/v1/device-aaa/groups",status_code=201,dependencies=[Depends(auth)])
+def create_device_user_group(body:DeviceRoleCreate):
+    with db() as conn:
+        row=conn.execute("INSERT INTO zradius_device_user_groups(name,description) VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING id,name,description",(body.name,body.description)).fetchone()
+        if not row:
+            raise HTTPException(409,"Device group exists")
+        audit(conn,"device.group.create",str(row["id"]))
+        return row
+
+@app.get("/api/v1/device-aaa/groups/{group_id}/members",dependencies=[Depends(auth)])
+def device_group_members(group_id:int):
+    with db() as conn:
+        return conn.execute("""SELECT u.id,u.username,u.enabled FROM zradius_device_user_members m
+            JOIN zradius_device_users u ON u.id=m.user_id WHERE m.group_id=%s ORDER BY u.username""",(group_id,)).fetchall()
+
+@app.put("/api/v1/device-aaa/groups/{group_id}/members/{user_id}",dependencies=[Depends(auth)])
+def add_device_group_member(group_id:int,user_id:int):
+    with db() as conn:
+        if not conn.execute("SELECT id FROM zradius_device_user_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone():
+            raise HTTPException(404,"Device group not found")
+        if not conn.execute("SELECT id FROM zradius_device_users WHERE id=%s FOR UPDATE",(user_id,)).fetchone():
+            raise HTTPException(404,"Device user not found")
+        conn.execute("INSERT INTO zradius_device_user_members(group_id,user_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",(group_id,user_id))
+        audit(conn,"device.group.member.add",f"{group_id}:{user_id}")
+    return {"status":"assigned"}
+
+@app.delete("/api/v1/device-aaa/groups/{group_id}/members/{user_id}",dependencies=[Depends(auth)])
+def remove_device_group_member(group_id:int,user_id:int):
+    with db() as conn:
+        conn.execute("DELETE FROM zradius_device_user_members WHERE group_id=%s AND user_id=%s",(group_id,user_id))
+        audit(conn,"device.group.member.remove",f"{group_id}:{user_id}")
+    return {"status":"removed"}
+
+@app.get("/api/v1/device-aaa/groups/{group_id}/grants",dependencies=[Depends(auth)])
+def device_group_grants(group_id:int):
+    with db() as conn:
+        return conn.execute("SELECT g.nas_id,n.shortname,g.role,g.filter_id FROM zradius_device_group_grants g JOIN nas n ON n.id=g.nas_id WHERE group_id=%s ORDER BY n.shortname",(group_id,)).fetchall()
+
+@app.put("/api/v1/device-aaa/groups/{group_id}/grants/{nas_id}",dependencies=[Depends(auth)])
+def set_device_group_grant(group_id:int,nas_id:int,body:DeviceGrant):
+    with db() as conn:
+        if not conn.execute("SELECT id FROM zradius_device_user_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone():
+            raise HTTPException(404,"Device group not found")
+        if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(nas_id,)).fetchone():
+            raise HTTPException(404,"MikroTik NAS not found")
+        if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='device-aaa'",(nas_id,)).fetchone():
+            raise HTTPException(409,"Assign Device AAA service first")
+        if not conn.execute("SELECT 1 FROM zradius_device_role_catalog WHERE name=%s",(body.role,)).fetchone():
+            raise HTTPException(422,"Unknown RouterOS role")
+        conn.execute("""INSERT INTO zradius_device_group_grants(group_id,nas_id,role,filter_id) VALUES (%s,%s,%s,%s)
+            ON CONFLICT(group_id,nas_id) DO UPDATE SET role=excluded.role,filter_id=excluded.filter_id""",(group_id,nas_id,body.role,body.filter_id))
+        audit(conn,"device.group.grant.set",f"{group_id}:{nas_id}:{body.role}")
+    return {"role":body.role,"filter_id":body.filter_id}
+
+@app.delete("/api/v1/device-aaa/groups/{group_id}/grants/{nas_id}",dependencies=[Depends(auth)])
+def remove_device_group_grant(group_id:int,nas_id:int):
+    with db() as conn:
+        conn.execute("DELETE FROM zradius_device_group_grants WHERE group_id=%s AND nas_id=%s",(group_id,nas_id))
+        audit(conn,"device.group.grant.remove",f"{group_id}:{nas_id}")
+    return {"status":"removed"}
+
+@app.get("/api/v1/device-aaa/users/{user_id}/effective-grants",dependencies=[Depends(auth)])
+def effective_device_grants(user_id:int):
+    with db() as conn:
+        return conn.execute("""SELECT g.nas_id,n.shortname,g.role,g.filter_id,g.source
+            FROM zradius_device_effective_grants g JOIN nas n ON n.id=g.nas_id
+            WHERE g.user_id=%s ORDER BY n.shortname""",(user_id,)).fetchall()
