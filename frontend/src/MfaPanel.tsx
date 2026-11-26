@@ -11,7 +11,17 @@ export default function MfaPanel({request}:{request:Request}){
  const [error,setError]=useState('');
  const [form]=Form.useForm();
  useEffect(()=>{let active=true;request<Status>('iam/mfa/status').then(v=>{if(active)setStatus(v)}).catch(()=>{if(active)setError('Не удалось получить состояние MFA')});return()=>{active=false}},[request]);
- async function submit(v:{password:string;otp?:string}){
+ async function submit(values:Record<string,unknown>){
+  const password=values.password;
+  const otp=values.otp;
+  if(typeof password!=='string'||!password||password.length>128){
+   setError('Введите текущий пароль');return;
+  }
+  if((status?.enabled||enrollment)&&(typeof otp!=='string'||otp.length<6||otp.length>64)){
+   setError('Введите код подтверждения');return;
+  }
+  const v:{password:string;otp?:string}={password};
+  if(typeof otp==='string'&&otp)v.otp=otp;
   setBusy(true);setError('');
   try{
    if(status?.enabled){await request('iam/mfa/disable','POST',v);window.location.reload();return}
