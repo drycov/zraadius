@@ -2426,3 +2426,73 @@ def identity_services(identity_id:int,body:IdentityServices):
         return {"status":"updated"}
     except UniqueViolation:
         raise HTTPException(409,"Existing independent login or static IP conflict")
+
+
+@app.get("/api/v1/identities/{identity_id}/assignments",dependencies=[Depends(auth)])
+def identity_assignments(identity_id:int):
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone():
+            raise HTTPException(404,"Identity not found")
+        direct=conn.execute("""SELECT g.nas_id,g.role,g.filter_id,g.profile_id FROM zradius_device_grants g
+            JOIN zradius_device_users u ON u.id=g.user_id WHERE u.identity_id=%s ORDER BY g.nas_id""",(identity_id,)).fetchall()
+        inherited=conn.execute("""SELECT g.id,g.name FROM zradius_device_user_groups g JOIN zradius_device_user_members m ON m.group_id=g.id
+            JOIN zradius_device_users u ON u.id=m.user_id WHERE u.identity_id=%s ORDER BY g.name""",(identity_id,)).fetchall()
+        vpn=conn.execute("""SELECT nas_id,profile_id,group_id,address_space_id,host(static_ip) AS static_ip,description
+            FROM zradius_l2tp_users WHERE identity_id=%s""",(identity_id,)).fetchone()
+        return {"device_grants":direct,"device_groups":inherited,"l2tp":vpn}
+
+class IdentityGrantSet(BaseModel):
+    grants:list[IdentityDeviceAssignment]=Field(max_length=200)
+    group_ids:list[int]=Field(default_factory=list,max_length=200)
+
+@app.put("/api/v1/identities/{identity_id}/device-policy",dependencies=[Depends(auth)])
+def identity_device_policy(identity_id:int,body:IdentityGrantSet):
+    if len({g.nas_id for g in body.grants})!=len(body.grants) or len(set(body.group_ids))!=len(body.group_ids):
+        raise HTTPException(422,"Duplicate assignment")
+    with db() as conn:
+        identity=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if not identity:
+            raise HTTPException(404,"Identity not found")
+        user=conn.execute("SELECT id FROM zradius_device_users WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if not user:
+            raise HTTPException(409,"Assign Device AAA service first")
+        prepared=[]
+        for grant in sorted(body.grants,key=lambda x:x.nas_id):
+            if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(grant.nas_id,)).fetchone():
+                raise HTTPException(404,"MikroTik NAS not found")
+            if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='device-aaa'",(grant.nas_id,)).fetchone():
+                raise HTTPException(409,"Assign Device AAA service first")
+            role,filter_id,profile_id=resolve_device_grant(conn,grant)
+            prepared.append((user["id"],grant.nas_id,role,filter_id,profile_id))
+        for group_id in sorted(body.group_ids):
+            if not conn.execute("SELECT id FROM zradius_device_user_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone():
+                raise HTTPException(404,"Device group not found")
+        conn.execute("DELETE FROM zradius_device_grants WHERE user_id=%s",(user["id"],))
+        for row in prepared:
+            conn.execute("INSERT INTO zradius_device_grants(user_id,nas_id,role,filter_id,profile_id) VALUES (%s,%s,%s,%s,%s)",row)
+        conn.execute("DELETE FROM zradius_device_user_members WHERE user_id=%s",(user["id"],))
+        for group_id in body.group_ids:
+            conn.execute("INSERT INTO zradius_device_user_members(group_id,user_id) VALUES (%s,%s)",(group_id,user["id"]))
+        audit(conn,"identity.device.policy",identity["username"])
+    return {"status":"updated"}
+
+@app.put("/api/v1/identities/{identity_id}/vpn-policy",dependencies=[Depends(auth)])
+def identity_vpn_policy(identity_id:int,body:L2tpAssignment):
+    try:
+        address=static_address(body.static_ip)
+        with db() as conn:
+            lock_ppp_policy(conn)
+            identity=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+            if not identity:
+                raise HTTPException(404,"Identity not found")
+            validate_l2tp_assignment(conn,body,address)
+            row=conn.execute("""UPDATE zradius_l2tp_users SET nas_id=%s,profile_id=%s,group_id=%s,address_space_id=%s,static_ip=%s::inet,description=%s
+                WHERE identity_id=%s RETURNING id""",(body.nas_id,body.profile_id,body.group_id,body.address_space_id,address,body.description,identity_id)).fetchone()
+            if not row:
+                raise HTTPException(409,"Assign L2TP service first")
+            audit(conn,"identity.vpn.policy",identity["username"])
+        return {"status":"updated"}
+    except ValueError:
+        raise HTTPException(422,"Invalid static IPv4")
+    except UniqueViolation:
+        raise HTTPException(409,"Static IP already assigned")
