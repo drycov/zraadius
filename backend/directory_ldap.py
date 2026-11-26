@@ -5,7 +5,7 @@ import ssl
 from uuid import UUID
 from ldap3 import Server, Connection, Tls, SUBTREE, NONE
 
-def discover(profile=None, test_only=False, object_guid=None):
+def discover(profile=None, test_only=False, object_guid=None, groups=False, member_dn=None):
     host=os.environ.get("ZRADIUS_LDAP_HOST","")
     base=os.environ.get("ZRADIUS_LDAP_BASE_DN","")
     bind=os.environ.get("ZRADIUS_LDAP_BIND_DN","")
@@ -29,6 +29,21 @@ def discover(profile=None, test_only=False, object_guid=None):
                 raise ValueError("LDAP base not readable")
             return {"status":"ok","tls":True,"base_readable":True}
         guid_filter="" if object_guid is None else "(objectGUID="+ "".join("\\%02x"%v for v in UUID(str(object_guid)).bytes_le)+")"
+        if groups:
+            # AD security-enabled bit, not distribution groups.
+            filt="(&(objectClass=group)(groupType:1.2.840.113556.1.4.803:=2147483648)"+guid_filter+")"
+            conn.search(base,filt,search_scope=SUBTREE,attributes=["objectGUID","cn","distinguishedName"],size_limit=201,time_limit=10)
+            items=[]
+            for entry in conn.entries[:200]:
+                raw=entry.entry_raw_attributes.get("objectGUID",[])
+                if len(raw)!=1 or len(raw[0])!=16:
+                    raise ValueError("Missing group GUID")
+                items.append({"object_guid":str(UUID(bytes_le=raw[0])),"name":str(entry.cn.value)[:256],"distinguished_name":entry.entry_dn})
+            return {"items":items,"limited":len(conn.entries)>200}
+        if member_dn is not None:
+            from ldap3.utils.conv import escape_filter_chars
+            # Explicit direct membership only; no nested or primary-group expansion.
+            guid_filter+="(memberOf="+escape_filter_chars(member_dn)+")"
         conn.search(base,"(&(objectCategory=person)(objectClass=user)"+guid_filter+")",search_scope=SUBTREE,
                     attributes=["sAMAccountName","displayName","department","userAccountControl","objectGUID"],size_limit=201,time_limit=10)
         rows=[]
