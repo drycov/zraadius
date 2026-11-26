@@ -36,11 +36,12 @@ jobs:
           docker compose build
       - name: Start isolated AAA stack
         run: |
-          printf 'POSTGRES_PASSWORD=%s\nADMIN_TOKEN=%s\nRADIUS_TEST_SECRET=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
+          printf 'POSTGRES_PASSWORD=%s\nADMIN_TOKEN=%s\nRADIUS_TEST_SECRET=%s\nZRADIUS_API_DB_PASSWORD=%s\nZRADIUS_RUNTIME_DB_PASSWORD=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
           docker compose up -d
           python scripts/wait-radius.py
           docker compose run --rm migrate
           docker compose exec -T api alembic current
+          docker compose exec -T api python check_db_roles.py
       - name: AAA integration
         run: |
           set -a

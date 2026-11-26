@@ -11,7 +11,7 @@ case "$fingerprint" in ""|*[!0-9a-f]*) exit 1;; esac
 export PGPASSWORD="$RADIUS_DB_PASSWORD"
 export PGCONNECT_TIMEOUT=3
 # Input is restricted above; psql variables are quoted as SQL literals.
-result=$(psql -X -h postgres -U radius -d radius -v ON_ERROR_STOP=1 -At -v fp="$fingerprint" -v source="$2" <<'SQL'
+result=$(psql -X -h postgres -U zradius_runtime -d radius -v ON_ERROR_STOP=1 -At -v fp="$fingerprint" -v source="$2" <<'SQL'
 SELECT count(*) FROM zradius_pki_certificates c
 JOIN zradius_pki_grants g ON g.fingerprint=c.fingerprint
 JOIN nas n ON n.id=g.nas_id

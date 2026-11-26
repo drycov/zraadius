@@ -3,7 +3,7 @@ sql {
  driver = "rlm_sql_postgresql"
  server = "postgres"
  port = 5432
- login = "radius"
+ login = "zradius_runtime"
  password = "$ENV{RADIUS_DB_PASSWORD}"
  radius_db = "radius"
  acct_table1 = "radacct"

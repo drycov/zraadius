@@ -15,7 +15,7 @@ export PGPASSWORD="$RADIUS_DB_PASSWORD"
 export PGCONNECT_TIMEOUT=3
 wait_schema() {
   attempt=0
-  until [ "$(psql -h postgres -U radius -d radius -Atqc "$1" 2>/dev/null || true)" = t ]; do
+  until [ "$(psql -h postgres -U zradius_runtime -d radius -Atqc "$1" 2>/dev/null || true)" = t ]; do
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 60 ]; then echo 'Database schema readiness timeout' >&2; exit 1; fi
     sleep 2
@@ -24,7 +24,7 @@ wait_schema() {
 wait_schema "SELECT to_regclass('public.radcheck') IS NOT NULL AND to_regclass('public.radacct') IS NOT NULL AND to_regclass('public.nas') IS NOT NULL AND to_regclass('public.nasreload') IS NOT NULL AND to_regclass('public.zradius_device_auth_log') IS NOT NULL AND to_regclass('public.zradius_hotspot_vouchers') IS NOT NULL AND to_regclass('public.zradius_ipoe_bindings') IS NOT NULL AND to_regclass('public.zradius_nas_services') IS NOT NULL"
 if [ "${RADIUS_ENABLE_NAS:-false}" = true ]; then
   umask 027
-  psql -h postgres -U radius -d radius -v ON_ERROR_STOP=1 -At <<'SQL' > /etc/freeradius/3.0/zradius-clients.conf
+  psql -h postgres -U zradius_runtime -d radius -v ON_ERROR_STOP=1 -At <<'SQL' > /etc/freeradius/3.0/zradius-clients.conf
 SELECT format(E'client managed_%s {\n ipaddr = %s\n secret = "%s"\n require_message_authenticator = yes\n}', id, host(nasname::inet), secret)
 FROM nas
 WHERE nasname !~ '/' AND secret ~ '^[A-Za-z0-9]{32,128}$'
@@ -73,7 +73,7 @@ printf 'proxy server {\n default_fallback = no\n}\n' > /etc/freeradius/3.0/proxy
 if [ "${RADIUS_ENABLE_PROXY:-false}" = true ]; then
   wait_schema "SELECT to_regclass('public.zradius_proxy_realms') IS NOT NULL AND to_regclass('public.zradius_proxy_grants') IS NOT NULL"
   umask 077
-  psql -h postgres -U radius -d radius -v ON_ERROR_STOP=1 -At <<'SQL' >> /etc/freeradius/3.0/proxy.conf
+  psql -h postgres -U zradius_runtime -d radius -v ON_ERROR_STOP=1 -At <<'SQL' >> /etc/freeradius/3.0/proxy.conf
 SELECT format(E'home_server proxy_auth_%s {\n type = auth\n ipaddr = %s\n port = 1812\n secret = "%s"\n status_check = status-server\n}\nhome_server proxy_acct_%s {\n type = acct\n ipaddr = %s\n port = 1813\n secret = "%s"\n status_check = status-server\n}\nhome_server_pool proxy_auth_pool_%s {\n type = fail-over\n home_server = proxy_auth_%s\n}\nhome_server_pool proxy_acct_pool_%s {\n type = fail-over\n home_server = proxy_acct_%s\n}\nrealm "%s" {\n auth_pool = proxy_auth_pool_%s\n acct_pool = proxy_acct_pool_%s\n nostrip\n}',id,host(home_ip),secret,id,host(home_ip),secret,id,id,id,id,realm,id,id)
 FROM zradius_proxy_realms WHERE enabled
 ORDER BY id;

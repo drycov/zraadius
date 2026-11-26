@@ -14,12 +14,14 @@ services:
       retries: 15
   migrate:
     build: ./backend
-    command: ["alembic", "upgrade", "head"]
+    command: ["sh", "-ec", "alembic upgrade head && python provision_roles.py"]
     environment:
       PGHOST: postgres
       PGDATABASE: radius
       PGUSER: radius
       PGPASSWORD: ${POSTGRES_PASSWORD:?required}
+      ZRADIUS_API_DB_PASSWORD: ${ZRADIUS_API_DB_PASSWORD:?required}
+      ZRADIUS_RUNTIME_DB_PASSWORD: ${ZRADIUS_RUNTIME_DB_PASSWORD:?required}
     depends_on:
       postgres:
         condition: service_healthy
@@ -27,7 +29,7 @@ services:
   radius:
     build: ./freeradius
     environment:
-      RADIUS_DB_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      RADIUS_DB_PASSWORD: ${ZRADIUS_RUNTIME_DB_PASSWORD:?required}
       RADIUS_TEST_SECRET: ${RADIUS_TEST_SECRET:?required}
       TZ: UTC
       RADIUS_ENABLE_SQLIPPOOL: ${RADIUS_ENABLE_SQLIPPOOL:-false}
@@ -46,8 +48,8 @@ services:
     environment:
       PGHOST: postgres
       PGDATABASE: radius
-      PGUSER: radius
-      PGPASSWORD: ${POSTGRES_PASSWORD:?required}
+      PGUSER: zradius_api
+      PGPASSWORD: ${ZRADIUS_API_DB_PASSWORD:?required}
       RADIUS_ENABLE_SQLIPPOOL: ${RADIUS_ENABLE_SQLIPPOOL:-false}
       ADMIN_TOKEN: ${ADMIN_TOKEN:?required}
       COA_ENABLED: ${COA_ENABLED:-false}
