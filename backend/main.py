@@ -259,3 +259,16 @@ def dictionaries():
         {"name":"Idle-Timeout","vendor":0,"type":"integer","list":"reply"},
         {"name":"Simultaneous-Use","vendor":0,"type":"integer","list":"control"}
     ]
+
+@app.get("/api/v1/dashboard", dependencies=[Depends(auth)])
+def dashboard():
+    with db() as conn:
+        return conn.execute("""SELECT
+            (SELECT count(DISTINCT username) FROM radcheck) AS users,
+            (SELECT count(*) FROM zradius_disabled_users) AS disabled_users,
+            (SELECT count(*) FROM zradius_groups) AS groups,
+            (SELECT count(*) FROM nas) AS nas,
+            (SELECT count(*) FROM radacct WHERE acctstoptime IS NULL) AS open_sessions,
+            (SELECT count(*) FROM radacct) AS accounting_records,
+            (SELECT count(*) FROM zradius_audit WHERE created_at >= now()-interval '24 hours') AS audit_24h
+        """).fetchone()

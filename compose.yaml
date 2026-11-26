@@ -35,6 +35,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    expose:
+      - "8080"
+    restart: unless-stopped
+  web:
+    build: ./frontend
+    depends_on:
+      - api
     ports:
       - "127.0.0.1:8080:8080"
     restart: unless-stopped
