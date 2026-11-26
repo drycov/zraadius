@@ -879,3 +879,54 @@ def device_auth_log(limit:int=100,offset:int=0):
         raise HTTPException(422,"Invalid pagination")
     with db() as conn:
         return conn.execute("SELECT id,username,host(source_ip) AS source_ip,result,created_at FROM zradius_device_auth_log ORDER BY id DESC LIMIT %s OFFSET %s",(limit,offset)).fetchall()
+
+# PEAP-MSCHAPv2 credentials are independent from PPP and device administrators.
+class EapUser(BaseModel):
+    username:str=Field(min_length=1,max_length=64,pattern=r"^[a-zA-Z0-9_.-]+$")
+    nt_password:SecretStr=Field(min_length=32,max_length=32)
+    vlan_id:int|None=Field(default=None,ge=1,le=4094)
+
+@app.get("/api/v1/eap/users",dependencies=[Depends(auth)])
+def eap_users():
+    with db() as conn:
+        return conn.execute("SELECT username,enabled,vlan_id,created_at FROM zradius_eap_users ORDER BY username").fetchall()
+
+@app.put("/api/v1/eap/users/{username}",dependencies=[Depends(auth)])
+def upsert_eap_user(username:str,body:EapUser):
+    import re
+    digest=body.nt_password.get_secret_value().lower()
+    if username!=body.username or not re.fullmatch(r"[0-9a-f]{32}",digest):
+        raise HTTPException(422,"Invalid identity or NT hash")
+    with db() as conn:
+        conn.execute("""INSERT INTO zradius_eap_users(username,nt_password,vlan_id) VALUES (%s,%s,%s)
+            ON CONFLICT(username) DO UPDATE SET nt_password=excluded.nt_password,vlan_id=excluded.vlan_id""",(username,digest,body.vlan_id))
+        audit(conn,"eap.user.upsert",username)
+    return {"username":username}
+
+@app.put("/api/v1/eap/users/{username}/state",dependencies=[Depends(auth)])
+def eap_user_state(username:str,body:UserState):
+    with db() as conn:
+        if not conn.execute("UPDATE zradius_eap_users SET enabled=%s WHERE username=%s RETURNING username",(body.enabled,username)).fetchone():
+            raise HTTPException(404,"EAP user not found")
+        audit(conn,"eap.user.state",username)
+    return {"enabled":body.enabled}
+
+@app.put("/api/v1/eap/users/{username}/grants/{nas_id}",dependencies=[Depends(auth)])
+def eap_grant(username:str,nas_id:int):
+    with db() as conn:
+        if not conn.execute("SELECT username FROM zradius_eap_users WHERE username=%s FOR UPDATE",(username,)).fetchone():
+            raise HTTPException(404,"EAP user not found")
+        if not conn.execute("SELECT id FROM nas WHERE id=%s FOR UPDATE",(nas_id,)).fetchone():
+            raise HTTPException(404,"NAS not found")
+        if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code IN ('dot1x','wpa-enterprise')",(nas_id,)).fetchone():
+            raise HTTPException(409,"Assign EAP service first")
+        conn.execute("INSERT INTO zradius_eap_grants VALUES (%s,%s) ON CONFLICT DO NOTHING",(username,nas_id))
+        audit(conn,"eap.grant",f"{username}:{nas_id}")
+    return {"status":"assigned"}
+
+@app.delete("/api/v1/eap/users/{username}/grants/{nas_id}",dependencies=[Depends(auth)])
+def revoke_eap_grant(username:str,nas_id:int):
+    with db() as conn:
+        conn.execute("DELETE FROM zradius_eap_grants WHERE username=%s AND nas_id=%s",(username,nas_id))
+        audit(conn,"eap.grant.remove",f"{username}:{nas_id}")
+    return {"status":"removed"}

@@ -1,0 +1,7 @@
+# Optional EAP profile; no additional published ports.
+services:
+  radius:
+    environment:
+      RADIUS_ENABLE_EAP: "true"
+    volumes:
+      - "${RADIUS_PKI_DIR:-./pki}:/run/zradius-pki:ro"
