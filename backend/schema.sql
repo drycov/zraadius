@@ -258,3 +258,18 @@ CREATE TABLE IF NOT EXISTS zradius_eap_grants (
  PRIMARY KEY(username,nas_id)
 );
 UPDATE zradius_services SET maturity='experimental' WHERE code IN ('dot1x','wpa-enterprise') AND maturity='planned';
+
+CREATE TABLE IF NOT EXISTS zradius_pki_certificates (
+ fingerprint varchar(64) PRIMARY KEY,
+ purpose text NOT NULL CHECK(purpose IN ('ca','server','client')),
+ subject text NOT NULL, issuer text NOT NULL, serial text NOT NULL,
+ not_before timestamptz NOT NULL, not_after timestamptz NOT NULL,
+ pem text NOT NULL, revoked_at timestamptz,
+ created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS zradius_pki_grants (
+ fingerprint varchar(64) REFERENCES zradius_pki_certificates(fingerprint) ON DELETE CASCADE,
+ nas_id bigint REFERENCES nas(id) ON DELETE CASCADE,
+ vlan_id integer CHECK(vlan_id BETWEEN 1 AND 4094),
+ PRIMARY KEY(fingerprint,nas_id)
+);
