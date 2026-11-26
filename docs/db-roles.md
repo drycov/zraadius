@@ -1,2 +1,34 @@
-# Database access separation
-The existing radius PostgreSQL owner is retained for compatibility with existing volumes and used only by PostgreSQL initialization and the one-shot migrate service. Migrate runs Alembic then provisions two non-superuser login roles: zradius_api and zradius_runtime. Distinct random passwords (at least 32 characters) are mandatory. API can manage configuration and read accounting; runtime reads authentication/configuration and writes accounting, lease state and device auth logs. No schema CREATE or owner membership. Explicit grants refreshed on each migration, with sequence permissions derived from actual defaults. No global future-table grants. Existing unrelated PUBLIC table grants or role privileges are not comprehensively audited; use a dedicated database. Legacy owner is still a PostgreSQL superuser; owner/migration separation, monitor and backup roles and credential encryption remain future work. Back up DB, stop api and radius, add new env secrets, rebuild and run migrate before restarting. Changing passwords requires migration and recreating API/radius. Verify actual runtime SQL privileges in isolated CI; optional EAP/proxy/IP pool tests pending.
+# Database roles
+
+## Roles
+
+| Role | Who uses it | Privileges (intent) |
+|------|-------------|---------------------|
+| `radius` | Postgres init + `migrate` only | Owner / migration superuser of the cluster role |
+| `zradius_api` | API container (`PGUSER`) | SELECT/INSERT/UPDATE/DELETE on management and config tables; SELECT on accounting-ish tables; **no** schema CREATE |
+| `zradius_runtime` | FreeRADIUS SQL module | SELECT on auth/config tables; INSERT/UPDATE on accounting, postauth, leases, device auth log |
+
+Passwords must be **distinct**, random, length ≥32. `provision_roles.py` recreates login attributes and **refreshes grants** on every migrate run. Sequence grants are discovered from column defaults, not hard-coded names.
+
+## Migrate command
+
+```text
+alembic upgrade head && python provision_roles.py
+```
+
+API and radius both require migrate to have completed successfully in Compose.
+
+## Verification helpers
+
+- `check_db_roles.py` — asserts current user is `zradius_api` without superuser/CREATE and without DELETE on `radacct`
+- API `GET /health/ready` runs `require_schema`
+
+## Password change
+
+Update `.env`, re-run migrate (role `ALTER … PASSWORD`), recreate api/radius containers. Existing sealed data is independent of DB role passwords.
+
+## Limits
+
+- Owner remains a powerful PostgreSQL role; full migrate as non-superuser is future work
+- No comprehensive audit of unrelated `PUBLIC` grants — use a dedicated database
+- No automatic future-table grants; new tables need grant list updates in `provision_roles.py`

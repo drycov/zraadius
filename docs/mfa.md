@@ -1,4 +1,33 @@
-# Optional management MFA
-TOTP SHA1/6 digits/30 seconds, +/- one step, consumed under user row lock. AES-GCM encrypted seed, ten-minute pending enrollment, ten one-time recovery codes stored as SHA-256 digests. Login requires password and OTP together; no session before both factors pass. Enrollment/disable revoke all sessions. Proof endpoints rate limited. Legacy token bypasses personal MFA: keep disabled. Mandatory MFA, QR rendering and administrator recovery are not implemented. Requires HTTPS and synchronized clocks. Tests added; runtime unverified.
+# Management MFA
 
-Web Console: My Account contains MFA status, local Ant Design QR code, manual key, confirmation and disable forms, and one-time recovery code display. QR generation is entirely browser-local; no secret is sent to an external QR service. Restarting enrollment replaces the pending seed; password change clears pending enrollment. Mandatory MFA and admin recovery remain unimplemented. Runtime validation pending.
+Implemented in `backend/mfa.py` and endpoints under `/api/v1/iam/mfa/*`. UI: `MfaPanel` on account page.
+
+## Algorithm
+
+- TOTP: SHA1, 6 digits, 30-second step, ±1 step window
+- Seed sealed with AES-GCM (`secret_crypto`) bound to user id
+- Pending enrollment expires in **10 minutes**
+- **10** one-time recovery codes stored as SHA-256 digests
+- Successful TOTP updates `mfa_last_step` (replay protection)
+- Recovery code is removed from the array on use and audited
+
+## Endpoints (authenticated personal session)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/v1/iam/mfa/status` | Enabled flag + recovery codes remaining |
+| POST | `/api/v1/iam/mfa/setup` | Body `{password}` → secret + otpauth URI |
+| POST | `/api/v1/iam/mfa/confirm` | Body `{password, otp}` → recovery codes once |
+| POST | `/api/v1/iam/mfa/disable` | Body `{password, otp}` |
+
+Enrollment and disable **revoke existing sessions**.
+
+## Login with MFA
+
+When MFA is enabled, login requires TOTP or recovery code with the password.
+
+## Gaps
+
+- No forced org-wide MFA policy
+- Legacy `ADMIN_TOKEN` bypasses personal MFA when enabled
+- Requires synchronized clocks and HTTPS for real deployments
