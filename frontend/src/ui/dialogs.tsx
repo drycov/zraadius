@@ -1,0 +1,9 @@
+import React,{useEffect,useRef,useState} from 'react';
+import {createPortal} from 'react-dom';
+import {Button,Space} from './primitives';
+type Node=React.ReactNode;type Style=React.CSSProperties;type Children={children?:Node;className?:string;style?:Style};
+export function Modal({open,title,children,footer,onCancel,onOk,confirmLoading,cancelButtonProps}:Children&{open:boolean;title?:Node;footer?:Node;onCancel?:()=>void;onOk?:()=>void;confirmLoading?:boolean;destroyOnClose?:boolean;cancelButtonProps?:{style?:Style}}){
+ const ref=useRef<HTMLDialogElement>(null);useEffect(()=>{const d=ref.current;if(open&&d&&!d.open)d.showModal();else if(!open&&d?.open)d.close()},[open]);if(!open)return null;
+ return createPortal(<dialog ref={ref} className="dk-modal zr-dialog" onCancel={e=>{e.preventDefault();if(!confirmLoading)onCancel?.()}}><div className="dk-modal__head"><h3>{title}</h3><Button disabled={confirmLoading} aria-label="Закрыть" onClick={onCancel}>×</Button></div><div className="dk-modal__body">{children}</div>{footer!==null&&<div className="dk-modal__foot">{footer??<Space><Button style={cancelButtonProps?.style} disabled={confirmLoading} onClick={onCancel}>Отмена</Button><Button type="primary" loading={confirmLoading} onClick={onOk??onCancel}>OK</Button></Space>}</div>}</dialog>,document.body)
+}
+export function Popconfirm({title,onConfirm,children}:{title:Node;onConfirm:()=>unknown;children:React.ReactElement}){const [open,setOpen]=useState(false);const [busy,setBusy]=useState(false);return <>{React.cloneElement(children,{onClick:(e:any)=>{e.preventDefault();setOpen(true)}})}<Modal open={open} title={title} confirmLoading={busy} onCancel={()=>setOpen(false)} onOk={async()=>{setBusy(true);try{await onConfirm();setOpen(false)}finally{setBusy(false)}}}><p>Подтвердите действие.</p></Modal></>}

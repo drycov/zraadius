@@ -1,0 +1,9 @@
+import React,{useEffect,useMemo,useState} from 'react';
+import {Alert,App,Button,Card,Checkbox,Col,Form,Input,InputNumber,Modal,Popconfirm,Row,Select,Space,Table,Tag,Typography} from '../ui';
+import {ReloadOutlined} from '../ui/icons';
+import {type Request,type User,type Group,type Nas,type Session,type Audit,type Dashboard,type Attribute} from '../api';
+import {StatCard} from '../vendor/design-kit/components/StatCard';
+import MfaPanel from '../MfaPanel';
+import {enc,useData,useAction,Fault} from '../hooks';
+const {Text}=Typography;
+export default function Audits({request}:{request:Request}){const d=useData<Audit[]>(request,'audit');return <Space direction="vertical" className="full"><Fault error={d.error}/><Button onClick={d.refresh}>Обновить</Button><Table<Audit> rowKey="id" loading={d.loading} dataSource={d.data??[]} columns={[{title:'Операция',dataIndex:'action'},{title:'Объект',dataIndex:'subject'},{title:'Время',dataIndex:'created_at'}]}/></Space>}

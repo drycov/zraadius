@@ -1,0 +1,13 @@
+import React,{useEffect,useMemo,useState} from 'react';
+import {Alert,App,Button,Card,Checkbox,Col,Form,Input,InputNumber,Modal,Popconfirm,Row,Select,Space,Table,Tag,Typography} from '../ui';
+import {ReloadOutlined} from '../ui/icons';
+import {type Request,type User,type Group,type Nas,type Session,type Audit,type Dashboard,type Attribute} from '../api';
+import {StatCard} from '../vendor/design-kit/components/StatCard';
+import MfaPanel from '../MfaPanel';
+import {enc,useData,useAction,Fault} from '../hooks';
+const {Text}=Typography;
+type ProxyRealmRow={id:number;realm:string;home_ip:string;enabled:boolean};
+export default function ProxyPage({request}:{request:Request}){
+ const d=useData<ProxyRealmRow[]>(request,'proxy/realms');const n=useData<Nas[]>(request,'nas');const a=useAction(d.refresh);const [form]=Form.useForm();const [grant]=Form.useForm();
+ return <Space direction="vertical" className="full"><Alert type="warning" message="Экспериментальный Proxy. Включение realm требует перезапуска radius. Разрешите только доверенные upstream через firewall."/><Fault error={d.error||n.error}/><Card title="Home Server / Realm"><Form form={form} layout="vertical" onFinish={v=>a.run(()=>request('proxy/realms','POST',v),()=>form.resetFields())}><Form.Item name="realm" label="Realm" rules={[{required:true}]}><Input placeholder="partner.example"/></Form.Item><Form.Item name="home_ip" label="Upstream IPv4" rules={[{required:true}]}><Input/></Form.Item><Form.Item name="secret" label="Shared secret" rules={[{required:true,min:32}]}><Input.Password autoComplete="new-password"/></Form.Item><Button type="primary" htmlType="submit" loading={a.busy}>Создать</Button></Form></Card><Table<ProxyRealmRow> rowKey="id" dataSource={d.data??[]} loading={d.loading} columns={[{title:'Realm',dataIndex:'realm'},{title:'Home server',dataIndex:'home_ip'},{title:'Статус',render:(_,x)=><Tag>{x.enabled?'Enabled':'Disabled'}</Tag>},{title:'',render:(_,x)=><Button disabled={a.busy} onClick={()=>a.run(()=>request('proxy/realms/'+x.id+'/state','PUT',{enabled:!x.enabled}))}>{x.enabled?'Отключить':'Включить'}</Button>}]}/><Card title="Разрешить NAS"><Form form={grant} layout="inline" onFinish={v=>a.run(()=>request('proxy/realms/'+v.realm_id+'/grants/'+v.nas_id,'PUT'))}><Form.Item name="realm_id" rules={[{required:true}]}><Select placeholder="Realm" style={{minWidth:180}} options={(d.data??[]).map(x=>({value:x.id,label:x.realm}))}/></Form.Item><Form.Item name="nas_id" rules={[{required:true}]}><Select placeholder="NAS" style={{minWidth:180}} options={(n.data??[]).map(x=>({value:x.id,label:x.shortname}))}/></Form.Item><Button htmlType="submit" loading={a.busy}>Разрешить</Button></Form></Card></Space>
+}

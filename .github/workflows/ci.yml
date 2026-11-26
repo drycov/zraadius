@@ -16,6 +16,12 @@ jobs:
         working-directory: frontend
       - run: npm run build
         working-directory: frontend
+      - name: Install browser for UI tests
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: UI smoke tests (mock API)
+        working-directory: frontend
+        run: npm run test:e2e
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
