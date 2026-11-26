@@ -1,9 +1,10 @@
 export class ApiError extends Error {
  constructor(public status:number){super('HTTP '+status)}
 }
-export function client(token:string){
+export function client(token:string,onUnauthorized?:()=>void){
  return async function request<T>(path:string,method='GET',body?:unknown):Promise<T>{
   const response=await fetch('/api/v1/'+path,{method,headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});
+  if(response.status===401&&token&&onUnauthorized)onUnauthorized();
   if(!response.ok) throw new ApiError(response.status);
   return response.json() as Promise<T>;
  }

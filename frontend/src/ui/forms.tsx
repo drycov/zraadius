@@ -11,7 +11,7 @@ function makeForm(){
  set:(name:string,v:unknown)=>{values={...values,[name]:v};errors={...errors,[name]:''};notify()},
  setFieldsValue:(v:Values)=>{values={...values,...v};errors={};notify()},
  resetFields:()=>{values={...initial};errors={};notify()},
- validate:()=>{const result:Values={};const next:Record<string,string>={};for(const [name,f] of fields){const v=values[name];result[name]=v;const empty=v===undefined||v===null||v===''||(Array.isArray(v)&&!v.length);for(const rule of f.rules){if(rule.required&&empty){next[name]=rule.message??'Обязательное поле';break}if(!empty&&((rule.min!==undefined&&String(v).length<rule.min)||(rule.max!==undefined&&String(v).length>rule.max)||(rule.pattern&&!rule.pattern.test(String(v))))){next[name]=rule.message??'Проверьте значение';break}}}errors=next;notify();return Object.keys(next).length?null:result},
+ validate:()=>{const result:Values={};const next:Record<string,string>={};for(const [name,f] of fields){const v=values[name];result[name]=f.child.props.type==="checkbox"||f.child.type===Checkbox?(v??false):v;const empty=v===undefined||v===null||v===''||(Array.isArray(v)&&!v.length);for(const rule of f.rules){if(rule.required&&empty){next[name]=rule.message??'Обязательное поле';break}if(!empty&&((rule.min!==undefined&&String(v).length<rule.min)||(rule.max!==undefined&&String(v).length>rule.max)||(rule.pattern&&!rule.pattern.test(String(v))))){next[name]=rule.message??'Проверьте значение';break}}}errors=next;notify();return Object.keys(next).length?null:result},
  bind:(fn:()=>void)=>{submitter=fn;return()=>{submitter=()=>{}}},submit:()=>submitter()};
 }
 type FormInstance=ReturnType<typeof makeForm>;

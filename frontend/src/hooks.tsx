@@ -8,7 +8,7 @@ export function useData<T>(request:Request,path:string){
  const [error,setError]=useState('');
  const [loading,setLoading]=useState(true);
  const [revision,reload]=useState(0);
- useEffect(()=>{let active=true;setLoading(true);setError('');request<T>(path).then(v=>{if(active)setData(v)}).catch(e=>{if(active){setError(String(e.message));setData(undefined)}}).finally(()=>{if(active)setLoading(false)});return()=>{active=false}},[request,path,revision]);
+ useEffect(()=>{let active=true;setLoading(true);setError('');setData(undefined);request<T>(path).then(v=>{if(active)setData(v)}).catch(e=>{if(active){setError(String(e.message));setData(undefined)}}).finally(()=>{if(active)setLoading(false)});return()=>{active=false}},[request,path,revision]);
  return {data,error,loading,refresh:()=>reload(v=>v+1)};
 }
 export function Fault({error}:{error:string}){return error?<KitAlert tone="error">{error}</KitAlert>:null}

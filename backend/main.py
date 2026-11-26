@@ -135,17 +135,36 @@ def audits():
         return conn.execute("SELECT * FROM zradius_audit ORDER BY id DESC LIMIT 100").fetchall()
 
 @app.get("/api/v1/accounting", dependencies=[Depends(auth)])
-def accounting(limit: int = 100, offset: int = 0, active: bool = False):
+def accounting(limit: int = 100, offset: int = 0, active: bool = False, username: str | None = None, nas: IPvAnyAddress | None = None, before: int | None = None, order: Literal["desc","asc"] = "desc"):
     if not 1 <= limit <= 500 or offset < 0:
         raise HTTPException(422, "Invalid pagination")
+    if username is not None and (not username or len(username)>253):
+        raise HTTPException(422,"Invalid username")
+    if before is not None and (before<1 or offset or order!="desc"):
+        raise HTTPException(422,"Cursor requires descending order and zero offset")
+    clauses=[]
+    params=[]
+    if active:
+        clauses.append("acctstoptime IS NULL")
+    if username is not None:
+        clauses.append("username=%s")
+        params.append(username)
+    if nas is not None:
+        clauses.append("nasipaddress=%s::inet")
+        params.append(str(nas))
+    if before is not None:
+        clauses.append("radacctid<%s")
+        params.append(before)
+    where=" AND ".join(clauses) or "TRUE"
+    direction="ASC" if order=="asc" else "DESC"
     with db() as conn:
         return conn.execute(
-            """SELECT radacctid, username, acctsessionid, nasipaddress::text,
-               framedipaddress::text, acctstarttime, acctstoptime,
+            f"""SELECT radacctid, username, acctsessionid, host(nasipaddress) AS nasipaddress,
+               host(framedipaddress) AS framedipaddress, acctstarttime, acctstoptime,
                acctsessiontime, acctinputoctets, acctoutputoctets
-               FROM radacct WHERE (NOT %s OR acctstoptime IS NULL)
-               ORDER BY radacctid DESC LIMIT %s OFFSET %s""",
-            (active,limit,offset)
+               FROM radacct WHERE {where}
+               ORDER BY radacctid {direction} LIMIT %s OFFSET %s""",
+            (*params,limit,offset)
         ).fetchall()
 
 # Management operations. Never return credential attributes or NAS secrets.
