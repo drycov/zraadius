@@ -2376,6 +2376,9 @@ def set_identity_eap(conn,identity_id,service,assignment):
         (identity_id,service,assignment.nas_id,assignment.vlan_id))
 
 class IdentityCreate(BaseModel):
+    account_type:Literal["person","service"]="person"
+    account_owner:str=Field(default="",max_length=200)
+    account_purpose:str=Field(default="",max_length=500)
     username:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
     full_name:str=Field(default="",max_length=200)
     department:str=Field(default="",max_length=200)
@@ -2825,14 +2828,14 @@ def directory_preview(profile_id:int|None=None,principal=Depends(auth)):
     return result
 
 @app.get("/api/v1/identities",dependencies=[Depends(auth)])
-def identities(limit:int=100,offset:int=0,q:str="",enabled:bool|None=None):
+def identities(limit:int=100,offset:int=0,q:str="",enabled:bool|None=None,account_type:Literal["person","service"]|None=None):
     if not 1<=limit<=500 or offset<0:
         raise HTTPException(422,"Invalid pagination")
     q=q.strip()
     if len(q)>200:
         raise HTTPException(422,"Search query too long")
     with db() as conn:
-        return conn.execute("""SELECT i.id,i.username,i.full_name,i.department,i.enabled,
+        return conn.execute("""SELECT i.id,i.username,i.full_name,i.department,i.enabled,i.account_type,i.account_owner,i.account_purpose,
             d.id AS device_id,d.enabled AS device_enabled,v.id AS l2tp_id,v.enabled AS l2tp_enabled,
             (c.identity_id IS NOT NULL) AS credentials_ready,(c.nt_password IS NOT NULL) AS mschap_ready,
             pp.identity_id IS NOT NULL AS pppoe_assigned,pp.enabled AS pppoe_enabled,
@@ -2851,7 +2854,8 @@ def identities(limit:int=100,offset:int=0,q:str="",enabled:bool|None=None):
                 OR strpos(lower(i.full_name),lower(%s))>0
                 OR strpos(lower(i.department),lower(%s))>0)
             AND (%s::boolean IS NULL OR i.enabled=%s::boolean)
-            ORDER BY i.username,i.id LIMIT %s OFFSET %s""",(q,q,q,q,enabled,enabled,limit,offset)).fetchall()
+            AND (%s::text IS NULL OR i.account_type=%s)
+            ORDER BY i.username,i.id LIMIT %s OFFSET %s""",(q,q,q,q,enabled,enabled,account_type,account_type,limit,offset)).fetchall()
 
 class LegacyIdentityMigration(BaseModel):
     service:Literal["device","l2tp"]
@@ -2916,6 +2920,8 @@ def migrate_legacy_identity(body:LegacyIdentityMigration,principal=Depends(auth)
 
 @app.post("/api/v1/identities",status_code=201,dependencies=[Depends(auth)])
 def create_identity(body:IdentityCreate,principal=Depends(auth)):
+    if body.account_type=="service" and (body.console_role or not body.account_owner.strip() or not body.account_purpose.strip()):
+        raise HTTPException(422,"Service account requires owner and purpose; console access is prohibited")
     if body.console_role:
         personal_admin(principal)
     if __import__('re').fullmatch(r'hs-[a-f0-9]{20}',body.username):
@@ -2938,7 +2944,7 @@ def create_identity(body:IdentityCreate,principal=Depends(auth)):
                 UNION ALL SELECT 1 FROM zradius_admin_users WHERE username=%s
                 UNION ALL SELECT 1 FROM zradius_hotspot_vouchers WHERE username=%s LIMIT 1""",(body.username,)*6).fetchone():
                 raise HTTPException(409,"Existing service login requires explicit migration")
-            row=conn.execute("INSERT INTO zradius_identities(username,full_name,department) VALUES (%s,%s,%s) RETURNING id,username,enabled",(body.username,body.full_name,body.department)).fetchone()
+            row=conn.execute("INSERT INTO zradius_identities(username,full_name,department,account_type,account_owner,account_purpose) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id,username,enabled,account_type",(body.username,body.full_name,body.department,body.account_type,body.account_owner.strip(),body.account_purpose.strip())).fetchone()
             conn.execute("INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password,web_password_hash) VALUES (%s,%s,%s,%s)",(row["id"],digest,nt,hash_password(body.password.get_secret_value())))
             if body.device:
                 d=body.device
@@ -2986,6 +2992,31 @@ def identity_metadata(identity_id:int,body:IdentityMetadata):
             row=conn.execute("UPDATE zradius_identities SET full_name=%s,department=%s,updated_at=now() WHERE id=%s RETURNING id,username,full_name,department",(full_name,department,identity_id)).fetchone()
             audit(conn,"identity.metadata",row["username"])
         return row
+
+class IdentityProfile(BaseModel):
+    account_type:Literal["person","service"]
+    account_owner:str=Field(default="",max_length=200)
+    account_purpose:str=Field(default="",max_length=500)
+    model_config={"extra":"forbid"}
+
+@app.put("/api/v1/identities/{identity_id}/profile")
+def update_identity_profile(identity_id:int,body:IdentityProfile,principal=Depends(auth)):
+    personal_admin(principal)
+    owner,purpose=body.account_owner.strip(),body.account_purpose.strip()
+    if body.account_type=="service" and (not owner or not purpose):
+        raise HTTPException(422,"Service account requires owner and purpose")
+    if any(ord(ch)<32 or 127<=ord(ch)<=159 for ch in owner+purpose):
+        raise HTTPException(422,"Control characters are not allowed")
+    with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        row=conn.execute("SELECT id,username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Identity not found")
+        if body.account_type=="service" and (conn.execute("SELECT 1 FROM zradius_admin_users WHERE identity_id=%s",(identity_id,)).fetchone() or conn.execute("SELECT 1 FROM zradius_directory_identities WHERE identity_id=%s",(identity_id,)).fetchone()):
+            raise HTTPException(409,"Console or directory identity cannot be converted to service account")
+        result=conn.execute("UPDATE zradius_identities SET account_type=%s,account_owner=%s,account_purpose=%s,updated_at=now() WHERE id=%s RETURNING id,account_type,account_owner,account_purpose",(body.account_type,owner,purpose,identity_id)).fetchone()
+        audit(conn,"identity.profile",row["username"])
+        return result
 
 class IdentityBulkState(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
@@ -3530,9 +3561,11 @@ def update_identity_console(identity_id:int,body:IdentityConsoleUpdate,principal
     with db() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
         account=conn.execute("SELECT id,role,enabled FROM zradius_admin_users WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
-        row=conn.execute("SELECT username,enabled FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        row=conn.execute("SELECT username,enabled,account_type FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
         if not row:
             raise HTTPException(404,"Identity not found")
+        if body.enabled and row["account_type"]=="service":
+            raise HTTPException(409,"Service accounts cannot access Web Console")
         if body.enabled and not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s AND web_password_hash IS NOT NULL",(identity_id,)).fetchone():
             raise HTTPException(409,"Reset unified password first")
         if account:
