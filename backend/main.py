@@ -1193,7 +1193,7 @@ def own_password(body:OwnPassword,principal=Depends(auth)):
         if not row or not verify_password(row["password_hash"],body.current_password.get_secret_value()):
             raise HTTPException(401,"Invalid current password")
         digest=hash_password(body.password.get_secret_value())
-        conn.execute("UPDATE zradius_admin_users SET password_hash=%s WHERE id=%s",(digest,principal["id"]))
+        conn.execute("UPDATE zradius_admin_users SET password_hash=%s,mfa_pending=NULL,mfa_pending_until=NULL WHERE id=%s",(digest,principal["id"]))
         conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(principal["id"],))
         audit(conn,"iam.password.change",principal["username"])
     return {"status":"changed","reauthentication_required":True}
@@ -1202,7 +1202,7 @@ def own_password(body:OwnPassword,principal=Depends(auth)):
 def reset_management_password(user_id:int,body:ManagementPassword):
     digest=hash_password(body.password.get_secret_value())
     with db() as conn:
-        row=conn.execute("UPDATE zradius_admin_users SET password_hash=%s WHERE id=%s RETURNING username",(digest,user_id)).fetchone()
+        row=conn.execute("UPDATE zradius_admin_users SET password_hash=%s,mfa_pending=NULL,mfa_pending_until=NULL WHERE id=%s RETURNING username",(digest,user_id)).fetchone()
         if not row:
             raise HTTPException(404,"Management user not found")
         conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(user_id,))
@@ -1258,7 +1258,7 @@ def consume_mfa(conn,row,code):
     digest=token_digest(code)
     if any(secrets.compare_digest(digest,item) for item in row["mfa_recovery"]):
         conn.execute("UPDATE zradius_admin_users SET mfa_recovery=array_remove(mfa_recovery,%s) WHERE id=%s",(digest,row["id"]))
-        audit(conn,"iam.mfa.recovery.used",str(row["id"]))
+        conn.execute("INSERT INTO zradius_audit(action,subject,actor) VALUES (\'iam.mfa.recovery.used\',%s,%s)",(row["username"],row["username"]))
         return True
     return False
 

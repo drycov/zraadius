@@ -1,2 +1,4 @@
 # Optional management MFA
 TOTP SHA1/6 digits/30 seconds, +/- one step, consumed under user row lock. AES-GCM encrypted seed, ten-minute pending enrollment, ten one-time recovery codes stored as SHA-256 digests. Login requires password and OTP together; no session before both factors pass. Enrollment/disable revoke all sessions. Proof endpoints rate limited. Legacy token bypasses personal MFA: keep disabled. Mandatory MFA, QR rendering and administrator recovery are not implemented. Requires HTTPS and synchronized clocks. Tests added; runtime unverified.
+
+Web Console: My Account contains MFA status, local Ant Design QR code, manual key, confirmation and disable forms, and one-time recovery code display. QR generation is entirely browser-local; no secret is sent to an external QR service. Restarting enrollment replaces the pending seed; password change clears pending enrollment. Mandatory MFA and admin recovery remain unimplemented. Runtime validation pending.
