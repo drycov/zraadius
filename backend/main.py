@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from starlette.concurrency import run_in_threadpool
 from iam import hash_password, verify_password, token_digest, new_token, permitted
 from uuid import UUID
+from service_tokens import PREFIX as SERVICE_PREFIX, SCOPES as SERVICE_SCOPES, issue_token, valid_token, allowed as service_allowed
 from mfa import new_seed, seed_from_envelope, match_step, recovery_codes, uri as mfa_uri
 actor_context=ContextVar('actor',default=None)
 
@@ -43,6 +44,24 @@ async def auth(request:Request, credentials: HTTPAuthorizationCredentials | None
     if not credentials or len(credentials.credentials)>512:
         raise HTTPException(401,"Unauthorized")
     token=credentials.credentials
+    if token.startswith(SERVICE_PREFIX):
+        if not valid_token(token):
+            raise HTTPException(401,"Unauthorized")
+        def lookup_service():
+            with db() as conn:
+                return conn.execute("""SELECT a.name,t.id,t.scopes FROM zradius_service_tokens t
+                    JOIN zradius_service_accounts a ON a.id=t.account_id
+                    WHERE t.token_hash=%s AND t.revoked_at IS NULL AND t.expires_at>now() AND a.enabled""",
+                    (token_digest(token),)).fetchone()
+        service=await run_in_threadpool(lookup_service)
+        if not service:
+            raise HTTPException(401,"Unauthorized")
+        route=getattr(request.scope.get("route"),"path",None)
+        if not service_allowed(service["scopes"],request.method,route):
+            raise HTTPException(403,"Forbidden")
+        actor="service:"+str(service["id"])
+        actor_context.set(actor)
+        return {"username":actor,"role":"service"}
     legacy=os.getenv("ADMIN_TOKEN","")
     if os.getenv("ZRADIUS_LEGACY_TOKEN_ENABLED","false")=="true" and legacy and secrets.compare_digest(token.encode(),legacy.encode()):
         principal={"username":"legacy-token","role":"admin"}
@@ -1347,3 +1366,82 @@ def mfa_disable(body:MfaProof,principal=Depends(auth)):
         conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(row["id"],))
         audit(conn,"iam.mfa.disabled",row["username"])
     return {"status":"disabled","reauthentication_required":True}
+
+
+# Machine credentials may only be issued by personal administrators.
+class ServiceAccountCreate(BaseModel):
+    name: str = Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+
+class ServiceTokenCreate(BaseModel):
+    label: str = Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    scopes: list[str] = Field(min_length=1,max_length=32)
+    lifetime_days: int = Field(default=30,ge=1,le=365)
+
+def personal_admin(principal):
+    if principal.get("role")!="admin" or not principal.get("id"):
+        raise HTTPException(403,"Personal administrator required")
+
+@app.get("/api/v1/iam/service-scopes")
+def service_scopes(principal=Depends(auth)):
+    personal_admin(principal)
+    return sorted(SERVICE_SCOPES)
+
+@app.get("/api/v1/iam/service-accounts")
+def service_accounts(principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        return conn.execute("SELECT id,name,enabled,created_at FROM zradius_service_accounts ORDER BY id DESC LIMIT 500").fetchall()
+
+@app.post("/api/v1/iam/service-accounts",status_code=201)
+def create_service_account(body:ServiceAccountCreate,principal=Depends(auth)):
+    personal_admin(principal)
+    try:
+        with db() as conn:
+            row=conn.execute("INSERT INTO zradius_service_accounts(name) VALUES (%s) RETURNING id,name,enabled,created_at",(body.name,)).fetchone()
+            audit(conn,"iam.service.create",str(row["id"]))
+            return row
+    except UniqueViolation:
+        raise HTTPException(409,"Service account already exists")
+
+@app.put("/api/v1/iam/service-accounts/{account_id}/disable")
+def disable_service_account(account_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        if not conn.execute("UPDATE zradius_service_accounts SET enabled=false WHERE id=%s RETURNING id",(account_id,)).fetchone():
+            raise HTTPException(404,"Service account not found")
+        conn.execute("UPDATE zradius_service_tokens SET revoked_at=now() WHERE account_id=%s AND revoked_at IS NULL",(account_id,))
+        audit(conn,"iam.service.disable",str(account_id))
+        return {"enabled":False}
+
+@app.get("/api/v1/iam/service-accounts/{account_id}/tokens")
+def list_service_tokens(account_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        return conn.execute("SELECT id,label,scopes,created_at,expires_at,revoked_at FROM zradius_service_tokens WHERE account_id=%s ORDER BY created_at DESC LIMIT 500",(account_id,)).fetchall()
+
+@app.post("/api/v1/iam/service-accounts/{account_id}/tokens",status_code=201)
+def create_service_token(account_id:int,body:ServiceTokenCreate,response:Response,principal=Depends(auth)):
+    personal_admin(principal)
+    scopes=sorted(set(body.scopes))
+    if not set(scopes)<=SERVICE_SCOPES:
+        raise HTTPException(422,"Unknown service scope")
+    token,digest=issue_token()
+    with db() as conn:
+        account=conn.execute("SELECT enabled FROM zradius_service_accounts WHERE id=%s FOR UPDATE",(account_id,)).fetchone()
+        if not account or not account["enabled"]:
+            raise HTTPException(409,"Service account unavailable")
+        row=conn.execute("""INSERT INTO zradius_service_tokens(account_id,label,token_hash,scopes,expires_at)
+            VALUES (%s,%s,%s,%s,now()+%s*interval '1 day') RETURNING id,label,scopes,expires_at""",
+            (account_id,body.label,digest,scopes,body.lifetime_days)).fetchone()
+        audit(conn,"iam.service.token.issue",str(row["id"]))
+    response.headers["Cache-Control"]="no-store"
+    return {**row,"token":token}
+
+@app.delete("/api/v1/iam/service-accounts/{account_id}/tokens/{token_id}")
+def revoke_service_token(account_id:int,token_id:UUID,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        if not conn.execute("UPDATE zradius_service_tokens SET revoked_at=COALESCE(revoked_at,now()) WHERE account_id=%s AND id=%s RETURNING id",(account_id,token_id)).fetchone():
+            raise HTTPException(404,"Token not found")
+        audit(conn,"iam.service.token.revoke",str(token_id))
+        return {"revoked":True}
