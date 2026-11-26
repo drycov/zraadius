@@ -874,7 +874,27 @@ class DeviceUserCreate(BaseModel):
     username:str=Field(min_length=1,max_length=64,pattern=r"^[a-zA-Z0-9_.-]+$")
 
 class DeviceGrant(BaseModel):
-    role:Literal["read","write","full"]
+    role:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    filter_id:str|None=Field(default=None,min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+
+class DeviceRoleCreate(BaseModel):
+    name:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    description:str=Field(default="",max_length=200)
+
+@app.get("/api/v1/device-aaa/roles",dependencies=[Depends(auth)])
+def device_role_catalog():
+    with db() as conn:
+        return conn.execute("SELECT name,description FROM zradius_device_role_catalog ORDER BY name").fetchall()
+
+@app.post("/api/v1/device-aaa/roles",status_code=201,dependencies=[Depends(auth)])
+def create_device_role(body:DeviceRoleCreate):
+    with db() as conn:
+        row=conn.execute("INSERT INTO zradius_device_role_catalog(name,description) VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING name,description",(body.name,body.description)).fetchone()
+        if not row:
+            raise HTTPException(409,"Device role already exists")
+        audit(conn,"device.role.create",body.name)
+        return row
+
 
 @app.get("/api/v1/device-aaa/users",dependencies=[Depends(auth)])
 def device_users():
@@ -913,7 +933,7 @@ def rotate_device_password(user_id:int):
 @app.get("/api/v1/device-aaa/users/{user_id}/grants",dependencies=[Depends(auth)])
 def device_grants(user_id:int):
     with db() as conn:
-        return conn.execute("SELECT g.nas_id,n.shortname,g.role FROM zradius_device_grants g JOIN nas n ON n.id=g.nas_id WHERE g.user_id=%s ORDER BY n.shortname",(user_id,)).fetchall()
+        return conn.execute("SELECT g.nas_id,n.shortname,g.role,g.filter_id FROM zradius_device_grants g JOIN nas n ON n.id=g.nas_id WHERE g.user_id=%s ORDER BY n.shortname",(user_id,)).fetchall()
 
 @app.put("/api/v1/device-aaa/users/{user_id}/grants/{nas_id}",dependencies=[Depends(auth)])
 def set_device_grant(user_id:int,nas_id:int,body:DeviceGrant):
@@ -924,9 +944,12 @@ def set_device_grant(user_id:int,nas_id:int,body:DeviceGrant):
             raise HTTPException(404,"MikroTik NAS not found")
         if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='device-aaa'",(nas_id,)).fetchone():
             raise HTTPException(409,"Assign Device AAA service first")
-        conn.execute("INSERT INTO zradius_device_grants VALUES (%s,%s,%s) ON CONFLICT(user_id,nas_id) DO UPDATE SET role=excluded.role",(user_id,nas_id,body.role))
+        if not conn.execute("SELECT 1 FROM zradius_device_role_catalog WHERE name=%s",(body.role,)).fetchone():
+            raise HTTPException(422,"Unknown RouterOS role")
+        conn.execute("""INSERT INTO zradius_device_grants(user_id,nas_id,role,filter_id) VALUES (%s,%s,%s,%s)
+            ON CONFLICT(user_id,nas_id) DO UPDATE SET role=excluded.role,filter_id=excluded.filter_id""",(user_id,nas_id,body.role,body.filter_id))
         audit(conn,"device.grant.set",f"{user_id}:{nas_id}:{body.role}")
-    return {"role":body.role}
+    return {"role":body.role,"filter_id":body.filter_id}
 
 @app.delete("/api/v1/device-aaa/users/{user_id}/grants/{nas_id}",dependencies=[Depends(auth)])
 def delete_device_grant(user_id:int,nas_id:int):
