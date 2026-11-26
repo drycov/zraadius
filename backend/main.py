@@ -2490,6 +2490,50 @@ def identity_metadata(identity_id:int,body:IdentityMetadata):
             audit(conn,"identity.metadata",row["username"])
         return row
 
+class IdentityBulkState(BaseModel):
+    identity_ids:list[int]=Field(min_length=1,max_length=100)
+    enabled:bool
+    preview:bool=True
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/identities/bulk-state")
+def bulk_identity_state(body:IdentityBulkState,principal=Depends(auth)):
+    personal_admin(principal)
+    ids=sorted(set(body.identity_ids))
+    if len(ids)!=len(body.identity_ids) or ids[0]<=0:
+        raise HTTPException(422,"Invalid or duplicate identity IDs")
+    with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        accounts=conn.execute("SELECT id,identity_id,role,enabled FROM zradius_admin_users WHERE identity_id=ANY(%s) ORDER BY id FOR UPDATE",(ids,)).fetchall()
+        rows=conn.execute("SELECT id,username,enabled FROM zradius_identities WHERE id=ANY(%s) ORDER BY id FOR UPDATE",(ids,)).fetchall()
+        if len(rows)!=len(ids):
+            raise HTTPException(404,"One or more identities not found")
+        if not body.enabled:
+            if any(a["id"]==principal["id"] for a in accounts):
+                raise HTTPException(409,"Cannot block your own management account in bulk")
+            if any(a["role"]=="admin" and a["enabled"] for a in accounts):
+                if not conn.execute("""SELECT 1 FROM zradius_admin_users u WHERE u.role='admin' AND u.enabled
+                    AND (u.identity_id IS NULL OR (NOT (u.identity_id=ANY(%s))
+                    AND EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled)
+                    AND EXISTS(SELECT 1 FROM zradius_identity_credentials c WHERE c.identity_id=u.identity_id AND c.web_password_hash IS NOT NULL))) LIMIT 1""",(ids,)).fetchone():
+                    raise HTTPException(409,"Cannot block last active administrator")
+        changed=[r for r in rows if r["enabled"]!=body.enabled]
+        web=0
+        if not body.enabled:
+            web=conn.execute("""DELETE FROM zradius_admin_sessions s USING zradius_admin_users u
+                WHERE s.user_id=u.id AND u.identity_id=ANY(%s)""",(ids,)).rowcount
+        if changed:
+            conn.execute("UPDATE zradius_identities SET enabled=%s,updated_at=now() WHERE id=ANY(%s)",(body.enabled,[r["id"] for r in changed]))
+            if not body.preview:
+                for row in changed:
+                    audit(conn,"identity.bulk.enable" if body.enabled else "identity.bulk.disable",row["username"])
+        if not body.preview and not body.enabled:
+            for account in accounts:
+                audit(conn,"identity.bulk.web.revoke",str(account["identity_id"]))
+        if body.preview:
+            conn.rollback()
+        return {"preview":body.preview,"enabled":body.enabled,"selected":len(ids),"changed":len(changed),"web_sessions_revoked":web,"network_disconnected":False}
+
 @app.put("/api/v1/identities/{identity_id}/state",dependencies=[Depends(auth)])
 def identity_state(identity_id:int,body:UserState,principal=Depends(auth)):
     with db() as conn:
