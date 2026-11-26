@@ -28,7 +28,7 @@ jobs:
       - name: Import API and generate OpenAPI
         working-directory: backend
         run: python -c 'from main import app; assert app.openapi()["paths"]'
-      - run: python -m unittest test_ipam test_ipoe test_hotspot test_secret_crypto
+      - run: python -m unittest test_ipam test_ipoe test_hotspot test_secret_crypto test_iam
         working-directory: backend
       - run: |
           cp .env.example .env
@@ -38,6 +38,7 @@ jobs:
         run: |
           printf 'POSTGRES_PASSWORD=%s\nADMIN_TOKEN=%s\nRADIUS_TEST_SECRET=%s\nZRADIUS_API_DB_PASSWORD=%s\nZRADIUS_RUNTIME_DB_PASSWORD=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
           printf 'ZRADIUS_SECRET_KEY=%s\n' "$(openssl rand -hex 32)" >> .env
+          printf 'ZRADIUS_LEGACY_TOKEN_ENABLED=true\n' >> .env
           docker compose up -d
           python scripts/wait-radius.py
           docker compose run --rm migrate

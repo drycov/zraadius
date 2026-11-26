@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import psycopg
 from psycopg.rows import dict_row
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, SecretStr, IPvAnyAddress
@@ -14,6 +14,10 @@ from coa import send, destination_allowed
 from schema_version import require_schema
 from secret_crypto import key as secret_key, seal, unseal
 from cryptography.exceptions import InvalidTag
+from contextvars import ContextVar
+from starlette.concurrency import run_in_threadpool
+from iam import hash_password, verify_password, token_digest, new_token, permitted
+actor_context=ContextVar('actor',default=None)
 
 ROOT = Path(__file__).parent
 bearer = HTTPBearer(auto_error=False)
@@ -24,8 +28,8 @@ def db():
 @asynccontextmanager
 async def lifespan(app):
     token = os.environ.get("ADMIN_TOKEN", "")
-    if len(token) < 32 or token.startswith("replace_with"):
-        raise RuntimeError("Set a random ADMIN_TOKEN of at least 32 characters")
+    if os.getenv("ZRADIUS_LEGACY_TOKEN_ENABLED","false")=="true" and (len(token)<32 or token.startswith("replace_with")):
+        raise RuntimeError("Set a random ADMIN_TOKEN for explicit legacy mode")
     secret_key()
     with db() as conn:
         require_schema(conn)
@@ -33,11 +37,25 @@ async def lifespan(app):
 
 app = FastAPI(title="ZRADIUS", version="0.1.0-alpha", lifespan=lifespan)
 
-def auth(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
-    if not credentials or not secrets.compare_digest(
-        credentials.credentials.encode(), os.environ["ADMIN_TOKEN"].encode()
-    ):
-        raise HTTPException(401, "Unauthorized", headers={"WWW-Authenticate":"Bearer"})
+async def auth(request:Request, credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
+    if not credentials or len(credentials.credentials)>512:
+        raise HTTPException(401,"Unauthorized")
+    token=credentials.credentials
+    legacy=os.getenv("ADMIN_TOKEN","")
+    if os.getenv("ZRADIUS_LEGACY_TOKEN_ENABLED","false")=="true" and legacy and secrets.compare_digest(token.encode(),legacy.encode()):
+        principal={"username":"legacy-token","role":"admin"}
+    else:
+        def lookup():
+            with db() as conn:
+                return conn.execute("""SELECT u.username,u.role FROM zradius_admin_sessions s JOIN zradius_admin_users u ON u.id=s.user_id
+                    WHERE s.token_hash=%s AND s.expires_at>now() AND u.enabled""",(token_digest(token),)).fetchone()
+        principal=await run_in_threadpool(lookup)
+        if not principal:
+            raise HTTPException(401,"Unauthorized")
+    if request.url.path not in ("/api/v1/iam/me","/api/v1/iam/logout") and not permitted(principal["role"],request.method,request.url.path):
+        raise HTTPException(403,"Forbidden")
+    actor_context.set(principal["username"])
+    return principal
 
 class User(BaseModel):
     username: str = Field(min_length=1,max_length=64,pattern=r"^[a-zA-Z0-9_.@-]+$")
@@ -47,7 +65,7 @@ class Group(BaseModel):
     name: str = Field(min_length=1,max_length=64,pattern=r"^[a-zA-Z0-9_.-]+$")
 
 def audit(conn, action, subject):
-    conn.execute("INSERT INTO zradius_audit(action,subject) VALUES (%s,%s)", (action,subject))
+    conn.execute("INSERT INTO zradius_audit(action,subject,actor) VALUES (%s,%s,%s)", (action,subject,actor_context.get()))
 
 @app.get("/", include_in_schema=False)
 def index():
@@ -1068,3 +1086,78 @@ def revoke_proxy_grant(realm_id:int,nas_id:int):
         conn.execute("DELETE FROM zradius_proxy_grants WHERE realm_id=%s AND nas_id=%s",(realm_id,nas_id))
         audit(conn,"proxy.grant.remove",f"{realm_id}:{nas_id}")
     return {"status":"removed"}
+
+class ManagementLogin(BaseModel):
+    username:str=Field(min_length=1,max_length=64,pattern=r"^[a-zA-Z0-9_.-]+$")
+    password:SecretStr=Field(min_length=1,max_length=128)
+
+class ManagementUser(ManagementLogin):
+    role:Literal["admin","operator","auditor"]="auditor"
+
+@app.post("/api/v1/iam/login")
+def management_login(body:ManagementLogin,request:Request,response:Response):
+    # Shared database limiter: global and per identity, independent of forwarded headers.
+    buckets=sorted([token_digest("global-login"),token_digest("login:"+body.username.lower())])
+    with db() as conn:
+        for bucket in buckets:
+            row=conn.execute("""INSERT INTO zradius_login_limits(bucket,attempts) VALUES (%s,1)
+                ON CONFLICT(bucket) DO UPDATE SET attempts=CASE WHEN zradius_login_limits.window_start<now()-interval '5 minutes' THEN 1 ELSE zradius_login_limits.attempts+1 END,
+                window_start=CASE WHEN zradius_login_limits.window_start<now()-interval '5 minutes' THEN now() ELSE zradius_login_limits.window_start END
+                RETURNING attempts""",(bucket,)).fetchone()
+            if row["attempts"]>(100 if bucket==token_digest("global-login") else 10):
+                conn.commit()
+                raise HTTPException(429,"Too many login attempts")
+        user=conn.execute("SELECT id,username,password_hash,role,enabled FROM zradius_admin_users WHERE username=%s",(body.username,)).fetchone()
+        if not user or not user["enabled"] or not verify_password(user["password_hash"],body.password.get_secret_value()):
+            conn.commit()
+            raise HTTPException(401,"Invalid credentials")
+        token,digest=new_token()
+        conn.execute("DELETE FROM zradius_admin_sessions WHERE expires_at<=now()")
+        conn.execute("INSERT INTO zradius_admin_sessions(token_hash,user_id,expires_at) VALUES (%s,%s,now()+interval '8 hours')",(digest,user["id"]))
+        conn.execute("INSERT INTO zradius_audit(action,subject,actor) VALUES ('iam.login',%s,%s)",(user["username"],user["username"]))
+    response.headers["Cache-Control"]="no-store"
+    return {"access_token":token,"token_type":"bearer","expires_in":28800,"username":user["username"],"role":user["role"]}
+
+@app.get("/api/v1/iam/me")
+def management_me(principal=Depends(auth)):
+    return principal
+
+@app.post("/api/v1/iam/logout")
+def management_logout(credentials:HTTPAuthorizationCredentials=Depends(bearer),principal=Depends(auth)):
+    with db() as conn:
+        conn.execute("DELETE FROM zradius_admin_sessions WHERE token_hash=%s",(token_digest(credentials.credentials),))
+        audit(conn,"iam.logout",principal["username"])
+    return {"status":"logged_out"}
+
+@app.get("/api/v1/iam/users",dependencies=[Depends(auth)])
+def management_users():
+    with db() as conn:
+        return conn.execute("SELECT id,username,role,enabled,created_at FROM zradius_admin_users ORDER BY username").fetchall()
+
+@app.post("/api/v1/iam/users",status_code=201,dependencies=[Depends(auth)])
+def management_create(body:ManagementUser):
+    try:
+        digest=hash_password(body.password.get_secret_value())
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
+    with db() as conn:
+        row=conn.execute("INSERT INTO zradius_admin_users(username,password_hash,role) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id,username,role,enabled",(body.username,digest,body.role)).fetchone()
+        if not row:
+            raise HTTPException(409,"Management user exists")
+        audit(conn,"iam.user.create",body.username)
+    return row
+
+@app.put("/api/v1/iam/users/{user_id}/state",dependencies=[Depends(auth)])
+def management_state(user_id:int,body:UserState):
+    with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        row=conn.execute("SELECT username,role FROM zradius_admin_users WHERE id=%s FOR UPDATE",(user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Management user not found")
+        if not body.enabled and row["role"]=="admin" and not conn.execute("SELECT 1 FROM zradius_admin_users WHERE role='admin' AND enabled AND id<>%s",(user_id,)).fetchone():
+            raise HTTPException(409,"Cannot disable last active administrator")
+        conn.execute("UPDATE zradius_admin_users SET enabled=%s WHERE id=%s",(body.enabled,user_id))
+        if not body.enabled:
+            conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(user_id,))
+        audit(conn,"iam.user.state",row["username"])
+    return {"enabled":body.enabled}

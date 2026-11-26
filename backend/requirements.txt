@@ -4,3 +4,4 @@ psycopg[binary]==3.2.9
 cryptography==46.0.5
 alembic==1.16.5
 SQLAlchemy==2.0.44
+argon2-cffi==25.1.0
