@@ -1,5 +1,5 @@
 import React,{useEffect,useState} from 'react';
-import {Alert,Button,Card,Form,Input,QRCode,Space,Spin,Tag,Typography} from 'antd';
+import {Alert,Button,Card,Form,Input,QRCode,Space,Spin,Tag,Typography} from './ui';
 import {ApiError,type Request} from './api';
 type Status={enabled:boolean;recovery_remaining:number};
 type Enrollment={secret:string;otpauth_uri:string;expires_in:number};

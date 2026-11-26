@@ -1,19 +1,17 @@
 import React,{useEffect,useMemo,useState} from 'react';
 import {createRoot} from 'react-dom/client';
-import {Alert,App,Button,Card,Checkbox,Col,ConfigProvider,Form,Input,InputNumber,Layout,Menu,Modal,Popconfirm,Row,Select,Space,Statistic,Table,Tag,Typography,theme} from 'antd';
-import {DashboardOutlined,UserOutlined,TeamOutlined,ClusterOutlined,HistoryOutlined,BookOutlined,LogoutOutlined,ReloadOutlined} from '@ant-design/icons';
+import {Alert,App,Button,Card,Checkbox,Col,Form,Input,InputNumber,Layout,Menu,Modal,Popconfirm,Row,Select,Space,Table,Tag,Typography} from './ui';
+import {DashboardOutlined,UserOutlined,TeamOutlined,ClusterOutlined,HistoryOutlined,BookOutlined,LogoutOutlined,ReloadOutlined} from './ui/icons';
 import {client,ApiError,type Request,type User,type Group,type Nas,type Session,type Audit,type Dashboard,type Attribute} from './api';
-import 'antd/dist/reset.css';
 import './vendor/design-kit/css/index.css';
 import './style.css';
 import {detectScheme} from './vendor/design-kit/theme';
-import {darkTokens,lightTokens} from './vendor/design-kit/tokens';
 import {StatCard} from './vendor/design-kit/components/StatCard';
 import {Alert as KitAlert} from './vendor/design-kit/components/Alert';
 import MfaPanel from './MfaPanel';
 
 const {Header,Sider,Content}=Layout;
-const {Title,Text}=Typography;
+const {Text}=Typography;
 const enc=encodeURIComponent;
 function useData<T>(request:Request,path:string){
  const [data,setData]=useState<T>();
@@ -118,7 +116,6 @@ function Root(){
  const [scheme,setScheme]=useState(detectScheme);
  useEffect(()=>{const media=window.matchMedia('(prefers-color-scheme: light)');const update=()=>setScheme(detectScheme());media.addEventListener('change',update);return()=>media.removeEventListener('change',update)},[]);
  useEffect(()=>{document.documentElement.setAttribute('data-tg-theme',scheme);document.body.classList.add('dk-body')},[scheme]);
- const t=scheme==='dark'?darkTokens:lightTokens;
- return <ConfigProvider theme={{algorithm:scheme==='dark'?theme.darkAlgorithm:theme.defaultAlgorithm,token:{colorPrimary:t.button,colorInfo:t.info,colorSuccess:t.success,colorWarning:t.warning,colorError:t.danger,colorBgLayout:t.bg,colorBgContainer:t.surface,colorBgElevated:t.elevated,colorText:t.text,colorTextSecondary:t.hint,borderRadius:t.radius,fontFamily:'Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif'},components:{Layout:{siderBg:t.secondary,headerBg:t.secondary,bodyBg:t.bg},Menu:{itemBg:t.secondary,itemSelectedBg:t.tertiary,itemSelectedColor:t.link}}}}><App><Console/></App></ConfigProvider>
+ return <App><Console/></App>
 }
 createRoot(document.getElementById('root')!).render(<React.StrictMode><Root/></React.StrictMode>);
