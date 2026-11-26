@@ -2,6 +2,7 @@ import {useState} from 'react';
 import {Alert,Button,Card,Form,Input,InputNumber,Modal,Popconfirm,Select,Space,Table,Tag} from '../ui';
 import Disclosure from '../ui/Disclosure';
 import VpnPools from './VpnPools';
+import VpnMonitoring from './VpnMonitoring';
 import PppImport from './PppImport';
 import RouterosPppConfig from './RouterosPppConfig';
 import VpnSessions from './VpnSessions';
@@ -16,7 +17,7 @@ export default function PppPage({request}:{request:Request}){
  const spaces=useData<AddressSpace[]>(request,'ppp/address-spaces');const groups=useData<VpnGroup[]>(request,'ppp/groups');const refresh=()=>{p.refresh();u.refresh();groups.refresh();spaces.refresh()};const a=useAction(refresh);const [edit,setEdit]=useState<User>();const [profileEdit,setProfileEdit]=useState<Profile>();const [ef]=Form.useForm();const [pef]=Form.useForm();const [pf]=Form.useForm();const [uf]=Form.useForm();const [passwordForm]=Form.useForm();const [target,setTarget]=useState<User>();
  const eligible=(n.data??[]).filter(x=>x.type==='mikrotik'&&x.services?.includes('l2tp'));
  return <Space direction="vertical" className="full"><Alert type="warning" message="L2TP: отдельная база пользователей. PPP-профили и пулы должны существовать на RouterOS. Не переключайте действующий NAS до тестирования."/><Fault error={p.error||n.error||u.error||groups.error||spaces.error}/>
- <Disclosure title="PPP Profiles" meta={String(p.data?.length??0)} defaultOpen>
+ <VpnMonitoring request={request}/><Disclosure title="PPP Profiles" meta={String(p.data?.length??0)} defaultOpen>
  <Form form={pf} layout="inline" initialValues={{interim_seconds:300}} onFinish={v=>a.run(()=>request('ppp/profiles','POST',{...v,pool:v.pool||null}),()=>pf.resetFields())}><Form.Item name="name" label="Имя PPP Profile" rules={[{required:true,max:64}]}><Input placeholder="vpn_ovn-lu-p"/></Form.Item><Form.Item name="pool" label="Remote Pool"><Input placeholder="Satory_VPN_2"/></Form.Item><Form.Item name="interim_seconds" label="Interim (сек)" rules={[{required:true}]}><InputNumber min={60} max={86400}/></Form.Item><Form.Item name="description" label="Описание"><Input maxLength={200}/></Form.Item><Button type="primary" htmlType="submit" loading={a.busy}>Создать профиль</Button></Form>
  <Table<Profile> rowKey="id" loading={p.loading} dataSource={p.data??[]} columns={[{title:'PPP Profile',dataIndex:'name'},{title:'Pool',dataIndex:'pool'},{title:'Interim',dataIndex:'interim_seconds'},{title:'Описание',dataIndex:'description'},{title:'',render:(_,x)=><Button onClick={()=>{pef.setFieldsValue(x);setProfileEdit(x)}}>Редактировать</Button>}]}/></Disclosure><PppGroups request={request} groups={groups.data??[]} profiles={p.data??[]} loading={groups.loading} refresh={refresh}/>
  <VpnAddressSpaces request={request} items={spaces.data??[]} loading={spaces.loading} refresh={spaces.refresh}/><VpnPools request={request} nas={eligible} spaces={spaces.data??[]}/><VpnSessions request={request} nas={n.data??[]}/><PppImport request={request} nas={eligible} spaces={spaces.data??[]} refresh={refresh}/><RouterosPppConfig request={request} nas={eligible}/><Disclosure title="L2TP Users" defaultOpen>

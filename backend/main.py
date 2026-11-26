@@ -2229,3 +2229,53 @@ def routeros_ppp_config(body:RouterosPppConfig,response:Response):
             "Disconnect requires actual API egress reachability, COA_ENABLED and COA_ALLOWED_NETWORKS.",
             "PPP profiles and named pools must already exist on RouterOS. No automatic creation or deletion."
         ]}
+
+
+@app.get("/api/v1/ppp/monitoring",dependencies=[Depends(auth)])
+def vpn_monitoring():
+    # One read-only snapshot: no synthetic sessions or inferred protocol from username.
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        inventory=conn.execute("""SELECT
+            (SELECT count(*) FROM zradius_l2tp_users) AS users,
+            (SELECT count(*) FROM zradius_l2tp_users WHERE enabled) AS enabled_users,
+            (SELECT count(*) FROM zradius_l2tp_users WHERE static_ip IS NOT NULL) AS static_users,
+            (SELECT count(*) FROM zradius_ppp_profiles) AS profiles,
+            (SELECT count(*) FROM zradius_vpn_groups) AS groups,
+            (SELECT count(*) FROM zradius_vpn_pools) AS pools,
+            (SELECT count(*) FROM zradius_nas_services WHERE service_code='l2tp') AS configured_nas""").fetchone()
+        sessions=conn.execute("""WITH classified AS (
+            SELECT a.*, CASE WHEN a.acctstoptime IS NOT NULL THEN 'closed'
+              WHEN a.acctupdatetime IS NULL THEN 'unknown'
+              WHEN a.acctupdatetime<now()-make_interval(secs=>GREATEST(900,COALESCE(p.interim_seconds,300)*3)) THEN 'stale'
+              ELSE 'reported_open' END AS state
+            FROM radacct a LEFT JOIN nas n ON n.nasname=host(a.nasipaddress)
+            LEFT JOIN zradius_l2tp_users u ON u.username=a.username AND u.nas_id=n.id
+            LEFT JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id
+            WHERE a.zradius_service='l2tp'
+        ) SELECT count(*) AS recorded,
+            count(*) FILTER(WHERE state='reported_open') AS reported_open,
+            count(*) FILTER(WHERE state='stale') AS stale,
+            count(*) FILTER(WHERE state='unknown') AS unknown,
+            count(*) FILTER(WHERE state='closed') AS closed,
+            count(*) FILTER(WHERE acctstarttime>=now()-interval '24 hours') AS starts_24h,
+            count(*) FILTER(WHERE acctstoptime>=now()-interval '24 hours') AS stops_24h,
+            COALESCE(sum(acctinputoctets) FILTER(WHERE acctstoptime IS NULL),0)::text AS open_rx_bytes,
+            COALESCE(sum(acctoutputoctets) FILTER(WHERE acctstoptime IS NULL),0)::text AS open_tx_bytes,
+            max(acctupdatetime) AS last_accounting
+            FROM classified""").fetchone()
+        by_nas=conn.execute("""SELECT host(a.nasipaddress) AS address,COALESCE(n.shortname,host(a.nasipaddress)) AS name,
+            count(*) AS open_records,
+            count(*) FILTER(WHERE a.acctupdatetime IS NULL OR a.acctupdatetime<now()-make_interval(secs=>GREATEST(900,COALESCE(p.interim_seconds,300)*3))) AS needs_review,
+            COALESCE(sum(a.acctinputoctets),0)::text AS rx_bytes,COALESCE(sum(a.acctoutputoctets),0)::text AS tx_bytes
+            FROM radacct a LEFT JOIN nas n ON n.nasname=host(a.nasipaddress)
+            LEFT JOIN zradius_l2tp_users u ON u.username=a.username AND u.nas_id=n.id
+            LEFT JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id
+            WHERE a.zradius_service='l2tp' AND a.acctstoptime IS NULL
+            GROUP BY a.nasipaddress,n.shortname ORDER BY open_records DESC,address LIMIT 500""").fetchall()
+        disconnect=conn.execute("""SELECT c.status,count(*) AS count FROM zradius_coa_requests c
+            JOIN radacct a ON a.radacctid=c.radacctid
+            WHERE a.zradius_service='l2tp' AND c.action='disconnect' AND c.created_at>=now()-interval '24 hours'
+            GROUP BY c.status ORDER BY c.status""").fetchall()
+        return {"generated_at":conn.execute("SELECT now() AS ts").fetchone()["ts"],
+                "inventory":inventory,"sessions":sessions,"by_nas":by_nas,"disconnect_24h":disconnect}
