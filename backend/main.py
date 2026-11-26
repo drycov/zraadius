@@ -2496,3 +2496,74 @@ def identity_vpn_policy(identity_id:int,body:L2tpAssignment):
         raise HTTPException(422,"Invalid static IPv4")
     except UniqueViolation:
         raise HTTPException(409,"Static IP already assigned")
+
+
+class IdentityGroupBindings(BaseModel):
+    device_group_ids:list[int]=Field(default_factory=list,max_length=200)
+
+class IdentityGroupMembership(BaseModel):
+    group_ids:list[int]=Field(default_factory=list,max_length=200)
+
+@app.get("/api/v1/identities/groups",dependencies=[Depends(auth)])
+def identity_groups():
+    with db() as conn:
+        return conn.execute("""SELECT g.id,g.name,g.description,
+            ARRAY(SELECT b.device_group_id FROM zradius_identity_group_device_bindings b WHERE b.group_id=g.id ORDER BY b.device_group_id) AS device_group_ids,
+            (SELECT count(*) FROM zradius_identity_group_members m WHERE m.group_id=g.id) AS members
+            FROM zradius_identity_groups g ORDER BY g.name""").fetchall()
+
+@app.post("/api/v1/identities/groups",status_code=201,dependencies=[Depends(auth)])
+def create_identity_group(body:DeviceRoleCreate):
+    with db() as conn:
+        row=conn.execute("INSERT INTO zradius_identity_groups(name,description) VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING id,name,description",(body.name,body.description)).fetchone()
+        if not row:
+            raise HTTPException(409,"Identity group exists")
+        audit(conn,"identity.group.create",str(row["id"]))
+        return row
+
+@app.put("/api/v1/identities/groups/{group_id}/bindings",dependencies=[Depends(auth)])
+def identity_group_bindings(group_id:int,body:IdentityGroupBindings):
+    ids=sorted(set(body.device_group_ids))
+    with db() as conn:
+        if not conn.execute("SELECT id FROM zradius_identity_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone():
+            raise HTTPException(404,"Identity group not found")
+        for gid in ids:
+            if not conn.execute("SELECT id FROM zradius_device_user_groups WHERE id=%s FOR KEY SHARE",(gid,)).fetchone():
+                raise HTTPException(404,"Device group not found")
+        conn.execute("DELETE FROM zradius_identity_group_device_bindings WHERE group_id=%s",(group_id,))
+        for gid in ids:
+            conn.execute("INSERT INTO zradius_identity_group_device_bindings(group_id,device_group_id) VALUES (%s,%s)",(group_id,gid))
+        audit(conn,"identity.group.bindings",str(group_id))
+    return {"status":"updated"}
+
+@app.get("/api/v1/identities/{identity_id}/groups",dependencies=[Depends(auth)])
+def identity_membership(identity_id:int):
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone():
+            raise HTTPException(404,"Identity not found")
+        return {"group_ids":[r["group_id"] for r in conn.execute("SELECT group_id FROM zradius_identity_group_members WHERE identity_id=%s ORDER BY group_id",(identity_id,)).fetchall()]}
+
+@app.put("/api/v1/identities/{identity_id}/groups",dependencies=[Depends(auth)])
+def set_identity_membership(identity_id:int,body:IdentityGroupMembership):
+    ids=sorted(set(body.group_ids))
+    with db() as conn:
+        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Identity not found")
+        for gid in ids:
+            if not conn.execute("SELECT id FROM zradius_identity_groups WHERE id=%s FOR KEY SHARE",(gid,)).fetchone():
+                raise HTTPException(404,"Identity group not found")
+        conn.execute("DELETE FROM zradius_identity_group_members WHERE identity_id=%s",(identity_id,))
+        for gid in ids:
+            conn.execute("INSERT INTO zradius_identity_group_members(group_id,identity_id) VALUES (%s,%s)",(gid,identity_id))
+        audit(conn,"identity.groups",row["username"])
+    return {"status":"updated"}
+
+@app.get("/api/v1/identities/{identity_id}/effective-device-grants",dependencies=[Depends(auth)])
+def identity_effective_device_grants(identity_id:int):
+    with db() as conn:
+        return conn.execute("""SELECT g.nas_id,n.shortname,g.role,g.filter_id,g.source
+            FROM zradius_device_effective_grants g JOIN zradius_device_users u ON u.id=g.user_id
+            JOIN zradius_identities i ON i.id=u.identity_id AND i.enabled
+            JOIN zradius_identity_credentials c ON c.identity_id=i.id
+            JOIN nas n ON n.id=g.nas_id WHERE i.id=%s ORDER BY n.shortname""",(identity_id,)).fetchall()
