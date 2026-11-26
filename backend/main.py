@@ -3209,6 +3209,20 @@ def identity_services(identity_id:int,body:IdentityServices):
         raise HTTPException(409,"Existing independent login or static IP conflict")
 
 
+@app.get("/api/v1/identities/{identity_id}/aaa-policy",dependencies=[Depends(auth)])
+def identity_aaa_policy(identity_id:int,nas_id:int|None=None):
+    from aaa_policy import inspect_identity
+    if nas_id is not None and nas_id<=0:
+        raise HTTPException(422,"Invalid NAS ID")
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        if nas_id is not None and not conn.execute("SELECT 1 FROM nas WHERE id=%s",(nas_id,)).fetchone():
+            raise HTTPException(404,"NAS not found")
+        result=inspect_identity(conn,identity_id,nas_id)
+        if result is None:
+            raise HTTPException(404,"Identity not found")
+        return result
+
 @app.get("/api/v1/identities/{identity_id}/assignments",dependencies=[Depends(auth)])
 def identity_assignments(identity_id:int):
     with db() as conn:
