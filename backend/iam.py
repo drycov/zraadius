@@ -19,13 +19,22 @@ def token_digest(token):
 def new_token():
     token=secrets.token_urlsafe(32)
     return token,token_digest(token)
+# Explicit resource/action allowlist; unknown endpoints deny non-admin roles.
+READ_RESOURCES=frozenset({"dashboard","users","groups","nas","accounting","coa","services","dictionaries","audit","ipoe","ipam","hotspot","device-aaa","eap","pki","proxy"})
+def permission(method,path):
+    parts=path.strip("/").split("/")
+    if len(parts)<3 or parts[:2]!=["api","v1"]:
+        return None
+    resource=parts[2]
+    if method=="GET" and resource in READ_RESOURCES:
+        return resource+":read"
+    if method=="POST" and len(parts)==5 and resource=="sessions" and parts[3].isdigit() and parts[4] in ("disconnect","rate"):
+        return "sessions:"+parts[4]
+    return None
 def permitted(role,method,path):
     if role=="admin":
         return True
-    if role not in ("operator","auditor"):
+    code=permission(method,path)
+    if role not in ("operator","auditor") or code is None:
         return False
-    if path.startswith("/api/v1/iam/"):
-        return False
-    if method=="GET":
-        return True
-    return role=="operator" and method=="POST" and path.startswith("/api/v1/sessions/") and path.endswith(("/disconnect","/rate"))
+    return code.endswith(":read") or (role=="operator" and code in ("sessions:disconnect","sessions:rate"))

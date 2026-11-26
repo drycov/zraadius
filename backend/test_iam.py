@@ -16,3 +16,8 @@ class IamTests(unittest.TestCase):
         self.assertFalse(permitted("operator","POST","/api/v1/users"))
         self.assertFalse(permitted("auditor","GET","/api/v1/iam/users"))
         self.assertFalse(permitted("auditor","DELETE","/api/v1/nas/1"))
+
+    def test_unknown_resources_denied(self):
+        self.assertFalse(permitted("auditor","GET","/api/v1/future-secret-endpoint"))
+        self.assertFalse(permitted("operator","POST","/api/v1/sessions/1/unexpected/disconnect"))
+        self.assertTrue(permitted("auditor","GET","/api/v1/nas"))

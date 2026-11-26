@@ -17,6 +17,7 @@ from cryptography.exceptions import InvalidTag
 from contextvars import ContextVar
 from starlette.concurrency import run_in_threadpool
 from iam import hash_password, verify_password, token_digest, new_token, permitted
+from uuid import UUID
 actor_context=ContextVar('actor',default=None)
 
 ROOT = Path(__file__).parent
@@ -47,12 +48,12 @@ async def auth(request:Request, credentials: HTTPAuthorizationCredentials | None
     else:
         def lookup():
             with db() as conn:
-                return conn.execute("""SELECT u.username,u.role FROM zradius_admin_sessions s JOIN zradius_admin_users u ON u.id=s.user_id
+                return conn.execute("""SELECT u.id,u.username,u.role FROM zradius_admin_sessions s JOIN zradius_admin_users u ON u.id=s.user_id
                     WHERE s.token_hash=%s AND s.expires_at>now() AND u.enabled""",(token_digest(token),)).fetchone()
         principal=await run_in_threadpool(lookup)
         if not principal:
             raise HTTPException(401,"Unauthorized")
-    if request.url.path not in ("/api/v1/iam/me","/api/v1/iam/logout") and not permitted(principal["role"],request.method,request.url.path):
+    if request.url.path not in ("/api/v1/iam/me","/api/v1/iam/logout","/api/v1/iam/password","/api/v1/iam/my-sessions") and not permitted(principal["role"],request.method,request.url.path):
         raise HTTPException(403,"Forbidden")
     actor_context.set(principal["username"])
     return principal
@@ -1107,7 +1108,7 @@ def management_login(body:ManagementLogin,request:Request,response:Response):
             if row["attempts"]>(100 if bucket==token_digest("global-login") else 10):
                 conn.commit()
                 raise HTTPException(429,"Too many login attempts")
-        user=conn.execute("SELECT id,username,password_hash,role,enabled FROM zradius_admin_users WHERE username=%s",(body.username,)).fetchone()
+        user=conn.execute("SELECT id,username,password_hash,role,enabled FROM zradius_admin_users WHERE username=%s FOR UPDATE",(body.username,)).fetchone()
         if not user or not user["enabled"] or not verify_password(user["password_hash"],body.password.get_secret_value()):
             conn.commit()
             raise HTTPException(401,"Invalid credentials")
@@ -1161,3 +1162,76 @@ def management_state(user_id:int,body:UserState):
             conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(user_id,))
         audit(conn,"iam.user.state",row["username"])
     return {"enabled":body.enabled}
+
+class ManagementPassword(BaseModel):
+    password:SecretStr=Field(min_length=16,max_length=128)
+
+class OwnPassword(ManagementPassword):
+    current_password:SecretStr=Field(min_length=1,max_length=128)
+
+class ManagementRole(BaseModel):
+    role:Literal["admin","operator","auditor"]
+
+@app.put("/api/v1/iam/password")
+def own_password(body:OwnPassword,principal=Depends(auth)):
+    if not principal.get("id"):
+        raise HTTPException(403,"Personal session required")
+    with db() as conn:
+        row=conn.execute("SELECT password_hash FROM zradius_admin_users WHERE id=%s AND enabled FOR UPDATE",(principal["id"],)).fetchone()
+        if not row or not verify_password(row["password_hash"],body.current_password.get_secret_value()):
+            raise HTTPException(401,"Invalid current password")
+        digest=hash_password(body.password.get_secret_value())
+        conn.execute("UPDATE zradius_admin_users SET password_hash=%s WHERE id=%s",(digest,principal["id"]))
+        conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(principal["id"],))
+        audit(conn,"iam.password.change",principal["username"])
+    return {"status":"changed","reauthentication_required":True}
+
+@app.put("/api/v1/iam/users/{user_id}/password",dependencies=[Depends(auth)])
+def reset_management_password(user_id:int,body:ManagementPassword):
+    digest=hash_password(body.password.get_secret_value())
+    with db() as conn:
+        row=conn.execute("UPDATE zradius_admin_users SET password_hash=%s WHERE id=%s RETURNING username",(digest,user_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"Management user not found")
+        conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(user_id,))
+        audit(conn,"iam.password.reset",row["username"])
+    return {"status":"changed","sessions_revoked":True}
+
+@app.put("/api/v1/iam/users/{user_id}/role",dependencies=[Depends(auth)])
+def management_role(user_id:int,body:ManagementRole):
+    with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        row=conn.execute("SELECT username,role,enabled FROM zradius_admin_users WHERE id=%s FOR UPDATE",(user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Management user not found")
+        if row["role"]=="admin" and row["enabled"] and body.role!="admin" and not conn.execute("SELECT 1 FROM zradius_admin_users WHERE role='admin' AND enabled AND id<>%s",(user_id,)).fetchone():
+            raise HTTPException(409,"Cannot demote last active administrator")
+        conn.execute("UPDATE zradius_admin_users SET role=%s WHERE id=%s",(body.role,user_id))
+        conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(user_id,))
+        audit(conn,"iam.role.change",row["username"]+":"+body.role)
+    return {"role":body.role,"sessions_revoked":True}
+
+@app.get("/api/v1/iam/sessions",dependencies=[Depends(auth)])
+def management_sessions():
+    with db() as conn:
+        return conn.execute("""SELECT s.session_id,u.username,s.created_at,s.expires_at
+            FROM zradius_admin_sessions s JOIN zradius_admin_users u ON u.id=s.user_id
+            WHERE s.expires_at>now() ORDER BY s.created_at DESC LIMIT 500""").fetchall()
+
+@app.get("/api/v1/iam/my-sessions")
+def my_sessions(principal=Depends(auth),credentials:HTTPAuthorizationCredentials=Depends(bearer)):
+    if not principal.get("id"):
+        raise HTTPException(403,"Personal session required")
+    with db() as conn:
+        return conn.execute("""SELECT session_id,created_at,expires_at,token_hash=%s AS current
+            FROM zradius_admin_sessions WHERE user_id=%s AND expires_at>now() ORDER BY created_at DESC""",
+            (token_digest(credentials.credentials),principal["id"])).fetchall()
+
+@app.delete("/api/v1/iam/sessions/{session_id}",dependencies=[Depends(auth)])
+def revoke_management_session(session_id:UUID):
+    with db() as conn:
+        row=conn.execute("DELETE FROM zradius_admin_sessions WHERE session_id=%s RETURNING user_id",(session_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Session not found")
+        audit(conn,"iam.session.revoke",str(session_id))
+    return {"status":"revoked"}
