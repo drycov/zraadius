@@ -1,3 +1,4 @@
+# Single external RADIUS endpoint. Explicit per-service MikroTik-Realm.
 server zradius {
  listen {
   type = auth
@@ -10,16 +11,94 @@ server zradius {
   port = 1813
  }
  authorize {
-  filter_username
-  preprocess
-  # Administrative login is denied until dedicated Device AAA policy is validated.
-  if (&Service-Type == Login-User || &Service-Type == Administrative-User || &Service-Type == NAS-Prompt-User || &Service-Type == Authenticate-Only) {
+  if (&EAP-Message) {
    reject
   }
-  chap
-  mschap
-  sql
-  pap
+  if (&Mikrotik-Realm == "device-aaa") {
+   if (!&User-Name || &User-Name !~ /^[a-zA-Z0-9_.-]{1,64}$/ || !&User-Password || &CHAP-Password || &EAP-Message || &MS-CHAP-Challenge) {
+    reject
+   }
+   if (!&Service-Type || (&Service-Type != Login-User && &Service-Type != Administrative-User && &Service-Type != NAS-Prompt-User)) {
+    reject
+   }
+   update control {
+    SSHA512-Password := "%{sql:SELECT u.password_hash FROM zradius_device_users u JOIN zradius_device_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+   }
+   if (!&control:SSHA512-Password || &control:SSHA512-Password == "") {
+    reject
+   }
+   pap
+  }
+  elsif (&Mikrotik-Realm == "hotspot") {
+   if (!&User-Name || &User-Name !~ /^hs-[a-f0-9]{20}$/ || !&User-Password || &CHAP-Password || &EAP-Message || &MS-CHAP-Challenge) {
+    reject
+   }
+   update control {
+    SSHA512-Password := "%{sql:SELECT v.password_hash FROM zradius_hotspot_vouchers v JOIN nas n ON n.id=v.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='hotspot' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND v.username='%{User-Name}' AND v.enabled AND v.expires_at>now()}"
+   }
+   if (!&control:SSHA512-Password || &control:SSHA512-Password == "") {
+    reject
+   }
+   pap
+  }
+  elsif (&Mikrotik-Realm == "ipoe") {
+   if (!&User-Name || &User-Name !~ /^(?:[0-9A-Fa-f]{12}|[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}|[0-9A-Fa-f]{2}(-[0-9A-Fa-f]{2}){5})$/) {
+    reject
+   }
+   if (&EAP-Message || &CHAP-Password || &MS-CHAP-Challenge) {
+    reject
+   }
+   # Use actual packet source, never the claimed NAS-IP-Address.
+   # The first runtime supports static IPv4 only; bindings requiring Option 82 fail closed.
+   update control {
+    Tmp-String-0 := "%{sql:SELECT host(b.static_ip) FROM zradius_ipoe_bindings b JOIN nas n ON n.id=b.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='ipoe' WHERE n.nasname='%{Packet-Src-IP-Address}' AND b.mac='%{User-Name}'::macaddr AND b.enabled AND b.static_ip IS NOT NULL AND b.circuit_id IS NULL AND b.remote_id IS NULL}"
+   }
+   if (&control:Tmp-String-0 !~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$/) {
+    reject
+   }
+   update reply {
+    Framed-IP-Address := "%{control:Tmp-String-0}"
+   }
+   # MAC identity, not a reusable PPP password. Trust registered NAS and secured access edge.
+   update control {
+    Auth-Type := Accept
+   }
+  }
+  elsif (&Mikrotik-Realm == "pppoe" || &Mikrotik-Realm == "l2tp") {
+   if (!&Service-Type || &Service-Type != Framed-User || !&Framed-Protocol || &Framed-Protocol != PPP) {
+    reject
+   }
+   if (&User-Name =~ /^hs-[a-f0-9]{20}$/) {
+    reject
+   }
+   update control {
+    Tmp-String-2 := "%{sql:SELECT count(*) FROM nas n JOIN zradius_nas_services s ON s.nas_id=n.id WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND s.service_code='%{Mikrotik-Realm}'}"
+   }
+   if (&control:Tmp-String-2 != "1") {
+    reject
+   }
+   filter_username
+   preprocess
+   chap
+   mschap
+   sql
+   pap
+  }
+  elsif (&Packet-Src-IP-Address == 127.0.0.1 && !&Mikrotik-Realm) {
+   # Local development smoke tests only; no external fallback.
+   if (&Service-Type == Login-User || &Service-Type == Administrative-User || &Service-Type == NAS-Prompt-User || &Service-Type == Authenticate-Only || &User-Name =~ /^hs-[a-f0-9]{20}$/) {
+    reject
+   }
+   filter_username
+   preprocess
+   chap
+   mschap
+   sql
+   pap
+  }
+  else {
+   reject
+  }
  }
  authenticate {
   Auth-Type PAP {
@@ -37,9 +116,73 @@ server zradius {
   acct_unique
  }
  accounting {
+  # Legacy local accounting and explicitly allowed registered NAS service only.
+  if (&Packet-Src-IP-Address != 127.0.0.1 || &Mikrotik-Realm) {
+   if (!&Mikrotik-Realm || &Mikrotik-Realm !~ /^(pppoe|l2tp|ipoe|hotspot|device-aaa)$/) {
+    reject
+   }
+   if (!&NAS-IP-Address || &NAS-IP-Address != &Packet-Src-IP-Address) {
+    reject
+   }
+   update control {
+    Tmp-String-2 := "%{sql:SELECT count(*) FROM nas n JOIN zradius_nas_services s ON s.nas_id=n.id WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND s.service_code='%{Mikrotik-Realm}'}"
+   }
+   if (&control:Tmp-String-2 != "1") {
+    reject
+   }
+  }
   sql
  }
  session {
   sql
+ }
+ post-auth {
+  if (&Mikrotik-Realm == "device-aaa") {
+   update control {
+    Tmp-String-0 := "%{sql:SELECT g.role FROM zradius_device_users u JOIN zradius_device_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+   }
+   if (&control:Tmp-String-0 !~ /^(read|write|full)$/) {
+    reject
+   }
+   update reply {
+    Mikrotik-Group := "%{control:Tmp-String-0}"
+   }
+   update control {
+    Tmp-String-1 := "%{sql:INSERT INTO zradius_device_auth_log(username,source_ip,result) VALUES ('%{User-Name}','%{Packet-Src-IP-Address}','accept')}"
+   }
+  }
+  elsif (&Mikrotik-Realm == "hotspot") {
+   update control {
+    Tmp-String-0 := "%{sql:SELECT LEAST(v.session_seconds,FLOOR(EXTRACT(EPOCH FROM v.expires_at-now())))::integer FROM zradius_hotspot_vouchers v JOIN nas n ON n.id=v.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='hotspot' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND v.username='%{User-Name}' AND v.enabled AND v.expires_at>now()}"
+   }
+   if (&control:Tmp-String-0 !~ /^[1-9][0-9]*$/) {
+    reject
+   }
+   update reply {
+    Session-Timeout := "%{control:Tmp-String-0}"
+    Idle-Timeout := "%{sql:SELECT idle_seconds FROM zradius_hotspot_vouchers WHERE username='%{User-Name}'}"
+   }
+   update control {
+    Tmp-String-1 := "%{sql:SELECT COALESCE(rate_limit,'') FROM zradius_hotspot_vouchers WHERE username='%{User-Name}'}"
+   }
+   if (&control:Tmp-String-1 =~ /^[0-9]+M\/[0-9]+M$/) {
+    update reply {
+     Mikrotik-Rate-Limit := "%{control:Tmp-String-1}"
+    }
+   }
+  }
+  elsif (&Mikrotik-Realm == "pppoe" || &Mikrotik-Realm == "l2tp" || (&Packet-Src-IP-Address == 127.0.0.1 && !&Mikrotik-Realm)) {
+   # ZRADIUS_POOL_POLICY
+   noop
+  }
+  Post-Auth-Type REJECT {
+   if (&Mikrotik-Realm == "device-aaa") {
+    if (&User-Name && &User-Name =~ /^[a-zA-Z0-9_.-]{1,64}$/) {
+     update control {
+      Tmp-String-1 := "%{sql:INSERT INTO zradius_device_auth_log(username,source_ip,result) VALUES ('%{User-Name}','%{Packet-Src-IP-Address}','reject')}"
+     }
+    }
+   }
+  }
  }
 }

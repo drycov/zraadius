@@ -1,6 +1,2 @@
-services:
-  radius:
-    environment:
-      RADIUS_ENABLE_HOTSPOT: "true"
-    ports:
-      - "${RADIUS_HOTSPOT_BIND_IP:-127.0.0.1}:18121:18121/udp"
+# Deprecated compatibility overlay. All services use UDP 1812/1813.
+services: {}

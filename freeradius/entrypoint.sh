@@ -12,7 +12,7 @@ client localhost {
 }
 EOF
 export PGPASSWORD="$RADIUS_DB_PASSWORD"
-until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.radcheck') IS NOT NULL AND to_regclass('public.radacct') IS NOT NULL AND to_regclass('public.nas') IS NOT NULL AND to_regclass('public.nasreload') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
+until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.radcheck') IS NOT NULL AND to_regclass('public.radacct') IS NOT NULL AND to_regclass('public.nas') IS NOT NULL AND to_regclass('public.nasreload') IS NOT NULL AND to_regclass('public.zradius_device_auth_log') IS NOT NULL AND to_regclass('public.zradius_hotspot_vouchers') IS NOT NULL AND to_regclass('public.zradius_ipoe_bindings') IS NOT NULL AND to_regclass('public.zradius_nas_services') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
 if [ "${RADIUS_ENABLE_NAS:-false}" = true ]; then
   umask 027
   psql -h postgres -U radius -d radius -v ON_ERROR_STOP=1 -At <<'SQL' > /etc/freeradius/3.0/zradius-clients.conf
@@ -29,34 +29,13 @@ fi
 if [ "${RADIUS_ENABLE_SQLIPPOOL:-false}" = true ]; then
   until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.radippool') IS NOT NULL AND to_regclass('public.zradius_radius_pool_active') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
   ln -sf ../mods-available/sqlippool /etc/freeradius/3.0/mods-enabled/sqlippool
-  # Always start from the immutable template to avoid duplicate sections on restart.
-  cp /etc/freeradius/3.0/sites-available/zradius /etc/freeradius/3.0/sites-available/zradius-pool-runtime
-  sed -i '$d' /etc/freeradius/3.0/sites-available/zradius-pool-runtime
-  cat /etc/freeradius/3.0/zradius-pool-postauth >> /etc/freeradius/3.0/sites-available/zradius-pool-runtime
-  printf '\n}\n' >> /etc/freeradius/3.0/sites-available/zradius-pool-runtime
+  sed '/# ZRADIUS_POOL_POLICY/r /etc/freeradius/3.0/zradius-pool-policy' /etc/freeradius/3.0/sites-available/zradius > /etc/freeradius/3.0/sites-available/zradius-pool-runtime
   ln -sf ../sites-available/zradius-pool-runtime /etc/freeradius/3.0/sites-enabled/zradius
 else
   rm -f /etc/freeradius/3.0/mods-enabled/sqlippool
   ln -sf ../sites-available/zradius /etc/freeradius/3.0/sites-enabled/zradius
 fi
-if [ "${RADIUS_ENABLE_IPOE:-false}" = true ]; then
-  until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.zradius_ipoe_bindings') IS NOT NULL AND to_regclass('public.zradius_nas_services') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
-  ln -sf ../sites-available/zradius-ipoe /etc/freeradius/3.0/sites-enabled/zradius-ipoe
-else
-  rm -f /etc/freeradius/3.0/sites-enabled/zradius-ipoe
-fi
-if [ "${RADIUS_ENABLE_HOTSPOT:-false}" = true ]; then
-  until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.zradius_hotspot_vouchers') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
-  ln -sf ../sites-available/zradius-hotspot /etc/freeradius/3.0/sites-enabled/zradius-hotspot
-else
-  rm -f /etc/freeradius/3.0/sites-enabled/zradius-hotspot
-fi
-if [ "${RADIUS_ENABLE_DEVICE_AAA:-false}" = true ]; then
-  until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.zradius_device_grants') IS NOT NULL AND to_regclass('public.zradius_device_auth_log') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
-  ln -sf ../sites-available/zradius-device-aaa /etc/freeradius/3.0/sites-enabled/zradius-device-aaa
-else
-  rm -f /etc/freeradius/3.0/sites-enabled/zradius-device-aaa
-fi
+rm -f /etc/freeradius/3.0/sites-enabled/zradius-ipoe /etc/freeradius/3.0/sites-enabled/zradius-hotspot /etc/freeradius/3.0/sites-enabled/zradius-device-aaa
 unset PGPASSWORD
 freeradius -C
 exec freeradius -f -l stdout

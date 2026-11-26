@@ -61,6 +61,8 @@ else:
 api("/api/v1/users","POST",{"username":user,"password":password})
 try:
     auth(password,"Received Access-Accept")
+    for realm in ("unknown","ipoe","hotspot","device-aaa","pppoe","l2tp"):
+        radius("auth", {"User-Name":user,"User-Password":password,"Mikrotik-Realm":realm,"Message-Authenticator":"0x00"}, "Received Access-Reject")
     auth("wrong-password","Received Access-Reject")
     api(f"/api/v1/users/{user}/state","PUT",{"enabled":False})
     auth(password,"Received Access-Reject")

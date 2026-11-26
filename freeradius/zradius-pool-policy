@@ -1,0 +1,25 @@
+# Select only an explicitly active pool, using SQL-escaped user identity.
+ update control {
+  Pool-Name := "%{sql:SELECT p.name FROM zradius_radius_pool_groups g JOIN zradius_radius_pool_active a ON a.pool_id=g.pool_id JOIN zradius_ip_pools p ON p.id=a.pool_id JOIN radusergroup u ON u.groupname=g.groupname WHERE u.username='%{SQL-User-Name}' ORDER BY u.priority,u.groupname LIMIT 1}"
+ }
+ if (&control:Pool-Name && &control:Pool-Name != "") {
+  if (!&NAS-IP-Address || !&NAS-Port || &reply:Framed-IP-Address || &reply:Framed-Pool) {
+   reject
+  }
+  sqlippool
+  if (!&reply:Framed-IP-Address) {
+   reject
+  }
+  # Return the generation token; NAS must echo Class in Accounting.
+  update reply {
+   Class := "zradius:%{sql:SELECT lease_token::text FROM radippool WHERE framedipaddress='%{reply:Framed-IP-Address}' AND username='%{SQL-User-Name}' AND nasipaddress='%{NAS-IP-Address}'}"
+  }
+  if (&reply:Class == "zradius:") {
+   reject
+  }
+  if (!&reply:Session-Timeout || &reply:Session-Timeout > 3600) {
+   update reply {
+    Session-Timeout := 3600
+   }
+  }
+ }
