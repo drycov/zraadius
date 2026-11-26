@@ -12,7 +12,16 @@ client localhost {
 }
 EOF
 export PGPASSWORD="$RADIUS_DB_PASSWORD"
-until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.radcheck') IS NOT NULL AND to_regclass('public.radacct') IS NOT NULL AND to_regclass('public.nas') IS NOT NULL AND to_regclass('public.nasreload') IS NOT NULL AND to_regclass('public.zradius_device_auth_log') IS NOT NULL AND to_regclass('public.zradius_hotspot_vouchers') IS NOT NULL AND to_regclass('public.zradius_ipoe_bindings') IS NOT NULL AND to_regclass('public.zradius_nas_services') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
+export PGCONNECT_TIMEOUT=3
+wait_schema() {
+  attempt=0
+  until [ "$(psql -h postgres -U radius -d radius -Atqc "$1" 2>/dev/null || true)" = t ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 60 ]; then echo 'Database schema readiness timeout' >&2; exit 1; fi
+    sleep 2
+  done
+}
+wait_schema "SELECT to_regclass('public.radcheck') IS NOT NULL AND to_regclass('public.radacct') IS NOT NULL AND to_regclass('public.nas') IS NOT NULL AND to_regclass('public.nasreload') IS NOT NULL AND to_regclass('public.zradius_device_auth_log') IS NOT NULL AND to_regclass('public.zradius_hotspot_vouchers') IS NOT NULL AND to_regclass('public.zradius_ipoe_bindings') IS NOT NULL AND to_regclass('public.zradius_nas_services') IS NOT NULL"
 if [ "${RADIUS_ENABLE_NAS:-false}" = true ]; then
   umask 027
   psql -h postgres -U radius -d radius -v ON_ERROR_STOP=1 -At <<'SQL' > /etc/freeradius/3.0/zradius-clients.conf
@@ -27,7 +36,8 @@ SQL
   printf '\n$INCLUDE /etc/freeradius/3.0/zradius-clients.conf\n' >> /etc/freeradius/3.0/clients.conf
 fi
 if [ "${RADIUS_ENABLE_SQLIPPOOL:-false}" = true ]; then
-  until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.radippool') IS NOT NULL AND to_regclass('public.zradius_radius_pool_active') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
+  /usr/local/bin/zradius-prepare-sqlippool
+  wait_schema "SELECT to_regclass('public.radippool') IS NOT NULL AND to_regclass('public.zradius_radius_pool_active') IS NOT NULL"
   ln -sf ../mods-available/sqlippool /etc/freeradius/3.0/mods-enabled/sqlippool
   sed '/# ZRADIUS_POOL_POLICY/r /etc/freeradius/3.0/zradius-pool-policy' /etc/freeradius/3.0/sites-available/zradius > /etc/freeradius/3.0/sites-available/zradius-pool-runtime
   ln -sf ../sites-available/zradius-pool-runtime /etc/freeradius/3.0/sites-enabled/zradius
@@ -40,9 +50,9 @@ if [ "${RADIUS_ENABLE_EAP:-false}" = true ]; then
   for f in server.key server.pem ca.pem; do
     [ -r "/run/zradius-pki/$f" ] || { echo "Missing EAP PKI file: $f" >&2; exit 1; }
   done
-  until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.zradius_eap_users') IS NOT NULL AND to_regclass('public.zradius_eap_grants') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
+  wait_schema "SELECT to_regclass('public.zradius_eap_users') IS NOT NULL AND to_regclass('public.zradius_eap_grants') IS NOT NULL"
   if [ "${RADIUS_ENABLE_EAP_TLS:-false}" = true ]; then
-    until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.zradius_pki_certificates') IS NOT NULL AND to_regclass('public.zradius_pki_grants') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
+    wait_schema "SELECT to_regclass('public.zradius_pki_certificates') IS NOT NULL AND to_regclass('public.zradius_pki_grants') IS NOT NULL"
     install -d -m 0700 -o freerad -g freerad /run/zradius-client-certs
     sed '/# ZRADIUS_TLS_CONFIG/r /etc/freeradius/3.0/zradius-tls-config' /etc/freeradius/3.0/mods-available/zradius-eap > /etc/freeradius/3.0/mods-available/zradius-eap-tls-runtime
     ln -sf ../mods-available/zradius-eap-tls-runtime /etc/freeradius/3.0/mods-enabled/eap
@@ -61,7 +71,7 @@ fi
 # Replace packaged sample proxy realms even when disabled.
 printf 'proxy server {\n default_fallback = no\n}\n' > /etc/freeradius/3.0/proxy.conf
 if [ "${RADIUS_ENABLE_PROXY:-false}" = true ]; then
-  until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.zradius_proxy_realms') IS NOT NULL AND to_regclass('public.zradius_proxy_grants') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
+  wait_schema "SELECT to_regclass('public.zradius_proxy_realms') IS NOT NULL AND to_regclass('public.zradius_proxy_grants') IS NOT NULL"
   umask 077
   psql -h postgres -U radius -d radius -v ON_ERROR_STOP=1 -At <<'SQL' >> /etc/freeradius/3.0/proxy.conf
 SELECT format(E'home_server proxy_auth_%s {\n type = auth\n ipaddr = %s\n port = 1812\n secret = "%s"\n status_check = status-server\n}\nhome_server proxy_acct_%s {\n type = acct\n ipaddr = %s\n port = 1813\n secret = "%s"\n status_check = status-server\n}\nhome_server_pool proxy_auth_pool_%s {\n type = fail-over\n home_server = proxy_auth_%s\n}\nhome_server_pool proxy_acct_pool_%s {\n type = fail-over\n home_server = proxy_acct_%s\n}\nrealm "%s" {\n auth_pool = proxy_auth_pool_%s\n acct_pool = proxy_acct_pool_%s\n nostrip\n}',id,host(home_ip),secret,id,host(home_ip),secret,id,id,id,id,realm,id,id)

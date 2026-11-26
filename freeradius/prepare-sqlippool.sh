@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+awk '/^allocate_existing = / { skip=1; next } skip && /RETURNING cte.framedipaddress"/ { skip=0; next } !skip { print }' /etc/freeradius/3.0/mods-config/sql/ippool/postgresql/queries.conf > /etc/freeradius/3.0/mods-config/sql/ippool/postgresql/zradius-queries.conf
+awk '/^allocate_find = / { active=1 } active && /username = / { print; printf "        lease_token = gen_random_uuid(), lease_session = NULL, lease_started_at = date_trunc(%csecond%c, now()), %c\n",39,39,92; found=1; next } {print} active && /RETURNING cte.framedipaddress"/ {active=0} END {if (!found) exit 1}' /etc/freeradius/3.0/mods-config/sql/ippool/postgresql/zradius-queries.conf > /tmp/zradius-queries.conf && mv /tmp/zradius-queries.conf /etc/freeradius/3.0/mods-config/sql/ippool/postgresql/zradius-queries.conf

@@ -19,7 +19,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m compileall backend
+      - name: Install backend dependencies
+        run: python -m pip install -r backend/requirements.txt
+      - run: python -m compileall backend scripts
+      - name: Validate shell syntax
+        run: |
+          for f in freeradius/*.sh scripts/*.sh; do sh -n "$f"; done
+      - name: Import API and generate OpenAPI
+        working-directory: backend
+        run: python -c 'from main import app; assert app.openapi()["paths"]'
       - run: python -m unittest test_ipam test_ipoe test_hotspot
         working-directory: backend
       - run: |
@@ -30,10 +38,7 @@ jobs:
         run: |
           printf 'POSTGRES_PASSWORD=%s\nADMIN_TOKEN=%s\nRADIUS_TEST_SECRET=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
           docker compose up -d
-          for i in $(seq 1 60); do
-            if docker compose exec -T radius sh -c 'test -s /run/freeradius/freeradius.pid' 2>/dev/null; then break; fi
-            sleep 2
-          done
+          python scripts/wait-radius.py
       - name: AAA integration
         run: |
           set -a
