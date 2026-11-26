@@ -28,3 +28,24 @@ test('accounting exact filter and cursor navigation',async({page})=>{
  await page.getByRole('button',{name:'Далее',exact:true}).click();
  await expect.poll(()=>calls.some(s=>s.includes('before=102')&&s.includes('username=test-user'))).toBeTruthy();
 });
+
+test('subscriber groups expand inline, load on demand and filter',async({page})=>{
+ const calls:string[]=[];
+ await page.route('**/api/v1/**',async route=>{
+  const path=new URL(route.request().url()).pathname;
+  calls.push(path);
+  if(path.endsWith('/iam/login'))return route.fulfill({json:{access_token:'test-session',username:'admin',role:'admin'}});
+  if(path.endsWith('/groups'))return route.fulfill({json:[{name:'INTERNET-100M'},{name:'INTERNET-500M'}]});
+  if(path.endsWith('/profile'))return route.fulfill({json:[{attribute:'Mikrotik-Rate-Limit',op:':=',value:'100M/100M'}]});
+  return route.fulfill({json:[]});
+ });
+ await page.goto('/#/groups');await page.getByLabel('Логин').fill('admin');await page.getByLabel('Пароль').fill('test-password');await page.getByRole('button',{name:'Войти'}).click();
+ const first=page.getByRole('button',{name:'INTERNET-100M',exact:true});
+ const second=page.getByRole('button',{name:'INTERNET-500M',exact:true});
+ await expect(first).toHaveAttribute('aria-expanded','false');
+ expect(calls.some(x=>x.endsWith('/profile'))).toBeFalsy();
+ await first.click();await expect(first).toHaveAttribute('aria-expanded','true');await expect(page.getByText('100M/100M',{exact:true})).toBeVisible();
+ await second.click();await expect(first).toHaveAttribute('aria-expanded','false');await expect(second).toHaveAttribute('aria-expanded','true');
+ await second.click();await expect(second).toHaveAttribute('aria-expanded','false');
+ await page.getByRole('searchbox',{name:'Поиск групп'}).fill('500M');await expect(first).toHaveCount(0);await expect(second).toBeVisible();
+});
