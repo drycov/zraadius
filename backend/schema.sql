@@ -150,3 +150,22 @@ CREATE TABLE IF NOT EXISTS zradius_radius_pool_groups (
  groupname varchar(64) PRIMARY KEY REFERENCES zradius_groups(name) ON DELETE CASCADE,
  pool_id bigint NOT NULL REFERENCES zradius_radius_pool_exports(pool_id) ON DELETE RESTRICT
 );
+
+-- FreeRADIUS 3.2.x PostgreSQL sqlippool-compatible lease storage.
+CREATE TABLE IF NOT EXISTS radippool (
+ id bigserial PRIMARY KEY,
+ pool_name text NOT NULL,
+ framedipaddress inet NOT NULL UNIQUE,
+ nasipaddress text NOT NULL DEFAULT '',
+ pool_key text NOT NULL DEFAULT '',
+ calledstationid text NOT NULL DEFAULT '',
+ callingstationid text NOT NULL DEFAULT '',
+ expiry_time timestamp(0) without time zone NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
+ username text DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS radippool_poolname_expire ON radippool(pool_name,expiry_time);
+CREATE INDEX IF NOT EXISTS radippool_nasip_poolkey_ipaddress ON radippool(nasipaddress,pool_key,framedipaddress);
+CREATE TABLE IF NOT EXISTS zradius_radius_pool_active (
+ pool_id bigint PRIMARY KEY REFERENCES zradius_radius_pool_exports(pool_id) ON DELETE RESTRICT,
+ activated_at timestamptz NOT NULL DEFAULT now()
+);

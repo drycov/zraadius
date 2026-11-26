@@ -17,6 +17,8 @@ services:
     environment:
       RADIUS_DB_PASSWORD: ${POSTGRES_PASSWORD:?required}
       RADIUS_TEST_SECRET: ${RADIUS_TEST_SECRET:?required}
+      TZ: UTC
+      RADIUS_ENABLE_SQLIPPOOL: ${RADIUS_ENABLE_SQLIPPOOL:-false}
       RADIUS_ENABLE_NAS: ${RADIUS_ENABLE_NAS:-false}
     depends_on:
       postgres:
@@ -32,6 +34,7 @@ services:
       PGDATABASE: radius
       PGUSER: radius
       PGPASSWORD: ${POSTGRES_PASSWORD:?required}
+      RADIUS_ENABLE_SQLIPPOOL: ${RADIUS_ENABLE_SQLIPPOOL:-false}
       ADMIN_TOKEN: ${ADMIN_TOKEN:?required}
       COA_ENABLED: ${COA_ENABLED:-false}
       COA_ALLOWED_NETWORKS: ${COA_ALLOWED_NETWORKS:-}

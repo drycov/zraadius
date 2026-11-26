@@ -26,6 +26,19 @@ SQL
   chgrp freerad /etc/freeradius/3.0/zradius-clients.conf
   printf '\n$INCLUDE /etc/freeradius/3.0/zradius-clients.conf\n' >> /etc/freeradius/3.0/clients.conf
 fi
+if [ "${RADIUS_ENABLE_SQLIPPOOL:-false}" = true ]; then
+  until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.radippool') IS NOT NULL AND to_regclass('public.zradius_radius_pool_active') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
+  ln -sf ../mods-available/sqlippool /etc/freeradius/3.0/mods-enabled/sqlippool
+  # Always start from the immutable template to avoid duplicate sections on restart.
+  cp /etc/freeradius/3.0/sites-available/zradius /etc/freeradius/3.0/sites-available/zradius-pool-runtime
+  sed -i '$d' /etc/freeradius/3.0/sites-available/zradius-pool-runtime
+  cat /etc/freeradius/3.0/zradius-pool-postauth >> /etc/freeradius/3.0/sites-available/zradius-pool-runtime
+  printf '\n}\n' >> /etc/freeradius/3.0/sites-available/zradius-pool-runtime
+  ln -sf ../sites-available/zradius-pool-runtime /etc/freeradius/3.0/sites-enabled/zradius
+else
+  rm -f /etc/freeradius/3.0/mods-enabled/sqlippool
+  ln -sf ../sites-available/zradius /etc/freeradius/3.0/sites-enabled/zradius
+fi
 unset PGPASSWORD
 freeradius -C
 exec freeradius -f -l stdout

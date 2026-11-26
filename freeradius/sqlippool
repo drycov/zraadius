@@ -1,0 +1,11 @@
+sqlippool {
+ sql_module_instance = "sql"
+ dialect = "postgresql"
+ pool_name = "Pool-Name"
+ ippool_table = "radippool"
+ lease_duration = 3600
+ attribute_name = Framed-IP-Address
+ req_attribute_name = Framed-IP-Address
+ pool_key = "%{NAS-Port}"
+ $INCLUDE ${modconfdir}/sql/ippool/postgresql/zradius-queries.conf
+}

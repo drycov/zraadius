@@ -722,3 +722,34 @@ def unbind_radius_pool(group:str):
         conn.execute("DELETE FROM zradius_radius_pool_groups WHERE groupname=%s",(group,))
         audit(conn,"group.radius_pool.remove",group)
     return {"status":"removed"}
+
+# Explicit one-way activation for lab use. No live lease deletion or implicit fallback.
+@app.post("/api/v1/ipam/pools/{pool_id}/radius-activate",dependencies=[Depends(auth)])
+def activate_radius_pool(pool_id:int):
+    with db() as conn:
+        pool=conn.execute("""SELECT p.name FROM zradius_ip_pools p JOIN zradius_radius_pool_exports e ON e.pool_id=p.id
+            WHERE p.id=%s FOR UPDATE OF p""",(pool_id,)).fetchone()
+        if not pool:
+            raise HTTPException(404,"Staged pool not found")
+        if conn.execute("SELECT 1 FROM zradius_radius_pool_active WHERE pool_id=%s",(pool_id,)).fetchone():
+            raise HTTPException(409,"Pool already activated")
+        if conn.execute("SELECT 1 FROM radippool WHERE pool_name=%s",(pool["name"],)).fetchone():
+            raise HTTPException(409,"Runtime pool name already exists")
+        count=conn.execute("""INSERT INTO radippool(pool_name,framedipaddress,expiry_time)
+            SELECT %s,address,TIMESTAMP '1970-01-01' FROM zradius_radius_pool_addresses WHERE pool_id=%s""",(pool["name"],pool_id)).rowcount
+        if not count:
+            raise HTTPException(409,"Empty pool")
+        conn.execute("INSERT INTO zradius_radius_pool_active(pool_id) VALUES (%s)",(pool_id,))
+        audit(conn,"ipam.radius.activate",str(pool_id))
+        return {"pool_id":pool_id,"addresses":count,"runtime_enabled":os.getenv("RADIUS_ENABLE_SQLIPPOOL","false")=="true"}
+
+@app.get("/api/v1/ipam/radius-leases",dependencies=[Depends(auth)])
+def radius_leases(pool_id:int,limit:int=100,offset:int=0):
+    if not 1<=limit<=500 or offset<0:
+        raise HTTPException(422,"Invalid pagination")
+    with db() as conn:
+        return conn.execute("""SELECT r.id,host(r.framedipaddress) AS address,r.username,r.nasipaddress,
+          r.expiry_time,(r.expiry_time>now() AT TIME ZONE 'UTC') AS leased
+          FROM radippool r JOIN zradius_ip_pools p ON p.name=r.pool_name
+          JOIN zradius_radius_pool_active a ON a.pool_id=p.id WHERE p.id=%s
+          ORDER BY r.framedipaddress LIMIT %s OFFSET %s""",(pool_id,limit,offset)).fetchall()
