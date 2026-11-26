@@ -348,7 +348,7 @@ class RateChange(BaseModel):
     upload_mbps: int = Field(ge=1,le=100000)
     download_mbps: int = Field(ge=1,le=100000)
 
-def session_action(session_id: int, rate: str | None = None):
+def session_action(session_id: int, rate: str | None = None, vpn_only: bool = False):
     if os.environ.get("COA_ENABLED","false").lower() != "true":
         raise HTTPException(409,"CoA is disabled")
     action = "coa" if rate else "disconnect"
@@ -356,7 +356,9 @@ def session_action(session_id: int, rate: str | None = None):
         with db() as conn:
             row = conn.execute("""SELECT a.username,a.acctsessionid,host(a.nasipaddress) AS address,n.secret,n.type
               FROM radacct a JOIN nas n ON n.nasname=host(a.nasipaddress)
-              WHERE a.radacctid=%s AND a.acctstoptime IS NULL""",(session_id,)).fetchone()
+              WHERE a.radacctid=%s AND a.acctstoptime IS NULL
+                AND (NOT %s OR (a.zradius_service='l2tp' AND n.type='mikrotik'
+                  AND EXISTS(SELECT 1 FROM zradius_nas_services s WHERE s.nas_id=n.id AND s.service_code='l2tp')))""",(session_id,vpn_only)).fetchone()
             if not row:
                 raise HTTPException(404,"Open session with registered NAS not found")
             if rate and row["type"]!="mikrotik":
@@ -2041,3 +2043,22 @@ def vpn_session_summary():
             count(*) FILTER (WHERE acctstoptime IS NULL) AS reported_open,
             count(*) FILTER (WHERE acctstoptime IS NULL AND (acctupdatetime IS NULL OR acctupdatetime<now()-interval '15 minutes')) AS no_update_15m
             FROM radacct WHERE zradius_service='l2tp'""").fetchone()
+
+
+@app.post("/api/v1/ppp/sessions/{session_id}/disconnect",dependencies=[Depends(auth)])
+def disconnect_vpn_session(session_id:int):
+    return session_action(session_id,vpn_only=True)
+
+@app.get("/api/v1/ppp/disconnect-history",dependencies=[Depends(auth)])
+def vpn_disconnect_history():
+    with db() as conn:
+        return conn.execute("""SELECT c.id,c.radacctid,c.status,c.created_at,c.completed_at,
+            a.username,host(a.nasipaddress) AS nasipaddress,a.acctsessionid,a.acctstoptime
+            FROM zradius_coa_requests c JOIN radacct a ON a.radacctid=c.radacctid
+            WHERE a.zradius_service='l2tp' AND c.action='disconnect'
+            ORDER BY c.id DESC LIMIT 100""").fetchall()
+
+@app.get("/api/v1/ppp/disconnect-capabilities",dependencies=[Depends(auth)])
+def vpn_disconnect_capabilities(principal=Depends(auth)):
+    return {"enabled":os.environ.get("COA_ENABLED","false").lower()=="true",
+            "permitted":principal["role"] in ("admin","operator")}

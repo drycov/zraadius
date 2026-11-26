@@ -21,3 +21,14 @@ class IamTests(unittest.TestCase):
         self.assertFalse(permitted("auditor","GET","/api/v1/future-secret-endpoint"))
         self.assertFalse(permitted("operator","POST","/api/v1/sessions/1/unexpected/disconnect"))
         self.assertTrue(permitted("auditor","GET","/api/v1/nas"))
+
+
+class VpnDisconnectPermissionTests(unittest.TestCase):
+    def test_vpn_disconnect(self):
+        from iam import permitted
+        path="/api/v1/ppp/sessions/42/disconnect"
+        self.assertTrue(permitted("admin","POST",path))
+        self.assertTrue(permitted("operator","POST",path))
+        self.assertFalse(permitted("auditor","POST",path))
+        self.assertFalse(permitted("operator","POST","/api/v1/ppp/sessions/42/rate"))
+        self.assertFalse(permitted("operator","POST","/api/v1/ppp/sessions/abc/disconnect"))

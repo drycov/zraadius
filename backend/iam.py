@@ -30,6 +30,8 @@ def permission(method,path):
         return resource+":read"
     if method=="POST" and len(parts)==5 and resource=="sessions" and parts[3].isdigit() and parts[4] in ("disconnect","rate"):
         return "sessions:"+parts[4]
+    if method=="POST" and len(parts)==6 and resource=="ppp" and parts[3]=="sessions" and parts[4].isdigit() and parts[5]=="disconnect":
+        return "sessions:disconnect"
     return None
 def permitted(role,method,path):
     if role=="admin":
