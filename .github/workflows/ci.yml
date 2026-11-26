@@ -2,6 +2,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -56,6 +57,7 @@ jobs:
           . ./.env
           set +a
           python scripts/integration-radius.py
+          ZRADIUS_ISOLATED_TEST=1 python scripts/integration-identity.py
       - name: Service diagnostics
         if: failure()
         run: |

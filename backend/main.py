@@ -78,6 +78,11 @@ async def auth(request:Request, credentials: HTTPAuthorizationCredentials | None
     actor_context.set(principal["username"])
     return principal
 
+def reserve_legacy_login(conn,username):
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",(username,))
+    if conn.execute("SELECT 1 FROM zradius_identities WHERE username=%s",(username,)).fetchone():
+        raise HTTPException(409,"Use unified identity editor")
+
 class User(BaseModel):
     username: str = Field(min_length=1,max_length=64,pattern=r"^[a-zA-Z0-9_.@-]+$")
     password: SecretStr = Field(min_length=12,max_length=253)
@@ -115,7 +120,7 @@ def users(limit: int = 100, offset: int = 0):
 @app.post("/api/v1/users", status_code=201, dependencies=[Depends(auth)])
 def create_user(user: User):
     with db() as conn:
-        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",(user.username,))
+        reserve_legacy_login(conn,user.username)
         if conn.execute("SELECT 1 FROM radcheck WHERE username=%s",(user.username,)).fetchone():
             raise HTTPException(409,"User exists")
         password = user.password.get_secret_value()
@@ -926,6 +931,7 @@ def device_users():
 def create_device_user(body:DeviceUserCreate):
     _,password,digest=device_credentials()
     with db() as conn:
+        reserve_legacy_login(conn,body.username)
         row=conn.execute("INSERT INTO zradius_device_users(username,password_hash) VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING id,username,enabled",(body.username,digest)).fetchone()
         if not row:
             raise HTTPException(409,"Device user exists")
@@ -1005,8 +1011,7 @@ def upsert_eap_user(username:str,body:EapUser):
     if username!=body.username or not re.fullmatch(r"[0-9a-f]{32}",digest):
         raise HTTPException(422,"Invalid identity or NT hash")
     with db() as conn:
-        if conn.execute("SELECT 1 FROM zradius_identities WHERE username=%s",(username,)).fetchone():
-            raise HTTPException(409,"Use unified identity editor")
+        reserve_legacy_login(conn,username)
         conn.execute("""INSERT INTO zradius_eap_users(username,nt_password,vlan_id) VALUES (%s,%s,%s)
             ON CONFLICT(username) DO UPDATE SET nt_password=excluded.nt_password,vlan_id=excluded.vlan_id""",(username,digest,body.vlan_id))
         audit(conn,"eap.user.upsert",username)
@@ -1811,6 +1816,7 @@ def create_l2tp_user(body:L2tpUserCreate):
     try:
         with db() as conn:
             lock_ppp_policy(conn)
+            reserve_legacy_login(conn,body.username)
             validate_l2tp_assignment(conn,body,address)
             row=conn.execute("""INSERT INTO zradius_l2tp_users(username,nt_password,password_hash,nas_id,profile_id,group_id,address_space_id,static_ip,description)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s::inet,%s) RETURNING id,username,enabled""",
@@ -2415,6 +2421,7 @@ def create_identity(body:IdentityCreate,principal=Depends(auth)):
         with db() as conn:
             lock_ppp_policy(conn)
             conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",(body.username,))
             # Never merge or adopt a pre-existing service login by name.
             if conn.execute("""SELECT 1 FROM zradius_device_users WHERE username=%s
                 UNION ALL SELECT 1 FROM zradius_l2tp_users WHERE username=%s

@@ -51,7 +51,8 @@ def main():
             conn.execute(sql.SQL("GRANT CONNECT ON DATABASE radius TO {}").format(sql.Identifier(role)))
         grant(conn,"zradius_api","SELECT, INSERT, UPDATE, DELETE",api_write)
         grant(conn,"zradius_api","SELECT",api_read)
-        grant(conn,"zradius_runtime","SELECT",runtime_read)
+        grant(conn,"zradius_runtime","SELECT",[t for t in runtime_read if t!="zradius_identity_credentials"])
+        conn.execute("GRANT SELECT (identity_id,password_hash,nt_password) ON public.zradius_identity_credentials TO zradius_runtime")
         grant(conn,"zradius_runtime","SELECT, INSERT, UPDATE",runtime_write)
         # Shared legacy sequences are discovered from column defaults, not guessed.
         for role,tables in (("zradius_api",api_write),("zradius_runtime",runtime_write)):
