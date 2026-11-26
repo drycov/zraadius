@@ -20,6 +20,8 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m compileall backend
+      - run: python -m unittest test_ipam test_ipoe
+        working-directory: backend
       - run: |
           cp .env.example .env
           docker compose config --quiet

@@ -536,3 +536,101 @@ def preview_ipoe(body:IpoePreview):
         (row["circuit_id"] is None or row["circuit_id"]==body.circuit_id) and
         (row["remote_id"] is None or row["remote_id"]==body.remote_id))
     return {"decision":"allow" if allowed else "deny","reply":{"Framed-IP-Address":row["static_ip"]} if allowed and row["static_ip"] else {},"runtime_enforced":False}
+
+# IPAM inventory: separate from NAS-managed DHCP and FreeRADIUS sqlippool.
+from ipam import pool_bounds, next_address
+from psycopg.errors import ExclusionViolation, ForeignKeyViolation
+
+class IpPool(BaseModel):
+    name: str=Field(min_length=1,max_length=64,pattern=r"^[a-zA-Z0-9_.-]+$")
+    network: str=Field(max_length=64)
+    first_ip: str|None=Field(default=None,max_length=45)
+    last_ip: str|None=Field(default=None,max_length=45)
+    description: str=Field(default="",max_length=200)
+
+class IpAllocation(BaseModel):
+    owner: str=Field(min_length=1,max_length=128)
+    address: IPvAnyAddress|None=None
+    kind: Literal["reserved","allocated"]="reserved"
+
+@app.get("/api/v1/ipam/pools",dependencies=[Depends(auth)])
+def ip_pools():
+    with db() as conn:
+        return conn.execute("""SELECT p.id,p.name,p.network::text AS network,
+        host(p.first_ip) AS first_ip,host(p.last_ip) AS last_ip,p.capacity::text AS capacity,
+        count(a.id) AS used,(p.capacity-count(a.id))::text AS free,p.description
+        FROM zradius_ip_pools p LEFT JOIN zradius_ip_allocations a ON a.pool_id=p.id
+        GROUP BY p.id ORDER BY p.name""").fetchall()
+
+@app.post("/api/v1/ipam/pools",status_code=201,dependencies=[Depends(auth)])
+def create_ip_pool(body:IpPool):
+    try:
+        net,first,last,capacity=pool_bounds(body.network,body.first_ip,body.last_ip)
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
+    try:
+        with db() as conn:
+            row=conn.execute("""INSERT INTO zradius_ip_pools(name,network,first_ip,last_ip,capacity,description)
+            VALUES (%s,%s,%s,%s,%s,%s) RETURNING id,name""",
+            (body.name,net,first,last,capacity,body.description)).fetchone()
+            audit(conn,"ipam.pool.create",body.name)
+    except (UniqueViolation,ExclusionViolation):
+        raise HTTPException(409,"Pool name or network overlaps existing pool")
+    return row
+
+@app.delete("/api/v1/ipam/pools/{pool_id}",dependencies=[Depends(auth)])
+def delete_ip_pool(pool_id:int):
+    try:
+        with db() as conn:
+            if not conn.execute("DELETE FROM zradius_ip_pools WHERE id=%s RETURNING id",(pool_id,)).fetchone():
+                raise HTTPException(404,"Pool not found")
+            audit(conn,"ipam.pool.delete",str(pool_id))
+    except ForeignKeyViolation:
+        raise HTTPException(409,"Release allocations first")
+    return {"status":"deleted"}
+
+@app.get("/api/v1/ipam/pools/{pool_id}/allocations",dependencies=[Depends(auth)])
+def ip_allocations(pool_id:int,limit:int=100,offset:int=0):
+    if not 1<=limit<=500 or offset<0:
+        raise HTTPException(422,"Invalid pagination")
+    with db() as conn:
+        return conn.execute("""SELECT id,host(address) AS address,owner,kind,created_at
+        FROM zradius_ip_allocations WHERE pool_id=%s ORDER BY address LIMIT %s OFFSET %s""",
+        (pool_id,limit,offset)).fetchall()
+
+@app.post("/api/v1/ipam/pools/{pool_id}/allocations",status_code=201,dependencies=[Depends(auth)])
+def allocate_ip(pool_id:int,body:IpAllocation):
+    try:
+        with db() as conn:
+            pool=conn.execute("SELECT host(first_ip) AS first,host(last_ip) AS last FROM zradius_ip_pools WHERE id=%s FOR UPDATE",(pool_id,)).fetchone()
+            if not pool:
+                raise HTTPException(404,"Pool not found")
+            if body.address is not None:
+                import ipaddress
+                ip=body.address
+                lo,hi=ipaddress.ip_address(pool["first"]),ipaddress.ip_address(pool["last"])
+                if ip.version!=lo.version or not lo<=ip<=hi:
+                    raise HTTPException(422,"Address outside pool range")
+                address=str(ip)
+            else:
+                with conn.cursor(name="ipam_scan") as cur:
+                    cur.execute("SELECT host(address) AS address FROM zradius_ip_allocations WHERE pool_id=%s ORDER BY address",(pool_id,))
+                    address=next_address(pool["first"],pool["last"],(r["address"] for r in cur))
+                if address is None:
+                    raise HTTPException(409,"Pool exhausted")
+            row=conn.execute("""INSERT INTO zradius_ip_allocations(pool_id,address,owner,kind)
+            VALUES (%s,%s,%s,%s) RETURNING id,host(address) AS address,owner,kind""",
+            (pool_id,address,body.owner,body.kind)).fetchone()
+            audit(conn,"ipam.allocate",str(row["id"]))
+    except UniqueViolation:
+        raise HTTPException(409,"Address already allocated")
+    return row
+
+@app.delete("/api/v1/ipam/pools/{pool_id}/allocations/{allocation_id}",dependencies=[Depends(auth)])
+def release_ip(pool_id:int,allocation_id:int):
+    with db() as conn:
+        conn.execute("SELECT id FROM zradius_ip_pools WHERE id=%s FOR UPDATE",(pool_id,))
+        if not conn.execute("DELETE FROM zradius_ip_allocations WHERE id=%s AND pool_id=%s RETURNING id",(allocation_id,pool_id)).fetchone():
+            raise HTTPException(404,"Allocation not found")
+        audit(conn,"ipam.release",str(allocation_id))
+    return {"status":"released","runtime_enforced":False}

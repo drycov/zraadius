@@ -111,3 +111,26 @@ CREATE TABLE IF NOT EXISTS zradius_ipoe_bindings (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS zradius_ipoe_static_ip_idx
  ON zradius_ipoe_bindings(nas_id,static_ip) WHERE static_ip IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS zradius_ip_pools (
+ id bigserial PRIMARY KEY,
+ name varchar(64) UNIQUE NOT NULL,
+ network cidr NOT NULL,
+ first_ip inet NOT NULL,
+ last_ip inet NOT NULL,
+ capacity numeric(39,0) NOT NULL CHECK(capacity>0),
+ description varchar(200) NOT NULL DEFAULT '',
+ created_at timestamptz NOT NULL DEFAULT now(),
+ CHECK(first_ip <<= network AND last_ip <<= network AND first_ip <= last_ip),
+ EXCLUDE USING gist (network inet_ops WITH &&)
+);
+CREATE TABLE IF NOT EXISTS zradius_ip_allocations (
+ id bigserial PRIMARY KEY,
+ pool_id bigint NOT NULL REFERENCES zradius_ip_pools(id) ON DELETE RESTRICT,
+ address inet NOT NULL UNIQUE,
+ owner varchar(128) NOT NULL,
+ kind text NOT NULL CHECK(kind IN ('reserved','allocated')),
+ created_at timestamptz NOT NULL DEFAULT now(),
+ CHECK(masklen(address)=CASE family(address) WHEN 4 THEN 32 ELSE 128 END)
+);
+CREATE INDEX IF NOT EXISTS zradius_ip_allocations_pool_idx ON zradius_ip_allocations(pool_id,address);
