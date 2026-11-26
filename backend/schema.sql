@@ -90,3 +90,8 @@ CREATE TABLE IF NOT EXISTS zradius_group_services (
  service_code text REFERENCES zradius_services(code),
  PRIMARY KEY(groupname,service_code)
 );
+
+CREATE TABLE IF NOT EXISTS zradius_device_roles (
+ groupname varchar(64) PRIMARY KEY REFERENCES zradius_groups(name) ON DELETE CASCADE,
+ mikrotik_group varchar(64) NOT NULL
+);

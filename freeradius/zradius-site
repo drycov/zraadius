@@ -12,6 +12,10 @@ server zradius {
  authorize {
   filter_username
   preprocess
+  # Administrative login is denied until dedicated Device AAA policy is validated.
+  if (&Service-Type == Login-User || &Service-Type == Administrative-User || &Service-Type == NAS-Prompt-User || &Service-Type == Authenticate-Only) {
+   reject
+  }
   chap
   mschap
   sql

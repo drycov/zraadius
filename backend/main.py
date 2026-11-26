@@ -379,3 +379,63 @@ def set_group_services(group: str, body: ServiceBindings):
             conn.execute("INSERT INTO zradius_group_services VALUES (%s,%s)",(group,code))
         audit(conn,"group.services",group)
     return {"services":codes,"runtime_enforced":False}
+
+class NetworkPolicy(BaseModel):
+    vlan_id: int | None = Field(default=None,ge=1,le=4094)
+    session_timeout: int | None = Field(default=None,ge=1,le=604800)
+    simultaneous_use: int | None = Field(default=None,ge=1,le=100)
+
+class DeviceRole(BaseModel):
+    mikrotik_group: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$",max_length=64,min_length=1)
+
+@app.put("/api/v1/groups/{group}/network-policy", dependencies=[Depends(auth)])
+def network_policy(group: str, body: NetworkPolicy):
+    reply = {}
+    if body.vlan_id is not None:
+        reply.update({"Tunnel-Type":"VLAN","Tunnel-Medium-Type":"IEEE-802","Tunnel-Private-Group-Id":str(body.vlan_id)})
+    if body.session_timeout is not None:
+        reply["Session-Timeout"]=str(body.session_timeout)
+    with db() as conn:
+        if not conn.execute("SELECT name FROM zradius_groups WHERE name=%s FOR UPDATE",(group,)).fetchone():
+            raise HTTPException(404,"Group not found")
+        conn.execute("DELETE FROM radgroupreply WHERE groupname=%s AND attribute=ANY(%s)",(group,["Tunnel-Type","Tunnel-Medium-Type","Tunnel-Private-Group-Id","Session-Timeout"]))
+        for name,value in reply.items():
+            conn.execute("INSERT INTO radgroupreply(groupname,attribute,op,value) VALUES (%s,%s,':=',%s)",(group,name,value))
+        conn.execute("DELETE FROM radgroupcheck WHERE groupname=%s AND attribute='Simultaneous-Use'",(group,))
+        if body.simultaneous_use is not None:
+            conn.execute("INSERT INTO radgroupcheck(groupname,attribute,op,value) VALUES (%s,'Simultaneous-Use',':=',%s)",(group,str(body.simultaneous_use)))
+        audit(conn,"group.network_policy",group)
+    return {"reply":reply,"simultaneous_use":body.simultaneous_use}
+
+@app.get("/api/v1/groups/{group}/network-policy", dependencies=[Depends(auth)])
+def get_network_policy(group: str):
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM zradius_groups WHERE name=%s",(group,)).fetchone():
+            raise HTTPException(404,"Group not found")
+        rows=conn.execute("SELECT attribute,value FROM radgroupreply WHERE groupname=%s AND attribute IN ('Tunnel-Type','Tunnel-Medium-Type','Tunnel-Private-Group-Id','Session-Timeout') ORDER BY id",(group,)).fetchall()
+        checks=conn.execute("SELECT attribute,value FROM radgroupcheck WHERE groupname=%s AND attribute='Simultaneous-Use' ORDER BY id",(group,)).fetchall()
+        return {"reply":{r["attribute"]:r["value"] for r in rows},"control":{r["attribute"]:r["value"] for r in checks}}
+
+@app.put("/api/v1/groups/{group}/device-role", dependencies=[Depends(auth)])
+def set_device_role(group: str, body: DeviceRole):
+    with db() as conn:
+        if not conn.execute("SELECT name FROM zradius_groups WHERE name=%s FOR UPDATE",(group,)).fetchone():
+            raise HTTPException(404,"Group not found")
+        if not conn.execute("SELECT 1 FROM zradius_group_services WHERE groupname=%s AND service_code='device-aaa'",(group,)).fetchone():
+            raise HTTPException(409,"Assign Device AAA service first")
+        conn.execute("INSERT INTO zradius_device_roles VALUES (%s,%s) ON CONFLICT(groupname) DO UPDATE SET mikrotik_group=excluded.mikrotik_group",(group,body.mikrotik_group))
+        audit(conn,"group.device_role",group)
+    return {"group":group,"mikrotik_group":body.mikrotik_group,"runtime_enforced":False}
+
+@app.get("/api/v1/groups/{group}/device-role", dependencies=[Depends(auth)])
+def get_device_role(group: str):
+    with db() as conn:
+        row=conn.execute("SELECT groupname,mikrotik_group FROM zradius_device_roles WHERE groupname=%s",(group,)).fetchone()
+        return {"role":row,"runtime_enforced":False}
+
+@app.delete("/api/v1/groups/{group}/device-role", dependencies=[Depends(auth)])
+def delete_device_role(group: str):
+    with db() as conn:
+        conn.execute("DELETE FROM zradius_device_roles WHERE groupname=%s",(group,))
+        audit(conn,"group.device_role.delete",group)
+    return {"status":"deleted"}
