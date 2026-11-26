@@ -45,6 +45,12 @@ if [ "${RADIUS_ENABLE_IPOE:-false}" = true ]; then
 else
   rm -f /etc/freeradius/3.0/sites-enabled/zradius-ipoe
 fi
+if [ "${RADIUS_ENABLE_HOTSPOT:-false}" = true ]; then
+  until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.zradius_hotspot_vouchers') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
+  ln -sf ../sites-available/zradius-hotspot /etc/freeradius/3.0/sites-enabled/zradius-hotspot
+else
+  rm -f /etc/freeradius/3.0/sites-enabled/zradius-hotspot
+fi
 unset PGPASSWORD
 freeradius -C
 exec freeradius -f -l stdout

@@ -210,3 +210,18 @@ FOR EACH ROW EXECUTE FUNCTION zradius_accounting_lease();
 
 -- IPoE runtime exists as opt-in static IPv4 authentication, not validated on hardware.
 UPDATE zradius_services SET maturity='experimental' WHERE code='ipoe' AND maturity='planned';
+
+CREATE TABLE IF NOT EXISTS zradius_hotspot_vouchers (
+ id bigserial PRIMARY KEY,
+ nas_id bigint NOT NULL REFERENCES nas(id) ON DELETE RESTRICT,
+ username varchar(64) NOT NULL UNIQUE,
+ password_hash text NOT NULL,
+ expires_at timestamptz NOT NULL,
+ session_seconds integer NOT NULL CHECK(session_seconds BETWEEN 60 AND 86400),
+ idle_seconds integer NOT NULL CHECK(idle_seconds BETWEEN 60 AND 86400),
+ rate_limit varchar(64),
+ enabled boolean NOT NULL DEFAULT true,
+ created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS zradius_hotspot_nas_idx ON zradius_hotspot_vouchers(nas_id);
+UPDATE zradius_services SET maturity='experimental' WHERE code='hotspot' AND maturity='planned';

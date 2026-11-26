@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m compileall backend
-      - run: python -m unittest test_ipam test_ipoe
+      - run: python -m unittest test_ipam test_ipoe test_hotspot
         working-directory: backend
       - run: |
           cp .env.example .env

@@ -1,0 +1,44 @@
+server zradius-hotspot {
+ listen {
+  type = auth
+  ipaddr = *
+  port = 18121
+ }
+ authorize {
+  if (!&User-Name || &User-Name !~ /^hs-[a-f0-9]{20}$/ || !&User-Password || &CHAP-Password || &EAP-Message || &MS-CHAP-Challenge) {
+   reject
+  }
+  update control {
+   SSHA512-Password := "%{sql:SELECT v.password_hash FROM zradius_hotspot_vouchers v JOIN nas n ON n.id=v.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='hotspot' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND v.username='%{User-Name}' AND v.enabled AND v.expires_at>now()}"
+  }
+  if (!&control:SSHA512-Password || &control:SSHA512-Password == "") {
+   reject
+  }
+  pap
+ }
+ authenticate {
+  Auth-Type PAP {
+   pap
+  }
+ }
+ post-auth {
+  update control {
+   Tmp-String-0 := "%{sql:SELECT LEAST(v.session_seconds,FLOOR(EXTRACT(EPOCH FROM v.expires_at-now())))::integer FROM zradius_hotspot_vouchers v JOIN nas n ON n.id=v.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='hotspot' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND v.username='%{User-Name}' AND v.enabled AND v.expires_at>now()}"
+  }
+  if (&control:Tmp-String-0 !~ /^[1-9][0-9]*$/) {
+   reject
+  }
+  update reply {
+   Session-Timeout := "%{control:Tmp-String-0}"
+   Idle-Timeout := "%{sql:SELECT idle_seconds FROM zradius_hotspot_vouchers WHERE username='%{User-Name}'}"
+  }
+  update control {
+   Tmp-String-1 := "%{sql:SELECT COALESCE(rate_limit,'') FROM zradius_hotspot_vouchers WHERE username='%{User-Name}'}"
+  }
+  if (&control:Tmp-String-1 =~ /^[0-9]+M\/[0-9]+M$/) {
+   update reply {
+    Mikrotik-Rate-Limit := "%{control:Tmp-String-1}"
+   }
+  }
+ }
+}

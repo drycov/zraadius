@@ -251,6 +251,8 @@ def delete_nas(nas_id: int):
         conn.execute("SELECT id FROM nas WHERE id=%s FOR UPDATE",(nas_id,))
         if conn.execute("SELECT 1 FROM zradius_ipoe_bindings WHERE nas_id=%s",(nas_id,)).fetchone():
             raise HTTPException(409,"Remove IPoE bindings first")
+        if conn.execute("SELECT 1 FROM zradius_hotspot_vouchers WHERE nas_id=%s",(nas_id,)).fetchone():
+            raise HTTPException(409,"NAS has Hotspot voucher history")
         row=conn.execute("DELETE FROM nas WHERE id=%s RETURNING nasname",(nas_id,)).fetchone()
         if not row:
             raise HTTPException(404,"NAS not found")
@@ -753,3 +755,53 @@ def radius_leases(pool_id:int,limit:int=100,offset:int=0):
           FROM radippool r JOIN zradius_ip_pools p ON p.name=r.pool_name
           JOIN zradius_radius_pool_active a ON a.pool_id=p.id WHERE p.id=%s
           ORDER BY r.framedipaddress LIMIT %s OFFSET %s""",(pool_id,limit,offset)).fetchall()
+
+from hotspot import voucher_credentials
+
+class HotspotVoucher(BaseModel):
+    nas_id:int=Field(gt=0)
+    validity_seconds:int=Field(default=86400,ge=60,le=2592000)
+    session_seconds:int=Field(default=3600,ge=60,le=86400)
+    idle_seconds:int=Field(default=300,ge=60,le=86400)
+    upload_mbps:int|None=Field(default=None,ge=1,le=10000)
+    download_mbps:int|None=Field(default=None,ge=1,le=10000)
+
+@app.post("/api/v1/hotspot/vouchers",status_code=201,dependencies=[Depends(auth)])
+def create_hotspot_voucher(body:HotspotVoucher):
+    if (body.upload_mbps is None)!=(body.download_mbps is None):
+        raise HTTPException(422,"Specify both rate limits or neither")
+    if body.session_seconds>body.validity_seconds or body.idle_seconds>body.session_seconds:
+        raise HTTPException(422,"Invalid time limits")
+    username,password,digest=voucher_credentials()
+    rate=f"{body.upload_mbps}M/{body.download_mbps}M" if body.upload_mbps else None
+    with db() as conn:
+        nas=conn.execute("SELECT id,type FROM nas WHERE id=%s FOR UPDATE",(body.nas_id,)).fetchone()
+        if not nas:
+            raise HTTPException(404,"NAS not found")
+        if nas["type"]!="mikrotik":
+            raise HTTPException(422,"Only MikroTik Hotspot is supported")
+        if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='hotspot'",(body.nas_id,)).fetchone():
+            raise HTTPException(409,"Assign Hotspot service to NAS first")
+        row=conn.execute("""INSERT INTO zradius_hotspot_vouchers(nas_id,username,password_hash,expires_at,session_seconds,idle_seconds,rate_limit)
+            VALUES (%s,%s,%s,now()+make_interval(secs=>%s),%s,%s,%s)
+            RETURNING id,nas_id,username,expires_at,session_seconds,idle_seconds,rate_limit,enabled""",
+            (body.nas_id,username,digest,body.validity_seconds,body.session_seconds,body.idle_seconds,rate)).fetchone()
+        audit(conn,"hotspot.voucher.create",username)
+    return {**row,"password":password}
+
+@app.get("/api/v1/hotspot/vouchers",dependencies=[Depends(auth)])
+def list_hotspot_vouchers(limit:int=100,offset:int=0):
+    if not 1<=limit<=500 or offset<0:
+        raise HTTPException(422,"Invalid pagination")
+    with db() as conn:
+        return conn.execute("""SELECT id,nas_id,username,expires_at,session_seconds,idle_seconds,rate_limit,enabled,
+            expires_at<=now() AS expired FROM zradius_hotspot_vouchers ORDER BY id DESC LIMIT %s OFFSET %s""",(limit,offset)).fetchall()
+
+@app.delete("/api/v1/hotspot/vouchers/{voucher_id}",dependencies=[Depends(auth)])
+def revoke_hotspot_voucher(voucher_id:int):
+    with db() as conn:
+        row=conn.execute("UPDATE zradius_hotspot_vouchers SET enabled=false WHERE id=%s RETURNING username",(voucher_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Voucher not found")
+        audit(conn,"hotspot.voucher.revoke",row["username"])
+    return {"status":"revoked","existing_sessions_terminated":False}
