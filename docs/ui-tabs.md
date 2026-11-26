@@ -1,0 +1,2 @@
+# Tabbed workspaces
+Users: unified directory, creation, global groups, legacy PPPoE. Identity editor: account, AAA/VPN, PPPoE, Hotspot, 802.1X, WPA, console, groups and sessions. PPP/VPN: nine tabs. Tabs support keyboard navigation, lazy first mount and preserve visited panel state until workspace closes. Existing group-list controlled disclosures remain for individual records. REST contracts unchanged. Build and browser tests pending.

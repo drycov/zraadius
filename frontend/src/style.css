@@ -87,3 +87,24 @@
  .zr-filter-toolbar>.dk-btn{width:100%}
  .zr-form .dk-input{font-size:16px}
 }
+
+/* Tabbed workspace. Inactive panels stay mounted after first visit, but are hidden. */
+.zr-tabs{min-width:0;max-width:100%;border:1px solid var(--tg-border);border-radius:var(--radius);background:var(--tg-surface)}
+.zr-tablist{display:flex;align-items:stretch;gap:4px;overflow-x:auto;padding:6px 10px 0;border-bottom:1px solid var(--tg-border);background:var(--tg-secondary);border-radius:var(--radius) var(--radius) 0 0;scrollbar-width:thin}
+.zr-tablist>button{flex:0 0 auto;min-height:44px;padding:10px 14px;border:0;border-bottom:2px solid transparent;border-radius:var(--radius-sm) var(--radius-sm) 0 0;background:transparent;color:var(--tg-hint);font:inherit;font-size:var(--text-sm);font-weight:600;white-space:nowrap;cursor:pointer}
+.zr-tablist>button:hover{background:var(--tg-tertiary);color:var(--tg-text)}
+.zr-tablist>button[aria-selected=true]{color:var(--tg-button);border-bottom-color:var(--tg-button);background:var(--tg-surface)}
+.zr-tablist>button:focus-visible{outline:2px solid var(--tg-button);outline-offset:-3px}
+.zr-tabpanel[hidden]{display:none!important}
+.zr-tabpanel:not([hidden]){display:flex;flex-direction:column;gap:16px;padding:18px;min-width:0}
+.zr-plain-section{min-width:0}
+.zr-section-heading{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:12px}
+.zr-section-heading h3{margin:0;font-size:1rem;font-weight:600}
+.zr-section-heading p{flex-basis:100%;margin:0;color:var(--tg-hint)}
+.zr-section-body{display:flex;flex-direction:column;gap:12px;min-width:0}
+.zr-workspace-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.zr-workspace-toolbar>.dk-input{flex:1 1 240px;min-width:0}
+.zr-service-tags{display:flex;gap:5px;flex-wrap:wrap;max-width:340px}
+.zr-identity-summary{display:flex;align-items:center;flex-wrap:wrap;gap:12px;padding:12px;background:var(--tg-secondary);border-radius:var(--radius-sm)}
+.zr-dialog-wide{width:min(1120px,calc(100vw - 32px));max-width:min(1120px,calc(100vw - 32px))}
+@media(max-width:600px){.zr-tabpanel:not([hidden]){padding:12px;gap:12px}.zr-tablist{padding-inline:6px}.zr-tablist>button{padding-inline:10px}.zr-dialog-wide{width:calc(100vw - 16px);max-width:calc(100vw - 16px)}}
