@@ -2567,3 +2567,73 @@ def identity_effective_device_grants(identity_id:int):
             JOIN zradius_identities i ON i.id=u.identity_id AND i.enabled
             JOIN zradius_identity_credentials c ON c.identity_id=i.id
             JOIN nas n ON n.id=g.nas_id WHERE i.id=%s ORDER BY n.shortname""",(identity_id,)).fetchall()
+
+
+class IdentityVpnTemplate(BaseModel):
+    nas_id:int=Field(gt=0)
+    profile_id:int=Field(gt=0)
+    address_space_id:int|None=Field(default=None,gt=0)
+
+@app.get("/api/v1/identities/groups/{group_id}/vpn-template",dependencies=[Depends(auth)])
+def identity_group_vpn_template(group_id:int):
+    with db() as conn:
+        return conn.execute("SELECT nas_id,profile_id,address_space_id FROM zradius_identity_group_vpn_templates WHERE group_id=%s",(group_id,)).fetchone()
+
+@app.put("/api/v1/identities/groups/{group_id}/vpn-template",dependencies=[Depends(auth)])
+def set_identity_group_vpn_template(group_id:int,body:IdentityVpnTemplate):
+    with db() as conn:
+        lock_ppp_policy(conn)
+        if not conn.execute("SELECT id FROM zradius_identity_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone():
+            raise HTTPException(404,"Identity group not found")
+        assignment=L2tpAssignment(**body.model_dump())
+        validate_l2tp_assignment(conn,assignment,None)
+        conn.execute("""INSERT INTO zradius_identity_group_vpn_templates(group_id,nas_id,profile_id,address_space_id)
+            VALUES (%s,%s,%s,%s) ON CONFLICT(group_id) DO UPDATE SET nas_id=excluded.nas_id,profile_id=excluded.profile_id,address_space_id=excluded.address_space_id""",
+            (group_id,body.nas_id,body.profile_id,body.address_space_id))
+        audit(conn,"identity.group.vpn.template",str(group_id))
+    return {"status":"updated"}
+
+@app.delete("/api/v1/identities/groups/{group_id}/vpn-template",dependencies=[Depends(auth)])
+def remove_identity_group_vpn_template(group_id:int):
+    with db() as conn:
+        lock_ppp_policy(conn)
+        conn.execute("DELETE FROM zradius_identity_group_vpn_templates WHERE group_id=%s",(group_id,))
+        audit(conn,"identity.group.vpn.template.remove",str(group_id))
+    return {"status":"removed"}
+
+def resolve_identity_vpn_template(conn,identity_id):
+    rows=conn.execute("""SELECT DISTINCT t.nas_id,t.profile_id,t.address_space_id
+        FROM zradius_identity_group_members m JOIN zradius_identity_group_vpn_templates t ON t.group_id=m.group_id
+        WHERE m.identity_id=%s""",(identity_id,)).fetchall()
+    if len(rows)!=1:
+        raise HTTPException(409,"No group VPN template or conflicting templates")
+    assignment=L2tpAssignment(**rows[0])
+    validate_l2tp_assignment(conn,assignment,None)
+    return assignment
+
+@app.get("/api/v1/identities/{identity_id}/vpn-template",dependencies=[Depends(auth)])
+def preview_identity_vpn_template(identity_id:int):
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone():
+            raise HTTPException(404,"Identity not found")
+        return resolve_identity_vpn_template(conn,identity_id).model_dump()
+
+@app.post("/api/v1/identities/{identity_id}/vpn-template/apply",dependencies=[Depends(auth)])
+def apply_identity_vpn_template(identity_id:int):
+    try:
+        with db() as conn:
+            lock_ppp_policy(conn)
+            identity=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+            if not identity:
+                raise HTTPException(404,"Identity not found")
+            if conn.execute("SELECT 1 FROM zradius_l2tp_users WHERE identity_id=%s",(identity_id,)).fetchone():
+                raise HTTPException(409,"Existing individual VPN assignment is preserved")
+            if not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s AND nt_password IS NOT NULL",(identity_id,)).fetchone():
+                raise HTTPException(409,"Set unified password first")
+            a=resolve_identity_vpn_template(conn,identity_id)
+            conn.execute("""INSERT INTO zradius_l2tp_users(username,identity_id,nas_id,profile_id,address_space_id,enabled)
+                VALUES (%s,%s,%s,%s,%s,false)""",(identity["username"],identity_id,a.nas_id,a.profile_id,a.address_space_id))
+            audit(conn,"identity.vpn.template.apply",identity["username"])
+        return {"status":"created_disabled"}
+    except UniqueViolation:
+        raise HTTPException(409,"Existing VPN login conflict")
