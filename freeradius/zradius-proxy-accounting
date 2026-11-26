@@ -1,0 +1,26 @@
+  if (&Mikrotik-Realm == "proxy") {
+   if (&Proxy-State || !&User-Name || &User-Name !~ /^[a-zA-Z0-9_.-]{1,64}@([a-z0-9][a-z0-9.-]{1,126}[a-z0-9])$/) {
+    reject
+   }
+   if (&User-Name =~ /^[a-zA-Z0-9_.-]{1,64}@([a-z0-9][a-z0-9.-]{1,126}[a-z0-9])$/) {
+    update control {
+     Tmp-String-0 := "%{1}"
+    }
+   }
+   else {
+    reject
+   }
+   if (!&NAS-IP-Address || &NAS-IP-Address != &Packet-Src-IP-Address) {
+    reject
+   }
+   update control {
+    Tmp-String-1 := "%{sql:SELECT r.realm FROM zradius_proxy_realms r JOIN zradius_proxy_grants g ON g.realm_id=r.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='proxy' WHERE r.enabled AND r.realm='%{control:Tmp-String-0}' AND n.nasname='%{Packet-Src-IP-Address}'}"
+   }
+   if (&control:Tmp-String-1 !~ /^[a-z0-9][a-z0-9.-]+$/) {
+    reject
+   }
+   update control {
+    Proxy-To-Realm := "%{control:Tmp-String-1}"
+   }
+   return
+  }
