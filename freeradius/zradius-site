@@ -175,6 +175,13 @@ server zradius {
    }
   }
   sql
+  if (&Mikrotik-Realm == "l2tp" && (&Acct-Status-Type == Start || &Acct-Status-Type == Interim-Update || &Acct-Status-Type == Stop)) {
+   if (&Acct-Unique-Session-Id && &Acct-Unique-Session-Id =~ /^[0-9a-fA-F]{32}$/) {
+    update control {
+     Tmp-String-3 := "%{sql:UPDATE radacct SET zradius_service='l2tp' WHERE acctuniqueid='%{Acct-Unique-Session-Id}' AND nasipaddress='%{Packet-Src-IP-Address}'::inet AND zradius_service IS NULL}"
+    }
+   }
+  }
  }
  session {
   sql

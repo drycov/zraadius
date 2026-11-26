@@ -2,6 +2,7 @@ import {useState} from 'react';
 import {Alert,Button,Card,Form,Input,InputNumber,Modal,Popconfirm,Select,Space,Table,Tag} from '../ui';
 import Disclosure from '../ui/Disclosure';
 import VpnPools from './VpnPools';
+import VpnSessions from './VpnSessions';
 import VpnAddressSpaces,{type AddressSpace} from './VpnAddressSpaces';
 import PppGroups,{type VpnGroup} from './PppGroups';
 import {useData,useAction,Fault} from '../hooks';
@@ -16,7 +17,7 @@ export default function PppPage({request}:{request:Request}){
  <Disclosure title="PPP Profiles" meta={String(p.data?.length??0)} defaultOpen>
  <Form form={pf} layout="inline" initialValues={{interim_seconds:300}} onFinish={v=>a.run(()=>request('ppp/profiles','POST',{...v,pool:v.pool||null}),()=>pf.resetFields())}><Form.Item name="name" label="Имя PPP Profile" rules={[{required:true,max:64}]}><Input placeholder="vpn_ovn-lu-p"/></Form.Item><Form.Item name="pool" label="Remote Pool"><Input placeholder="Satory_VPN_2"/></Form.Item><Form.Item name="interim_seconds" label="Interim (сек)" rules={[{required:true}]}><InputNumber min={60} max={86400}/></Form.Item><Form.Item name="description" label="Описание"><Input maxLength={200}/></Form.Item><Button type="primary" htmlType="submit" loading={a.busy}>Создать профиль</Button></Form>
  <Table<Profile> rowKey="id" loading={p.loading} dataSource={p.data??[]} columns={[{title:'PPP Profile',dataIndex:'name'},{title:'Pool',dataIndex:'pool'},{title:'Interim',dataIndex:'interim_seconds'},{title:'Описание',dataIndex:'description'},{title:'',render:(_,x)=><Button onClick={()=>{pef.setFieldsValue(x);setProfileEdit(x)}}>Редактировать</Button>}]}/></Disclosure><PppGroups request={request} groups={groups.data??[]} profiles={p.data??[]} loading={groups.loading} refresh={refresh}/>
- <VpnAddressSpaces request={request} items={spaces.data??[]} loading={spaces.loading} refresh={spaces.refresh}/><VpnPools request={request} nas={eligible} spaces={spaces.data??[]}/><Disclosure title="L2TP Users" defaultOpen>
+ <VpnAddressSpaces request={request} items={spaces.data??[]} loading={spaces.loading} refresh={spaces.refresh}/><VpnPools request={request} nas={eligible} spaces={spaces.data??[]}/><VpnSessions request={request} nas={n.data??[]}/><Disclosure title="L2TP Users" defaultOpen>
  {!eligible.length&&<Alert type="warning" message="Назначьте сервис l2tp зарегистрированному MikroTik NAS."/>}
  <Form form={uf} layout="vertical" disabled={!eligible.length||!p.data?.length||a.busy} onFinish={v=>a.run(()=>request('ppp/l2tp/users','POST',{...v,profile_id:v.profile_id||null,group_id:v.group_id||null,address_space_id:v.address_space_id||null,static_ip:v.static_ip||null}),()=>uf.resetFields())}>
  <Form.Item name="username" label="Username" rules={[{required:true,max:64}]}><Input/></Form.Item>

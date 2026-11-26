@@ -2001,3 +2001,43 @@ def validate_registered_vpn_pools(conn):
         JOIN zradius_vpn_pools r ON r.nas_id=u.nas_id AND r.name=p.pool
         WHERE u.static_ip IS NULL AND u.address_space_id IS DISTINCT FROM r.address_space_id LIMIT 1""").fetchone():
         raise HTTPException(409,"Registered pool belongs to another address space")
+
+
+@app.get("/api/v1/ppp/sessions",dependencies=[Depends(auth)])
+def vpn_sessions(active:bool=True,username:str|None=None,nas:IPvAnyAddress|None=None,before:int|None=None,limit:int=100):
+    if not 1<=limit<=500 or (before is not None and before<1) or (username is not None and not 1<=len(username)<=253):
+        raise HTTPException(422,"Invalid session filters")
+    clauses=["a.zradius_service='l2tp'"]
+    params=[]
+    if active:
+        clauses.append("a.acctstoptime IS NULL")
+    if username is not None:
+        clauses.append("a.username=%s")
+        params.append(username)
+    if nas is not None:
+        clauses.append("a.nasipaddress=%s::inet")
+        params.append(str(nas))
+    if before is not None:
+        clauses.append("a.radacctid<%s")
+        params.append(before)
+    where=" AND ".join(clauses)
+    with db() as conn:
+        return conn.execute(f"""SELECT a.radacctid,a.username,a.acctsessionid,host(a.nasipaddress) AS nasipaddress,
+            host(a.framedipaddress) AS framedipaddress,a.acctstarttime,a.acctupdatetime,a.acctstoptime,
+            a.acctsessiontime,a.acctinputoctets,a.acctoutputoctets,a.acctterminatecause,
+            CASE WHEN a.acctstoptime IS NOT NULL THEN 'closed'
+                 WHEN a.acctupdatetime IS NULL THEN 'unknown'
+                 WHEN a.acctupdatetime<now()-make_interval(secs=>GREATEST(900,COALESCE(p.interim_seconds,300)*3)) THEN 'stale'
+                 ELSE 'reported_open' END AS state
+            FROM radacct a LEFT JOIN nas n ON n.nasname=host(a.nasipaddress)
+            LEFT JOIN zradius_l2tp_users u ON u.username=a.username AND u.nas_id=n.id
+            LEFT JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id
+            WHERE {where} ORDER BY a.radacctid DESC LIMIT %s""",(*params,limit)).fetchall()
+
+@app.get("/api/v1/ppp/session-summary",dependencies=[Depends(auth)])
+def vpn_session_summary():
+    with db() as conn:
+        return conn.execute("""SELECT count(*) AS recorded,
+            count(*) FILTER (WHERE acctstoptime IS NULL) AS reported_open,
+            count(*) FILTER (WHERE acctstoptime IS NULL AND (acctupdatetime IS NULL OR acctupdatetime<now()-interval '15 minutes')) AS no_update_15m
+            FROM radacct WHERE zradius_service='l2tp'""").fetchone()
