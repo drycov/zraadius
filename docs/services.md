@@ -1,3 +1,16 @@
-# Multi-service AAA
+# Service catalog
 
-Service catalog and NAS/group bindings are inventory metadata only. They are not authentication gates. Existing PPP runtime remains unchanged. PPPoE and L2TP are experimental until lab tests pass. IPoE requires NAS-specific DHCP/MAC identity and trusted circuit identifiers. Hotspot requires captive portal integration. Device AAA requires explicit administrative role mapping and a separate authorization policy. 802.1X/WPA Enterprise require dedicated EAP configuration, certificates, inner-tunnel for PEAP and EAP interoperability tests. Proxy requires explicit realm/home-server configuration, loop prevention and protected transport. No automatic enabling of these protocols is performed. Do not interpret catalog registration as protocol support or access restriction.
+`GET /api/v1/services` and NAS/group service bindings are **inventory and policy metadata** for the management plane and unified radius site logic.
+
+They are **not** an automatic license to enable protocols:
+
+| Catalog / UI area | Runtime requirement |
+|-------------------|---------------------|
+| PPP / L2TP profiles | FreeRADIUS PPP branch + NAS realm + optional pools |
+| IPoE | Trusted circuit/MAC identity; NAS DHCP behavior |
+| Hotspot | Captive portal + vouchers API |
+| Device AAA | Roles, grants, separate auth log |
+| EAP / PKI | Certs, flags, inner tunnel |
+| Proxy | Home servers, loop prevention |
+
+No compose flag is flipped merely by inserting a catalog row. Use explicit env flags and overlay files, then lab-test Accept/Reject and accounting.

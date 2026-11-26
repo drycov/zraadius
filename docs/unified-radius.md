@@ -1,2 +1,35 @@
 # Unified RADIUS endpoint
-One radius container, one public authentication listener UDP 1812 and accounting listener UDP 1813. Explicit RouterOS /radius realm values: pppoe, l2tp, ipoe, hotspot, device-aaa. For PPP choose pppoe or l2tp, configure appropriate service assignment; RouterOS uses one ppp service entry for both and cannot necessarily distinguish them by realm on the same NAS, so use one assigned PPP realm for mixed access until NAS-Port-Type policy is implemented. Use a separate /radius entry per RouterOS service, same destination and secret. No user-controlled realm suffix routing. Every remote request requires an assigned service, actual source IPv4 and a matching registered MikroTik NAS; PPP also requires Framed-User and PPP. Unknown/missing realms and EAP rejected. Local loopback without realm is reserved for development tests. Do not publish via a proxy that rewrites source IP to loopback. Accounting requires matching NAS-IP-Address and packet source for managed NAS; NAT and differing NAS addresses need explicit future mapping. Existing managed NAS without realm must be migrated before deployment or authentication will fail. Old 18120/18121/18122 listeners removed. SQL pool remains optional and is invoked only on PPP branch. EAP/Proxy not yet implemented. No claim of successful runtime validation. Docs for prior per-service overlays are historical; this document supersedes their ports and activation instructions.
+
+One radius container, one public authentication listener **UDP 1812** and accounting **UDP 1813**.
+
+## Realms (RouterOS `/radius`)
+
+- `pppoe`
+- `l2tp`
+- `ipoe`
+- `hotspot`
+- `device-aaa`
+
+Configure a **separate** `/radius` entry per service on MikroTik if needed, same destination and secret, different realm.
+
+RouterOS PPP may not distinguish PPPoE vs L2TP by realm on the same NAS; assign one PPP realm until NAS-Port-Type policy exists.
+
+## Request acceptance rules (design intent)
+
+- Remote requests require assigned service, real source IPv4, and matching registered MikroTik NAS (when NAS runtime is enabled)
+- Unknown or missing realms → reject
+- Local **loopback without realm** reserved for development tests and healthcheck
+- Do not put a proxy in front that rewrites source IP to loopback
+- Accounting for managed NAS expects consistent NAS-IP-Address vs packet source
+
+## Removed
+
+Older per-service high ports (18120/18121/18122) are gone.
+
+## Optional SQL pool
+
+Invoked only on the PPP branch when `RADIUS_ENABLE_SQLIPPOOL=true`.
+
+## EAP / Proxy
+
+Code paths and compose overlays exist; default base stack leaves them disabled.
