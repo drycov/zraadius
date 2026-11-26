@@ -1,2 +1,26 @@
 # PKI inventory
-Import public PEM CA/server/client certificates only. Parse X.509, verify CA constraint and leaf EKU, record SHA-256 fingerprint, serial, issuer and validity. This is inventory validation, NOT certificate chain verification. Future certificates may be registered but cannot receive grants until valid. Revocation is a permanent local registry marker; it does not publish a CRL or change the current FreeRADIUS trust store. Client grants are metadata only. EAP-TLS remains disabled until verified certificate fingerprint extraction, chain validation, per-NAS authorization and revocation checks are integrated and tested. CA private keys and server private keys are never accepted by the API. Use an external/offline CA for issuance, retain the existing PEAP read-only mount. No additional RADIUS listener.
+
+`backend/pki.py`, API `/api/v1/pki/*`. UI: `#/pki`.
+
+## Principle
+
+**Public certificates only.** API never accepts or stores private keys.
+
+## Import rules
+
+- Exactly one PEM CERTIFICATE block
+- Not expired
+- `purpose=ca` ↔ BasicConstraints CA
+- `client` / `server` require matching ExtendedKeyUsage
+- Returns SHA-256 fingerprint, subject, issuer, serial, validity
+
+## API
+
+```
+GET/POST  /api/v1/pki/certificates
+GET       /api/v1/pki/certificates/{fingerprint}/pem
+POST      /api/v1/pki/certificates/{fingerprint}/revoke
+GET/PUT/DELETE grants on NAS
+```
+
+Server material for FreeRADIUS is separate host files under `RADIUS_PKI_DIR` (`server.key`, `server.pem`, `ca.pem`). Helper: `scripts/pki-server-csr.sh`.

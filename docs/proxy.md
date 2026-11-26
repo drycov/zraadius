@@ -1,2 +1,19 @@
-# Experimental RADIUS proxy
-One standard endpoint, UDP 1812/1813. Register a realm with upstream IPv4 and random shared secret; assign proxy service and explicit NAS grant; enable realm and recreate radius with compose.yaml + compose.proxy.yaml (retain other overlays if used). Upstream must register ZRADIUS source as a client and support Status-Server probes. Use MikroTik-Realm=proxy and user@realm. First version only forwards non-EAP PPP authentication and associated accounting; preserves username suffix. No DEFAULT fallback, denies incoming Proxy-State (single-hop topology only), unknown or disabled realms and unauthorized NAS. Local PPP credentials never checked on proxy branch. One home server per realm; failover pools are scaffolding, not redundant yet. Configure egress firewall to allow only known upstream RADIUS IPs and forbid self/NAT hairpin routes; API cannot detect all local addresses or network loops. Shared secrets stored plaintext in current development database and generated config; do not deploy in production. Enable requires restart, disabling/grant removal checked in SQL per request. No local accounting copy for proxied sessions, no RadSec or proxy EAP. Runtime/configuration not yet validated.
+# RADIUS proxy (experimental)
+
+Outbound proxy realms. **Default: off.**
+
+```bash
+docker compose -f compose.yaml -f compose.proxy.yaml up -d --force-recreate radius
+```
+
+Sets `RADIUS_ENABLE_PROXY=true`. Entrypoint renders home servers into `proxy.conf` via `render_secrets.py`, injects proxy policy fragments.
+
+## API
+
+```
+GET/POST  /api/v1/proxy/realms
+PUT       /api/v1/proxy/realms/{realm_id}/state
+GET/PUT/DELETE grants on NAS
+```
+
+Firewall egress to known upstream only; avoid hairpin. Restart radius after realm/secret changes. No RadSec in this alpha path. Experimental.

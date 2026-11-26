@@ -1,3 +1,13 @@
-# Experimental EAP-TLS
-Enable with compose.yaml, compose.eap.yaml and compose.eap-tls.yaml. Uses the same UDP 1812/1813 and external PKI mount. PEAP remains separate. Import public client cert and grant it on an EAP-enabled NAS. TLS chain verification uses the configured CA bundle; an external verifier calculates the SHA-256 fingerprint from the temporary client PEM and checks the registry and NAS grant. A second virtual-server gate checks serial uniqueness for that NAS and returns its VLAN. Use a dedicated controlled client CA with unique serial numbers. FreeRADIUS 3.2.1 source contains early exits in the external verification hook on temporary file failures; this implementation must not be treated as fail-closed fingerprint enforcement until negative tests and fault injection verify it. External verifier execution, inherited DB environment, source address in virtual server, reply propagation and revocation are unverified. No CRL/OCSP, no existing-session disconnect. Do not enable on production. Registry revoke and grant APIs intentionally retain runtime_enforced=false because effective runtime state is not verified.
-Upstream: https://github.com/FreeRADIUS/freeradius-server/blob/release_3_2_1/raddb/mods-available/eap and src/main/tls.c.
+# EAP-TLS (experimental)
+
+Requires EAP overlay as well:
+
+```bash
+docker compose -f compose.yaml -f compose.eap.yaml -f compose.eap-tls.yaml up -d --force-recreate radius
+```
+
+Sets `RADIUS_ENABLE_EAP_TLS=true`. Entrypoint refuses TLS without EAP.
+
+When enabled: waits for PKI tables, prepares `/run/zradius-client-certs`, builds EAP-TLS runtime mod, enables `zradius-check-eap-tls` site.
+
+Client certificates via public PKI inventory API (no private keys). More experimental than PEAP.

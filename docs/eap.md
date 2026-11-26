@@ -1,2 +1,34 @@
-# Experimental PEAP-MSCHAPv2
-One FreeRADIUS instance, UDP 1812/1813, internal listenerless inner tunnel. Enable compose.eap.yaml only on an isolated lab. Supply server.key, server.pem (certificate chain), ca.pem in a private directory readable by freerad; never commit private keys. Configure supplicants to verify the CA and server DNS identity. PEAP-MSCHAPv2 uses separate NT hashes (password-equivalent secrets), not PPP/device credentials. Grant each user to NAS; assign dot1x or wpa-enterprise. Optional VLAN returned through tunneled reply. Disable EAP users to block future full authentication. Session resumption disabled. EAP-TLS and TTLS intentionally not enabled until explicit certificate identity mapping and revocation enforcement are implemented. EAP accounting currently requires additional service classification; not validated. No production deployment before config check, eapol_test positive/negative tests and NAS tests.
+# EAP (experimental)
+
+PEAP-MSCHAPv2-oriented path in FreeRADIUS. **Default base stack: EAP off.**
+
+## Enable (lab only)
+
+```bash
+# server.key, server.pem (chain), ca.pem — private dir, never commit keys
+docker compose -f compose.yaml -f compose.eap.yaml up -d --force-recreate radius
+```
+
+`compose.eap.yaml` sets `RADIUS_ENABLE_EAP=true` and mounts `${RADIUS_PKI_DIR:-./pki}:/run/zradius-pki:ro`.
+
+Entrypoint requires readable `/run/zradius-pki/{server.key,server.pem,ca.pem}`, EAP tables, links EAP mod + inner-tunnel, injects Auth-Type EAP, then `freeradius -C`.
+
+## Management API
+
+```
+GET  /api/v1/eap/users
+PUT  /api/v1/eap/users/{username}
+PUT  /api/v1/eap/users/{username}/state
+PUT  /api/v1/eap/users/{username}/grants/{nas_id}
+DELETE /api/v1/eap/users/{username}/grants/{nas_id}
+```
+
+Also: `GET/PUT /api/v1/identities/{identity_id}/eap/{service}`.
+
+PEAP credentials are NT-hash oriented, not Argon2 management hashes.
+
+## Disable
+
+Remove overlay / set flag false, recreate radius. Entrypoint clears EAP links when disabled.
+
+Experimental — isolated lab only.
