@@ -1,0 +1,2 @@
+# ZRADIUS UI
+Adopts drycov/design-kit v0.3.0 at cd8b60c5d93ded440bfe20c69d29042330da202f, using the upstream recommended vendor approach. Shared CSS and tokens, responsive content layout, dashboard StatCard and error Alert are active. Ant Design remains for complex tables, forms, modal dialogs and QR codes, with its palette/radii mapped to kit tokens. OS light/dark preference determines theme. Existing API and AAA runtime unchanged. Further migration of complex controls is incremental; not a complete Ant Design removal. Build and visual validation pending.
