@@ -2375,6 +2375,51 @@ def set_identity_eap(conn,identity_id,service,assignment):
         VALUES (%s,%s,%s,%s) ON CONFLICT(identity_id,service_code) DO UPDATE SET nas_id=excluded.nas_id,vlan_id=excluded.vlan_id""",
         (identity_id,service,assignment.nas_id,assignment.vlan_id))
 
+class AccessTemplate(BaseModel):
+    name:str=Field(min_length=1,max_length=100)
+    account_type:Literal["person","service"]
+    description:str=Field(default="",max_length=500)
+    services:list[Literal["device-aaa","l2tp","pppoe","hotspot","dot1x","wpa-enterprise","console"]]=Field(default_factory=list,max_length=7)
+    enabled:bool=True
+    model_config={"extra":"forbid"}
+
+def validate_access_template(body):
+    if not body.name.strip() or len(set(body.services))!=len(body.services):
+        raise HTTPException(422,"Template name required; duplicate services prohibited")
+    if body.account_type=="service" and "console" in body.services:
+        raise HTTPException(422,"Service accounts cannot access Web Console")
+    if any(ord(ch)<32 or 127<=ord(ch)<=159 for ch in body.name+body.description):
+        raise HTTPException(422,"Control characters are not allowed")
+
+@app.get("/api/v1/identities/access-templates",dependencies=[Depends(auth)])
+def access_templates():
+    with db() as conn:
+        return conn.execute("SELECT id,name,account_type,description,services,enabled FROM zradius_access_templates ORDER BY account_type,name").fetchall()
+
+@app.post("/api/v1/identities/access-templates",status_code=201)
+def create_access_template(body:AccessTemplate,principal=Depends(auth)):
+    personal_admin(principal)
+    validate_access_template(body)
+    with db() as conn:
+        row=conn.execute("""INSERT INTO zradius_access_templates(name,account_type,description,services,enabled)
+            VALUES (%s,%s,%s,%s::text[],%s) RETURNING id,name,account_type,description,services,enabled""",
+            (body.name.strip(),body.account_type,body.description.strip(),body.services,body.enabled)).fetchone()
+        audit(conn,"identity.template.create",str(row["id"]))
+        return row
+
+@app.put("/api/v1/identities/access-templates/{template_id}")
+def update_access_template(template_id:int,body:AccessTemplate,principal=Depends(auth)):
+    personal_admin(principal)
+    validate_access_template(body)
+    with db() as conn:
+        row=conn.execute("""UPDATE zradius_access_templates SET name=%s,account_type=%s,description=%s,services=%s::text[],enabled=%s
+            WHERE id=%s RETURNING id,name,account_type,description,services,enabled""",
+            (body.name.strip(),body.account_type,body.description.strip(),body.services,body.enabled,template_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"Access template not found")
+        audit(conn,"identity.template.update",str(template_id))
+        return row
+
 class IdentityCreate(BaseModel):
     account_type:Literal["person","service"]="person"
     account_owner:str=Field(default="",max_length=200)
