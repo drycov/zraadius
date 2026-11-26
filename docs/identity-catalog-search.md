@@ -1,0 +1,3 @@
+# Identity catalog search
+
+GET `/api/v1/identities` accepts optional `q` (up to 200 characters after trimming) and `enabled` (boolean). Search is case-insensitive literal substring matching over username, full name and department before pagination. Parameters are bound, not interpolated; `%` and `_` are literal. Existing requests without filters remain compatible. The console requests 101 rows and displays 100 to detect a next page without an extra count query. Changing filters resets pagination. Offset pagination may shift during concurrent edits. No migration; large catalogs may eventually need trigram indexing. Runtime and frontend build verification pending.

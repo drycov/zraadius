@@ -2385,9 +2385,12 @@ class IdentityCreate(BaseModel):
     console_role:Literal["admin","operator","auditor"]|None=None
 
 @app.get("/api/v1/identities",dependencies=[Depends(auth)])
-def identities(limit:int=100,offset:int=0):
+def identities(limit:int=100,offset:int=0,q:str="",enabled:bool|None=None):
     if not 1<=limit<=500 or offset<0:
         raise HTTPException(422,"Invalid pagination")
+    q=q.strip()
+    if len(q)>200:
+        raise HTTPException(422,"Search query too long")
     with db() as conn:
         return conn.execute("""SELECT i.id,i.username,i.full_name,i.department,i.enabled,
             d.id AS device_id,d.enabled AS device_enabled,v.id AS l2tp_id,v.enabled AS l2tp_enabled,
@@ -2404,7 +2407,11 @@ def identities(limit:int=100,offset:int=0):
             LEFT JOIN zradius_identity_eap dx ON dx.identity_id=i.id AND dx.service_code='dot1x'
             LEFT JOIN zradius_identity_eap we ON we.identity_id=i.id AND we.service_code='wpa-enterprise'
             LEFT JOIN zradius_admin_users au ON au.identity_id=i.id
-            ORDER BY i.username LIMIT %s OFFSET %s""",(limit,offset)).fetchall()
+            WHERE (%s = '' OR strpos(lower(i.username),lower(%s))>0
+                OR strpos(lower(i.full_name),lower(%s))>0
+                OR strpos(lower(i.department),lower(%s))>0)
+            AND (%s::boolean IS NULL OR i.enabled=%s::boolean)
+            ORDER BY i.username,i.id LIMIT %s OFFSET %s""",(q,q,q,q,enabled,enabled,limit,offset)).fetchall()
 
 @app.post("/api/v1/identities",status_code=201,dependencies=[Depends(auth)])
 def create_identity(body:IdentityCreate,principal=Depends(auth)):
