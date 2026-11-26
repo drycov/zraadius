@@ -16,6 +16,7 @@ sql {
  usergroup_table = "radusergroup"
  read_groups = yes
  read_profiles = yes
+ client_table = "nas"
  read_clients = no
  group_attribute = "SQL-Group"
  pool {
