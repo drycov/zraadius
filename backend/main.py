@@ -1730,6 +1730,14 @@ def validate_l2tp_assignment(conn,body,address):
         raise HTTPException(404,"PPP profile not found")
     if address is None and not profile["pool"]:
         raise HTTPException(422,"Static IPv4 or named NAS pool required")
+    if address is not None:
+        if conn.execute("""SELECT 1 FROM zradius_vpn_pools WHERE (nas_id=%s OR address_space_id=%s)
+            AND %s::inet BETWEEN first_ip AND last_ip LIMIT 1""",(body.nas_id,body.address_space_id,address)).fetchone():
+            raise HTTPException(409,"Static IP overlaps a registered VPN pool")
+    else:
+        pool=conn.execute("SELECT address_space_id FROM zradius_vpn_pools WHERE nas_id=%s AND name=%s",(body.nas_id,profile["pool"])).fetchone()
+        if pool and pool["address_space_id"]!=body.address_space_id:
+            raise HTTPException(409,"Registered pool belongs to another address space")
 
 @app.get("/api/v1/ppp/profiles",dependencies=[Depends(auth)])
 def ppp_profiles():
@@ -1842,6 +1850,7 @@ def update_vpn_group(group_id:int,body:VpnGroupCreate):
             row=conn.execute("UPDATE zradius_vpn_groups SET name=%s,description=%s,profile_id=%s WHERE id=%s RETURNING id",(body.name,body.description,body.profile_id,group_id)).fetchone()
             if not row:
                 raise HTTPException(404,"VPN group not found")
+            validate_registered_vpn_pools(conn)
             audit(conn,"ppp.group.update",str(group_id))
             return row
     except UniqueViolation:
@@ -1870,6 +1879,7 @@ def update_ppp_profile(profile_id:int,body:PppProfileCreate):
             WHERE p.profile_id=%s AND u.static_ip IS NULL LIMIT 1""",(profile_id,)).fetchone():
             raise HTTPException(409,"Assigned users require a dynamic pool")
         conn.execute("UPDATE zradius_ppp_profiles SET pool=%s,interim_seconds=%s,description=%s WHERE id=%s",(body.pool,body.interim_seconds,body.description,profile_id))
+        validate_registered_vpn_pools(conn)
         audit(conn,"ppp.profile.update",str(profile_id))
         return {"id":profile_id}
 
@@ -1884,7 +1894,7 @@ def update_l2tp_assignment(user_id:int,body:L2tpAssignment):
             lock_ppp_policy(conn)
             validate_l2tp_assignment(conn,body,address)
             row=conn.execute("""UPDATE zradius_l2tp_users SET nas_id=%s,profile_id=%s,group_id=%s,address_space_id=%s,static_ip=%s::inet,description=%s
-                WHERE id=%s RETURNING id,username""",(body.nas_id,body.profile_id,body.group_id,address,body.description,user_id)).fetchone()
+                WHERE id=%s RETURNING id,username""",(body.nas_id,body.profile_id,body.group_id,body.address_space_id,address,body.description,user_id)).fetchone()
             if not row:
                 raise HTTPException(404,"L2TP user not found")
             audit(conn,"ppp.l2tp.assignment",row["username"])
@@ -1919,3 +1929,75 @@ def vpn_address_conflicts():
             FROM zradius_l2tp_users WHERE static_ip IS NOT NULL
             GROUP BY static_ip HAVING count(*)>1 AND bool_or(address_space_id IS NULL)
             ORDER BY static_ip LIMIT 500""").fetchall()
+
+
+class VpnPoolCreate(BaseModel):
+    name:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    nas_id:int=Field(gt=0)
+    address_space_id:int=Field(gt=0)
+    network:str=Field(max_length=18)
+    first_ip:str=Field(max_length=15)
+    last_ip:str=Field(max_length=15)
+
+@app.get("/api/v1/ppp/pools",dependencies=[Depends(auth)])
+def vpn_pools():
+    with db() as conn:
+        return conn.execute("""SELECT p.id,p.name,p.nas_id,n.shortname AS nas,s.name AS address_space,p.address_space_id,
+            p.network::text AS network,host(p.first_ip) AS first_ip,host(p.last_ip) AS last_ip,
+            p.last_ip-p.first_ip+1 AS capacity
+            FROM zradius_vpn_pools p JOIN nas n ON n.id=p.nas_id
+            JOIN zradius_vpn_address_spaces s ON s.id=p.address_space_id ORDER BY n.shortname,p.name""").fetchall()
+
+@app.post("/api/v1/ppp/pools",status_code=201,dependencies=[Depends(auth)])
+def create_vpn_pool(body:VpnPoolCreate):
+    from ipam import pool_bounds
+    try:
+        network,first,last,_=pool_bounds(body.network,body.first_ip,body.last_ip)
+        static_address(first)
+        static_address(last)
+    except ValueError:
+        raise HTTPException(422,"Invalid IPv4 pool range")
+    try:
+        with db() as conn:
+            lock_ppp_policy(conn)
+            if not conn.execute("SELECT 1 FROM nas n JOIN zradius_nas_services s ON s.nas_id=n.id WHERE n.id=%s AND n.type='mikrotik' AND s.service_code='l2tp'",(body.nas_id,)).fetchone():
+                raise HTTPException(409,"Assign L2TP service to MikroTik NAS first")
+            if not conn.execute("SELECT 1 FROM zradius_vpn_address_spaces WHERE id=%s",(body.address_space_id,)).fetchone():
+                raise HTTPException(404,"VPN address space not found")
+            if conn.execute("""SELECT 1 FROM zradius_vpn_pools WHERE (nas_id=%s OR address_space_id=%s)
+                AND first_ip<=%s::inet AND last_ip>=%s::inet LIMIT 1""",(body.nas_id,body.address_space_id,last,first)).fetchone():
+                raise HTTPException(409,"Overlapping VPN pool range")
+            if conn.execute("""SELECT 1 FROM zradius_l2tp_users WHERE (nas_id=%s OR address_space_id=%s)
+                AND static_ip BETWEEN %s::inet AND %s::inet LIMIT 1""",(body.nas_id,body.address_space_id,first,last)).fetchone():
+                raise HTTPException(409,"Pool overlaps a static VPN assignment")
+            if conn.execute("""SELECT 1 FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id
+                WHERE u.nas_id=%s AND p.pool=%s AND u.static_ip IS NULL AND u.address_space_id IS DISTINCT FROM %s LIMIT 1""",
+                (body.nas_id,body.name,body.address_space_id)).fetchone():
+                raise HTTPException(409,"Existing dynamic users must first be assigned to this address space")
+            row=conn.execute("""INSERT INTO zradius_vpn_pools(name,nas_id,address_space_id,network,first_ip,last_ip)
+                VALUES (%s,%s,%s,%s::cidr,%s::inet,%s::inet) RETURNING id""",
+                (body.name,body.nas_id,body.address_space_id,network,first,last)).fetchone()
+            audit(conn,"ppp.pool.create",str(row["id"]))
+            return row
+    except UniqueViolation:
+        raise HTTPException(409,"Pool name already registered on NAS")
+
+@app.delete("/api/v1/ppp/pools/{pool_id}",dependencies=[Depends(auth)])
+def delete_vpn_pool(pool_id:int):
+    with db() as conn:
+        lock_ppp_policy(conn)
+        pool=conn.execute("SELECT nas_id,name FROM zradius_vpn_pools WHERE id=%s",(pool_id,)).fetchone()
+        if not pool:
+            raise HTTPException(404,"VPN pool not found")
+        if conn.execute("""SELECT 1 FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id
+            WHERE u.nas_id=%s AND p.pool=%s AND u.static_ip IS NULL LIMIT 1""",(pool["nas_id"],pool["name"])).fetchone():
+            raise HTTPException(409,"Pool is assigned to VPN users")
+        conn.execute("DELETE FROM zradius_vpn_pools WHERE id=%s",(pool_id,))
+        audit(conn,"ppp.pool.delete",str(pool_id))
+    return {"status":"removed"}
+
+def validate_registered_vpn_pools(conn):
+    if conn.execute("""SELECT 1 FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id
+        JOIN zradius_vpn_pools r ON r.nas_id=u.nas_id AND r.name=p.pool
+        WHERE u.static_ip IS NULL AND u.address_space_id IS DISTINCT FROM r.address_space_id LIMIT 1""").fetchone():
+        raise HTTPException(409,"Registered pool belongs to another address space")
