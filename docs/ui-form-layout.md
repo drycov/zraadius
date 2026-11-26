@@ -1,0 +1,2 @@
+# Console form layout
+Shared UI overrides normalize single-line controls to 44px, remove duplicate label margin, align inline action buttons to control tops, and keep validation errors below fields without shifting neighboring buttons. Card bodies use a vertical 16px gap. Accounting secondary controls use a separated filter toolbar. Inline forms stack on narrow viewports. Select forwards validation aria attributes. Vendor design-kit remains unchanged. Review all forms in both themes and at desktop/mobile widths; browser verification pending.

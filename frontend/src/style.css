@@ -45,3 +45,45 @@
  .zr-sidebar .zr-grouped-nav .dk-nav-link{width:100%;white-space:normal}
 }
 @media(prefers-reduced-motion:reduce){.zr-nav-chevron{transition:none}}
+
+
+/* Shared console form rhythm. Keep the vendored design kit unchanged. */
+.dk-card__body{display:flex;flex-direction:column;gap:16px;min-width:0}
+.dk-card__body>*{min-width:0;max-width:100%}
+.zr-card-head{flex-wrap:wrap;min-width:0}
+.zr-form{min-width:0;gap:16px}
+.zr-field{gap:6px;min-width:0;max-width:100%}
+.zr-field>.dk-label{margin:0;line-height:1.4}
+.zr-field>.dk-input:not(textarea):not([multiple]){height:44px;min-height:44px;padding:0 12px;line-height:normal}
+.zr-field>.dk-input{min-width:0;max-width:100%}
+.zr-form-inline{align-items:flex-start;gap:14px 12px}
+.zr-form-inline>.zr-field{flex:0 1 240px;min-width:min(200px,100%);max-width:100%}
+.zr-form-inline>.zr-field--unlabelled{flex:0 1 auto;min-width:0}
+.zr-form-inline>.zr-field--unlabelled>.zr-checkbox{min-height:44px}
+.zr-form-inline>.dk-btn,.zr-form-inline>.zr-space{margin-top:calc(1.4 * var(--text-sm) + 6px);min-height:44px}
+.zr-form-inline>.dk-btn{flex-shrink:0}
+.zr-form-inline>.zr-field--unlabelled:has(>.zr-checkbox){margin-top:calc(1.4 * var(--text-sm) + 6px)}
+.zr-form-inline>.zr-space>.dk-btn{min-height:44px}
+.zr-form-inline>.zr-field>.dk-text-danger{overflow-wrap:anywhere}
+.zr-checkbox{min-width:0;line-height:1.4;cursor:pointer}
+.zr-checkbox input{flex-shrink:0;width:16px;height:16px;margin:0}
+.zr-checkbox input:focus-visible{outline:2px solid var(--tg-button);outline-offset:3px}
+.zr-space:not(.zr-stack){max-width:100%}
+.zr-space>*{min-width:0}
+.zr-filter-toolbar{border-top:1px solid var(--tg-border);padding-top:12px;justify-content:space-between}
+.zr-filter-toolbar .dk-btn{min-height:44px}
+.zr-form .dk-btn{max-width:100%;white-space:normal}
+.zr-field .dk-input[aria-invalid=true]{border-color:var(--tg-danger)}
+@media(max-width:900px){
+ .zr-form-inline{flex-direction:column;align-items:stretch;gap:12px}
+ .zr-form-inline>.zr-field,.zr-form-inline>.zr-field--unlabelled{flex:none;width:100%;min-width:0}
+ .zr-form-inline>.dk-btn,.zr-form-inline>.zr-space,.zr-form-inline>.zr-field--unlabelled:has(>.zr-checkbox){margin-top:0}
+ .zr-form-inline>.dk-btn{min-height:44px}
+ .zr-form-inline>.zr-field--unlabelled>.zr-checkbox{min-height:36px}
+ .zr-filter-toolbar{justify-content:flex-start}
+}
+@media(max-width:480px){
+ .zr-filter-toolbar{align-items:stretch;flex-direction:column}
+ .zr-filter-toolbar>.dk-btn{width:100%}
+ .zr-form .dk-input{font-size:16px}
+}
