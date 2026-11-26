@@ -1,0 +1,28 @@
+sql {
+ dialect = "postgresql"
+ driver = "rlm_sql_postgresql"
+ server = "postgres"
+ port = 5432
+ login = "radius"
+ password = "$ENV{RADIUS_DB_PASSWORD}"
+ radius_db = "radius"
+ acct_table1 = "radacct"
+ acct_table2 = "radacct"
+ postauth_table = "radpostauth"
+ authcheck_table = "radcheck"
+ authreply_table = "radreply"
+ groupcheck_table = "radgroupcheck"
+ groupreply_table = "radgroupreply"
+ usergroup_table = "radusergroup"
+ read_groups = yes
+ read_profiles = yes
+ read_clients = no
+ group_attribute = "SQL-Group"
+ pool {
+  start = 1
+  min = 1
+  max = 8
+  spare = 1
+ }
+ $INCLUDE ${modconfdir}/sql/main/postgresql/queries.conf
+}

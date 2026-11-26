@@ -12,6 +12,18 @@ services:
       interval: 5s
       timeout: 3s
       retries: 15
+  radius:
+    build: ./freeradius
+    environment:
+      RADIUS_DB_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      RADIUS_TEST_SECRET: ${RADIUS_TEST_SECRET:?required}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:1812:1812/udp"
+      - "127.0.0.1:1813:1813/udp"
+    restart: unless-stopped
   api:
     build: ./backend
     environment:

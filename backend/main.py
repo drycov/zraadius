@@ -106,3 +106,17 @@ def assign_group(username: str, group: str):
 def audits():
     with db() as conn:
         return conn.execute("SELECT * FROM zradius_audit ORDER BY id DESC LIMIT 100").fetchall()
+
+@app.get("/api/v1/accounting", dependencies=[Depends(auth)])
+def accounting(limit: int = 100, offset: int = 0, active: bool = False):
+    if not 1 <= limit <= 500 or offset < 0:
+        raise HTTPException(422, "Invalid pagination")
+    with db() as conn:
+        return conn.execute(
+            """SELECT radacctid, username, acctsessionid, nasipaddress::text,
+               framedipaddress::text, acctstarttime, acctstoptime,
+               acctsessiontime, acctinputoctets, acctoutputoctets
+               FROM radacct WHERE (NOT %s OR acctstoptime IS NULL)
+               ORDER BY radacctid DESC LIMIT %s OFFSET %s""",
+            (active,limit,offset)
+        ).fetchall()
