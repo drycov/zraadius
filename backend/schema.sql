@@ -134,3 +134,19 @@ CREATE TABLE IF NOT EXISTS zradius_ip_allocations (
  CHECK(masklen(address)=CASE family(address) WHEN 4 THEN 32 ELSE 128 END)
 );
 CREATE INDEX IF NOT EXISTS zradius_ip_allocations_pool_idx ON zradius_ip_allocations(pool_id,address);
+
+-- Dedicated runtime pool staging. No lease allocation by FreeRADIUS yet.
+CREATE TABLE IF NOT EXISTS zradius_radius_pool_exports (
+ pool_id bigint PRIMARY KEY REFERENCES zradius_ip_pools(id) ON DELETE RESTRICT,
+ created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS zradius_radius_pool_addresses (
+ pool_id bigint NOT NULL REFERENCES zradius_radius_pool_exports(pool_id) ON DELETE CASCADE,
+ address inet NOT NULL UNIQUE,
+ PRIMARY KEY(pool_id,address),
+ CHECK(family(address)=4 AND masklen(address)=32)
+);
+CREATE TABLE IF NOT EXISTS zradius_radius_pool_groups (
+ groupname varchar(64) PRIMARY KEY REFERENCES zradius_groups(name) ON DELETE CASCADE,
+ pool_id bigint NOT NULL REFERENCES zradius_radius_pool_exports(pool_id) ON DELETE RESTRICT
+);

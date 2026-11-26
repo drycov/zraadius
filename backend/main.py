@@ -486,7 +486,10 @@ def create_ipoe_binding(body:IpoeBinding):
     values=binding_values(body)
     try:
         with db() as conn:
+            conn.execute("LOCK TABLE zradius_ipoe_bindings IN ROW EXCLUSIVE MODE")
             require_ipoe_nas(conn,body.nas_id)
+            if values[2] is not None and conn.execute("SELECT 1 FROM zradius_radius_pool_addresses WHERE address=%s",(values[2],)).fetchone():
+                raise HTTPException(409,"IP belongs to staged RADIUS pool")
             row=conn.execute("INSERT INTO zradius_ipoe_bindings(nas_id,mac,static_ip,circuit_id,remote_id,enabled,description) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING "+IPOE_FIELDS,values).fetchone()
             audit(conn,"ipoe.create",str(row["id"]))
     except UniqueViolation:
@@ -498,7 +501,10 @@ def update_ipoe_binding(binding_id:int,body:IpoeBinding):
     values=binding_values(body)
     try:
         with db() as conn:
+            conn.execute("LOCK TABLE zradius_ipoe_bindings IN ROW EXCLUSIVE MODE")
             require_ipoe_nas(conn,body.nas_id)
+            if values[2] is not None and conn.execute("SELECT 1 FROM zradius_radius_pool_addresses WHERE address=%s",(values[2],)).fetchone():
+                raise HTTPException(409,"IP belongs to staged RADIUS pool")
             row=conn.execute("UPDATE zradius_ipoe_bindings SET nas_id=%s,mac=%s,static_ip=%s,circuit_id=%s,remote_id=%s,enabled=%s,description=%s WHERE id=%s RETURNING "+IPOE_FIELDS,(*values,binding_id)).fetchone()
             if not row:
                 raise HTTPException(404,"Binding not found")
@@ -605,6 +611,8 @@ def allocate_ip(pool_id:int,body:IpAllocation):
             pool=conn.execute("SELECT host(first_ip) AS first,host(last_ip) AS last FROM zradius_ip_pools WHERE id=%s FOR UPDATE",(pool_id,)).fetchone()
             if not pool:
                 raise HTTPException(404,"Pool not found")
+            if conn.execute("SELECT 1 FROM zradius_radius_pool_exports WHERE pool_id=%s",(pool_id,)).fetchone():
+                raise HTTPException(409,"Withdraw staged RADIUS pool before modifying inventory")
             if body.address is not None:
                 import ipaddress
                 ip=body.address
@@ -630,7 +638,87 @@ def allocate_ip(pool_id:int,body:IpAllocation):
 def release_ip(pool_id:int,allocation_id:int):
     with db() as conn:
         conn.execute("SELECT id FROM zradius_ip_pools WHERE id=%s FOR UPDATE",(pool_id,))
+        if conn.execute("SELECT 1 FROM zradius_radius_pool_exports WHERE pool_id=%s",(pool_id,)).fetchone():
+            raise HTTPException(409,"Withdraw staged RADIUS pool before modifying inventory")
         if not conn.execute("DELETE FROM zradius_ip_allocations WHERE id=%s AND pool_id=%s RETURNING id",(allocation_id,pool_id)).fetchone():
             raise HTTPException(404,"Allocation not found")
         audit(conn,"ipam.release",str(allocation_id))
     return {"status":"released","runtime_enforced":False}
+
+# Staged export for a future version-matched sqlippool runtime adapter.
+@app.post("/api/v1/ipam/pools/{pool_id}/radius-export",status_code=201,dependencies=[Depends(auth)])
+def stage_radius_pool(pool_id:int):
+    with db() as conn:
+        # Serialize with IPoE writes to avoid a conflicting static binding during export.
+        conn.execute("LOCK TABLE zradius_ipoe_bindings IN SHARE MODE")
+        pool=conn.execute("SELECT id,name,family(network) AS family,capacity,host(first_ip) AS first,host(last_ip) AS last FROM zradius_ip_pools WHERE id=%s FOR UPDATE",(pool_id,)).fetchone()
+        if not pool:
+            raise HTTPException(404,"Pool not found")
+        if pool["family"]!=4 or pool["capacity"]>65536:
+            raise HTTPException(422,"Staging supports IPv4 pools of at most 65536 addresses")
+        if conn.execute("SELECT 1 FROM zradius_radius_pool_exports WHERE pool_id=%s",(pool_id,)).fetchone():
+            raise HTTPException(409,"Pool already staged")
+        conn.execute("INSERT INTO zradius_radius_pool_exports(pool_id) VALUES (%s)",(pool_id,))
+        result=conn.execute("""INSERT INTO zradius_radius_pool_addresses(pool_id,address)
+            SELECT %s, ip FROM (SELECT %s::inet + n AS ip
+            FROM generate_series(0, %s::bigint-1) AS s(n)) AS candidates
+            WHERE NOT EXISTS(SELECT 1 FROM zradius_ip_allocations a WHERE a.address=ip)
+            AND NOT EXISTS(SELECT 1 FROM zradius_ipoe_bindings b WHERE b.static_ip=ip)""",
+            (pool_id,pool["first"],int(pool["capacity"])))
+        if result.rowcount==0:
+            raise HTTPException(409,"No available addresses")
+        audit(conn,"ipam.radius.stage",str(pool_id))
+        return {"pool_id":pool_id,"pool_name":pool["name"],"staged_addresses":result.rowcount,"runtime_applied":False}
+
+@app.get("/api/v1/ipam/radius-exports",dependencies=[Depends(auth)])
+def radius_exports():
+    with db() as conn:
+        return conn.execute("""SELECT e.pool_id,p.name,e.created_at,count(a.address) AS staged_addresses,
+            false AS runtime_applied FROM zradius_radius_pool_exports e
+            JOIN zradius_ip_pools p ON p.id=e.pool_id
+            LEFT JOIN zradius_radius_pool_addresses a ON a.pool_id=e.pool_id
+            GROUP BY e.pool_id,p.name,e.created_at ORDER BY p.name""").fetchall()
+
+@app.delete("/api/v1/ipam/pools/{pool_id}/radius-export",dependencies=[Depends(auth)])
+def withdraw_radius_pool(pool_id:int):
+    try:
+        with db() as conn:
+            conn.execute("SELECT id FROM zradius_ip_pools WHERE id=%s FOR UPDATE",(pool_id,))
+            if not conn.execute("DELETE FROM zradius_radius_pool_exports WHERE pool_id=%s RETURNING pool_id",(pool_id,)).fetchone():
+                raise HTTPException(404,"Export not found")
+            audit(conn,"ipam.radius.withdraw",str(pool_id))
+    except ForeignKeyViolation:
+        raise HTTPException(409,"Remove group bindings first")
+    return {"status":"withdrawn","runtime_applied":False}
+
+class RadiusPoolBinding(BaseModel):
+    pool_id:int=Field(gt=0)
+
+@app.put("/api/v1/groups/{group}/radius-pool",dependencies=[Depends(auth)])
+def bind_radius_pool(group:str,body:RadiusPoolBinding):
+    try:
+        with db() as conn:
+            if not conn.execute("SELECT name FROM zradius_groups WHERE name=%s FOR UPDATE",(group,)).fetchone():
+                raise HTTPException(404,"Group not found")
+            if not conn.execute("SELECT 1 FROM zradius_radius_pool_exports WHERE pool_id=%s",(body.pool_id,)).fetchone():
+                raise HTTPException(409,"Stage pool first")
+            conn.execute("INSERT INTO zradius_radius_pool_groups VALUES (%s,%s) ON CONFLICT(groupname) DO UPDATE SET pool_id=excluded.pool_id",(group,body.pool_id))
+            audit(conn,"group.radius_pool",group)
+    except ForeignKeyViolation:
+        raise HTTPException(409,"Pool no longer staged")
+    return {"group":group,"pool_id":body.pool_id,"runtime_applied":False}
+
+@app.get("/api/v1/groups/{group}/radius-pool",dependencies=[Depends(auth)])
+def get_radius_pool_binding(group:str):
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM zradius_groups WHERE name=%s",(group,)).fetchone():
+            raise HTTPException(404,"Group not found")
+        row=conn.execute("SELECT pool_id FROM zradius_radius_pool_groups WHERE groupname=%s",(group,)).fetchone()
+        return {"pool_id":row["pool_id"] if row else None,"runtime_applied":False}
+
+@app.delete("/api/v1/groups/{group}/radius-pool",dependencies=[Depends(auth)])
+def unbind_radius_pool(group:str):
+    with db() as conn:
+        conn.execute("DELETE FROM zradius_radius_pool_groups WHERE groupname=%s",(group,))
+        audit(conn,"group.radius_pool.remove",group)
+    return {"status":"removed"}
