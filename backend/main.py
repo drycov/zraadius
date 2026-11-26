@@ -2536,6 +2536,88 @@ class IdentityServices(BaseModel):
     device_assignment:IdentityDeviceAssignment|None=None
     l2tp_assignment:L2tpAssignment|None=None
 
+
+class IdentityBulkAssignment(BaseModel):
+    identity_ids:list[int]=Field(min_length=1,max_length=100)
+    device:IdentityDeviceAssignment|None=None
+    l2tp:L2tpAssignment|None=None
+    pppoe:IdentityPppoeAssignment|None=None
+    hotspot:IdentityHotspotAssignment|None=None
+    dot1x:IdentityEapAssignment|None=None
+    wpa_enterprise:IdentityEapAssignment|None=None
+    preview:bool=True
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/identities/bulk-assign",dependencies=[Depends(auth)])
+def bulk_identity_assign(body:IdentityBulkAssignment):
+    ids=sorted(set(body.identity_ids))
+    if len(ids)!=len(body.identity_ids) or ids[0]<=0:
+        raise HTTPException(422,"Invalid or duplicate identity IDs")
+    services=[name for name in ("device","l2tp","pppoe","hotspot","dot1x","wpa_enterprise") if getattr(body,name) is not None]
+    if not services:
+        raise HTTPException(422,"Select at least one service")
+    if body.l2tp and body.l2tp.static_ip:
+        raise HTTPException(422,"Bulk VPN requires dynamic addresses")
+    try:
+        with db() as conn:
+            lock_ppp_policy(conn)
+            rows=conn.execute("SELECT id,username,enabled FROM zradius_identities WHERE id=ANY(%s) ORDER BY id FOR UPDATE",(ids,)).fetchall()
+            if len(rows)!=len(ids):
+                raise HTTPException(404,"One or more identities not found")
+            # Add-only: existing assignments, including disabled ones, are never overwritten.
+            for row in rows:
+                identity_id=row["id"]
+                if not row["enabled"]:
+                    raise HTTPException(409,"Blocked identity: "+row["username"])
+                creds=conn.execute("SELECT nt_password FROM zradius_identity_credentials WHERE identity_id=%s",(identity_id,)).fetchone()
+                if not creds or (any(s in services for s in ("l2tp","dot1x","wpa_enterprise")) and not creds["nt_password"]):
+                    raise HTTPException(409,"Reset unified password: "+row["username"])
+                for service,table in (("device","zradius_device_users"),("l2tp","zradius_l2tp_users"),("pppoe","zradius_identity_pppoe"),("hotspot","zradius_identity_hotspot"),("dot1x","zradius_identity_eap"),("wpa_enterprise","zradius_identity_eap")):
+                    if service not in services:
+                        continue
+                    # Table identifiers are constants, never request input.
+                    query="SELECT 1 FROM "+table+" WHERE identity_id=%s"
+                    args=(identity_id,)
+                    if service in ("dot1x","wpa_enterprise"):
+                        query+=" AND service_code=%s"
+                        args+=(service.replace("_","-"),)
+                    if conn.execute(query,args).fetchone():
+                        raise HTTPException(409,"Existing "+service+" assignment: "+row["username"])
+            for row in rows:
+                identity_id=row["id"]
+                if body.device:
+                    a=body.device
+                    if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(a.nas_id,)).fetchone():
+                        raise HTTPException(404,"MikroTik NAS not found")
+                    if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='device-aaa'",(a.nas_id,)).fetchone():
+                        raise HTTPException(409,"Assign Device AAA service first")
+                    role,filter_id,profile_id=resolve_device_grant(conn,a)
+                    d=conn.execute("INSERT INTO zradius_device_users(username,identity_id) VALUES (%s,%s) RETURNING id",(row["username"],identity_id)).fetchone()
+                    conn.execute("INSERT INTO zradius_device_grants(user_id,nas_id,role,filter_id,profile_id) VALUES (%s,%s,%s,%s,%s)",(d["id"],a.nas_id,role,filter_id,profile_id))
+                if body.l2tp:
+                    a=body.l2tp
+                    validate_l2tp_assignment(conn,a,None)
+                    conn.execute("""INSERT INTO zradius_l2tp_users(username,identity_id,nas_id,profile_id,group_id,address_space_id,description)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s)""",(row["username"],identity_id,a.nas_id,a.profile_id,a.group_id,a.address_space_id,a.description))
+                if body.pppoe:
+                    set_identity_pppoe(conn,identity_id,body.pppoe)
+                if body.hotspot:
+                    if __import__('re').fullmatch(r'hs-[a-f0-9]{20}',row["username"]):
+                        raise HTTPException(422,"Reserved voucher username")
+                    set_identity_hotspot(conn,identity_id,body.hotspot)
+                if body.dot1x:
+                    set_identity_eap(conn,identity_id,"dot1x",body.dot1x)
+                if body.wpa_enterprise:
+                    set_identity_eap(conn,identity_id,"wpa-enterprise",body.wpa_enterprise)
+                if not body.preview:
+                    for service in services:
+                        audit(conn,"identity.bulk."+service,row["username"])
+            if body.preview:
+                conn.rollback()
+            return {"preview":body.preview,"identities":len(ids),"services":services,"assignments":len(ids)*len(services)}
+    except UniqueViolation:
+        raise HTTPException(409,"Conflicting login or assignment")
+
 @app.put("/api/v1/identities/{identity_id}/services",dependencies=[Depends(auth)])
 def identity_services(identity_id:int,body:IdentityServices):
     try:

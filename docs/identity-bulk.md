@@ -1,0 +1,3 @@
+# Bulk identity assignment
+
+POST /api/v1/identities/bulk-assign (administrator only) accepts 1–100 distinct identity IDs and one or more assignment objects using existing service schemas. Default preview=true executes the same validation and writes inside a rolled-back transaction (sequence gaps possible). Apply repeats all validation and commits atomically. Only missing assignments are accepted; existing disabled or enabled assignments are never overwritten. Blocked identities and missing credentials reject the entire batch. L2TP dynamic only; no static IP or Web Console grants. Per-user service audit on commit. Preview is not a reservation. UI applies the displayed frozen payload. No migration; build and runtime checks pending.
