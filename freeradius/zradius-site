@@ -11,6 +11,7 @@ server zradius {
   port = 1813
  }
  authorize {
+  # ZRADIUS_PROXY_AUTHORIZE
   # ZRADIUS_EAP_AUTHORIZE
   if (&EAP-Message) {
    reject
@@ -114,6 +115,7 @@ server zradius {
   }
  }
  preacct {
+  # ZRADIUS_PROXY_ACCOUNTING
   preprocess
   acct_unique
  }

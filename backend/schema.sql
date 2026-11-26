@@ -273,3 +273,18 @@ CREATE TABLE IF NOT EXISTS zradius_pki_grants (
  vlan_id integer CHECK(vlan_id BETWEEN 1 AND 4094),
  PRIMARY KEY(fingerprint,nas_id)
 );
+
+CREATE TABLE IF NOT EXISTS zradius_proxy_realms (
+ id bigserial PRIMARY KEY,
+ realm varchar(128) UNIQUE NOT NULL CHECK(realm ~ '^[a-z0-9][a-z0-9.-]*[a-z0-9]$'),
+ home_ip inet NOT NULL CHECK(family(home_ip)=4 AND masklen(home_ip)=32),
+ secret varchar(128) NOT NULL CHECK(secret ~ '^[a-zA-Z0-9]{32,128}$'),
+ enabled boolean NOT NULL DEFAULT false,
+ created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS zradius_proxy_grants (
+ realm_id bigint REFERENCES zradius_proxy_realms(id) ON DELETE CASCADE,
+ nas_id bigint REFERENCES nas(id) ON DELETE CASCADE,
+ PRIMARY KEY(realm_id,nas_id)
+);
+UPDATE zradius_services SET maturity='experimental' WHERE code='proxy' AND maturity='planned';

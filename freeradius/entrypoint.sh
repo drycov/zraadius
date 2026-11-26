@@ -58,6 +58,20 @@ if [ "${RADIUS_ENABLE_EAP:-false}" = true ]; then
 else
   rm -f /etc/freeradius/3.0/mods-enabled/eap /etc/freeradius/3.0/sites-enabled/zradius-inner-tunnel /etc/freeradius/3.0/sites-enabled/zradius-check-eap-tls
 fi
+# Replace packaged sample proxy realms even when disabled.
+printf 'proxy server {\n default_fallback = no\n}\n' > /etc/freeradius/3.0/proxy.conf
+if [ "${RADIUS_ENABLE_PROXY:-false}" = true ]; then
+  until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.zradius_proxy_realms') IS NOT NULL AND to_regclass('public.zradius_proxy_grants') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
+  umask 077
+  psql -h postgres -U radius -d radius -v ON_ERROR_STOP=1 -At <<'SQL' >> /etc/freeradius/3.0/proxy.conf
+SELECT format(E'home_server proxy_auth_%s {\n type = auth\n ipaddr = %s\n port = 1812\n secret = "%s"\n status_check = status-server\n}\nhome_server proxy_acct_%s {\n type = acct\n ipaddr = %s\n port = 1813\n secret = "%s"\n status_check = status-server\n}\nhome_server_pool proxy_auth_pool_%s {\n type = fail-over\n home_server = proxy_auth_%s\n}\nhome_server_pool proxy_acct_pool_%s {\n type = fail-over\n home_server = proxy_acct_%s\n}\nrealm "%s" {\n auth_pool = proxy_auth_pool_%s\n acct_pool = proxy_acct_pool_%s\n nostrip\n}',id,host(home_ip),secret,id,host(home_ip),secret,id,id,id,id,realm,id,id)
+FROM zradius_proxy_realms WHERE enabled
+ORDER BY id;
+SQL
+  cp -L /etc/freeradius/3.0/sites-enabled/zradius /tmp/zradius-proxy-site
+  sed '/# ZRADIUS_PROXY_AUTHORIZE/r /etc/freeradius/3.0/zradius-proxy-policy' /tmp/zradius-proxy-site | sed '/# ZRADIUS_PROXY_ACCOUNTING/r /etc/freeradius/3.0/zradius-proxy-accounting' > /etc/freeradius/3.0/sites-available/zradius-proxy-runtime
+  ln -sf ../sites-available/zradius-proxy-runtime /etc/freeradius/3.0/sites-enabled/zradius
+fi
 unset PGPASSWORD
 freeradius -C
 exec freeradius -f -l stdout

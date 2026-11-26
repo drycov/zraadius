@@ -1,0 +1,5 @@
+# Experimental outbound proxy; no new published ports.
+services:
+  radius:
+    environment:
+      RADIUS_ENABLE_PROXY: "true"

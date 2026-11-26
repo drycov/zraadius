@@ -1004,3 +1004,63 @@ def revoke_certificate_grant(fingerprint:str,nas_id:int):
         conn.execute("DELETE FROM zradius_pki_grants WHERE fingerprint=%s AND nas_id=%s",(fingerprint,nas_id))
         audit(conn,"pki.grant.remove",fingerprint+":"+str(nas_id))
     return {"status":"removed","runtime_enforced":False}
+
+# Proxy registry: explicit realms and individual source NAS grants.
+class ProxyRealm(BaseModel):
+    realm:str=Field(min_length=3,max_length=128,pattern=r"^[a-z0-9][a-z0-9.-]*[a-z0-9]$")
+    home_ip:IPvAnyAddress
+    secret:SecretStr=Field(min_length=32,max_length=128)
+
+@app.get("/api/v1/proxy/realms",dependencies=[Depends(auth)])
+def proxy_realms():
+    with db() as conn:
+        return conn.execute("SELECT id,realm,host(home_ip) AS home_ip,enabled,created_at FROM zradius_proxy_realms ORDER BY realm").fetchall()
+
+@app.post("/api/v1/proxy/realms",status_code=201,dependencies=[Depends(auth)])
+def create_proxy_realm(body:ProxyRealm):
+    import re
+    ip=body.home_ip
+    if ip.version!=4 or ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local or ip.is_reserved:
+        raise HTTPException(422,"Invalid upstream IPv4")
+    if not re.fullmatch(r"[a-zA-Z0-9]{32,128}",body.secret.get_secret_value()) or "." not in body.realm or ".." in body.realm:
+        raise HTTPException(422,"Invalid realm or shared secret")
+    with db() as conn:
+        row=conn.execute("""INSERT INTO zradius_proxy_realms(realm,home_ip,secret) VALUES (%s,%s,%s)
+            ON CONFLICT DO NOTHING RETURNING id,realm,host(home_ip) AS home_ip,enabled""",(body.realm,str(ip),body.secret.get_secret_value())).fetchone()
+        if not row:
+            raise HTTPException(409,"Realm exists")
+        audit(conn,"proxy.realm.create",body.realm)
+    return row
+
+@app.put("/api/v1/proxy/realms/{realm_id}/state",dependencies=[Depends(auth)])
+def proxy_realm_state(realm_id:int,body:UserState):
+    with db() as conn:
+        if not conn.execute("UPDATE zradius_proxy_realms SET enabled=%s WHERE id=%s RETURNING id",(body.enabled,realm_id)).fetchone():
+            raise HTTPException(404,"Realm not found")
+        audit(conn,"proxy.realm.state",str(realm_id))
+    return {"enabled":body.enabled,"restart_required_for_enable":True}
+
+@app.put("/api/v1/proxy/realms/{realm_id}/grants/{nas_id}",dependencies=[Depends(auth)])
+def proxy_grant(realm_id:int,nas_id:int):
+    with db() as conn:
+        if not conn.execute("SELECT id FROM zradius_proxy_realms WHERE id=%s FOR UPDATE",(realm_id,)).fetchone():
+            raise HTTPException(404,"Realm not found")
+        if not conn.execute("SELECT id FROM nas WHERE id=%s FOR UPDATE",(nas_id,)).fetchone():
+            raise HTTPException(404,"NAS not found")
+        if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='proxy'",(nas_id,)).fetchone():
+            raise HTTPException(409,"Assign Proxy service first")
+        conn.execute("INSERT INTO zradius_proxy_grants VALUES (%s,%s) ON CONFLICT DO NOTHING",(realm_id,nas_id))
+        audit(conn,"proxy.grant",f"{realm_id}:{nas_id}")
+    return {"status":"assigned"}
+
+@app.get("/api/v1/proxy/realms/{realm_id}/grants",dependencies=[Depends(auth)])
+def proxy_grants(realm_id:int):
+    with db() as conn:
+        return conn.execute("SELECT g.nas_id,n.shortname FROM zradius_proxy_grants g JOIN nas n ON n.id=g.nas_id WHERE g.realm_id=%s ORDER BY n.shortname",(realm_id,)).fetchall()
+
+@app.delete("/api/v1/proxy/realms/{realm_id}/grants/{nas_id}",dependencies=[Depends(auth)])
+def revoke_proxy_grant(realm_id:int,nas_id:int):
+    with db() as conn:
+        conn.execute("DELETE FROM zradius_proxy_grants WHERE realm_id=%s AND nas_id=%s",(realm_id,nas_id))
+        audit(conn,"proxy.grant.remove",f"{realm_id}:{nas_id}")
+    return {"status":"removed"}
