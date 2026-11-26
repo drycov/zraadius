@@ -69,7 +69,7 @@ async def auth(request:Request, credentials: HTTPAuthorizationCredentials | None
         def lookup():
             with db() as conn:
                 return conn.execute("""SELECT u.id,u.username,u.role FROM zradius_admin_sessions s JOIN zradius_admin_users u ON u.id=s.user_id
-                    WHERE s.token_hash=%s AND s.expires_at>now() AND u.enabled""",(token_digest(token),)).fetchone()
+                    WHERE s.token_hash=%s AND s.expires_at>now() AND u.enabled AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))""",(token_digest(token),)).fetchone()
         principal=await run_in_threadpool(lookup)
         if not principal:
             raise HTTPException(401,"Unauthorized")
@@ -1191,8 +1191,8 @@ def management_login(body:ManagementSignIn,request:Request,response:Response):
             if row["attempts"]>(100 if bucket==token_digest("global-login") else 10):
                 conn.commit()
                 raise HTTPException(429,"Too many login attempts")
-        user=conn.execute("SELECT id,username,password_hash,role,enabled,mfa_secret,mfa_last_step,mfa_recovery FROM zradius_admin_users WHERE username=%s FOR UPDATE",(body.username,)).fetchone()
-        if not user or not user["enabled"] or not verify_password(user["password_hash"],body.password.get_secret_value()):
+        user=conn.execute("SELECT u.id,u.username,CASE WHEN u.identity_id IS NULL THEN u.password_hash ELSE c.web_password_hash END AS password_hash,u.role,u.enabled,mfa_secret,mfa_last_step,mfa_recovery FROM zradius_admin_users u LEFT JOIN zradius_identity_credentials c ON c.identity_id=u.identity_id WHERE u.username=%s AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled)) FOR UPDATE OF u",(body.username,)).fetchone()
+        if not user or not user["enabled"] or not user["password_hash"] or not verify_password(user["password_hash"],body.password.get_secret_value()):
             conn.commit()
             raise HTTPException(401,"Invalid credentials")
         if user["mfa_secret"]:
@@ -1233,6 +1233,9 @@ def management_create(body:ManagementUser):
     except ValueError as exc:
         raise HTTPException(422,str(exc))
     with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        if conn.execute("SELECT 1 FROM zradius_identities WHERE username=%s",(body.username,)).fetchone():
+            raise HTTPException(409,"Use unified identity editor")
         row=conn.execute("INSERT INTO zradius_admin_users(username,password_hash,role) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id,username,role,enabled",(body.username,digest,body.role)).fetchone()
         if not row:
             raise HTTPException(409,"Management user exists")
@@ -1243,10 +1246,12 @@ def management_create(body:ManagementUser):
 def management_state(user_id:int,body:UserState):
     with db() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
-        row=conn.execute("SELECT username,role FROM zradius_admin_users WHERE id=%s FOR UPDATE",(user_id,)).fetchone()
+        row=conn.execute("SELECT username,role,identity_id FROM zradius_admin_users WHERE id=%s FOR UPDATE",(user_id,)).fetchone()
         if not row:
             raise HTTPException(404,"Management user not found")
-        if not body.enabled and row["role"]=="admin" and not conn.execute("SELECT 1 FROM zradius_admin_users WHERE role='admin' AND enabled AND id<>%s",(user_id,)).fetchone():
+        if row["identity_id"] is not None:
+            raise HTTPException(409,"Use unified identity editor")
+        if not body.enabled and row["role"]=="admin" and not conn.execute("SELECT 1 FROM zradius_admin_users u WHERE role='admin' AND enabled AND id<>%s AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))",(user_id,)).fetchone():
             raise HTTPException(409,"Cannot disable last active administrator")
         conn.execute("UPDATE zradius_admin_users SET enabled=%s WHERE id=%s",(body.enabled,user_id))
         if not body.enabled:
@@ -1268,11 +1273,20 @@ def own_password(body:OwnPassword,principal=Depends(auth)):
     if not principal.get("id"):
         raise HTTPException(403,"Personal session required")
     with db() as conn:
-        row=conn.execute("SELECT password_hash FROM zradius_admin_users WHERE id=%s AND enabled FOR UPDATE",(principal["id"],)).fetchone()
-        if not row or not verify_password(row["password_hash"],body.current_password.get_secret_value()):
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        row=conn.execute("SELECT u.identity_id,CASE WHEN u.identity_id IS NULL THEN u.password_hash ELSE c.web_password_hash END AS password_hash FROM zradius_admin_users u LEFT JOIN zradius_identity_credentials c ON c.identity_id=u.identity_id WHERE u.id=%s AND u.enabled AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled)) FOR UPDATE OF u",(principal["id"],)).fetchone()
+        if not row or not row["password_hash"] or not verify_password(row["password_hash"],body.current_password.get_secret_value()):
             raise HTTPException(401,"Invalid current password")
-        digest=hash_password(body.password.get_secret_value())
-        conn.execute("UPDATE zradius_admin_users SET password_hash=%s,mfa_pending=NULL,mfa_pending_until=NULL WHERE id=%s",(digest,principal["id"]))
+        if row["identity_id"] is not None:
+            try:
+                nt,ssha=ppp_credentials(body.password.get_secret_value())
+            except ValueError:
+                raise HTTPException(422,"Invalid unified password")
+            conn.execute("UPDATE zradius_identity_credentials SET password_hash=%s,nt_password=%s,web_password_hash=%s,updated_at=now() WHERE identity_id=%s",(ssha,nt,hash_password(body.password.get_secret_value()),row["identity_id"]))
+            conn.execute("UPDATE zradius_admin_users SET mfa_pending=NULL,mfa_pending_until=NULL WHERE id=%s",(principal["id"],))
+        else:
+            digest=hash_password(body.password.get_secret_value())
+            conn.execute("UPDATE zradius_admin_users SET password_hash=%s,mfa_pending=NULL,mfa_pending_until=NULL WHERE id=%s",(digest,principal["id"]))
         conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(principal["id"],))
         audit(conn,"iam.password.change",principal["username"])
     return {"status":"changed","reauthentication_required":True}
@@ -1281,6 +1295,9 @@ def own_password(body:OwnPassword,principal=Depends(auth)):
 def reset_management_password(user_id:int,body:ManagementPassword):
     digest=hash_password(body.password.get_secret_value())
     with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        if conn.execute("SELECT 1 FROM zradius_admin_users WHERE id=%s AND identity_id IS NOT NULL FOR UPDATE",(user_id,)).fetchone():
+            raise HTTPException(409,"Use unified identity password reset")
         row=conn.execute("UPDATE zradius_admin_users SET password_hash=%s,mfa_pending=NULL,mfa_pending_until=NULL WHERE id=%s RETURNING username",(digest,user_id)).fetchone()
         if not row:
             raise HTTPException(404,"Management user not found")
@@ -1292,10 +1309,12 @@ def reset_management_password(user_id:int,body:ManagementPassword):
 def management_role(user_id:int,body:ManagementRole):
     with db() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
-        row=conn.execute("SELECT username,role,enabled FROM zradius_admin_users WHERE id=%s FOR UPDATE",(user_id,)).fetchone()
+        row=conn.execute("SELECT username,role,enabled,identity_id FROM zradius_admin_users WHERE id=%s FOR UPDATE",(user_id,)).fetchone()
         if not row:
             raise HTTPException(404,"Management user not found")
-        if row["role"]=="admin" and row["enabled"] and body.role!="admin" and not conn.execute("SELECT 1 FROM zradius_admin_users WHERE role='admin' AND enabled AND id<>%s",(user_id,)).fetchone():
+        if row["identity_id"] is not None:
+            raise HTTPException(409,"Use unified identity editor")
+        if row["role"]=="admin" and row["enabled"] and body.role!="admin" and not conn.execute("SELECT 1 FROM zradius_admin_users u WHERE role='admin' AND enabled AND id<>%s AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))",(user_id,)).fetchone():
             raise HTTPException(409,"Cannot demote last active administrator")
         conn.execute("UPDATE zradius_admin_users SET role=%s WHERE id=%s",(body.role,user_id))
         conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(user_id,))
@@ -1357,8 +1376,10 @@ def mfa_user(conn,principal,password):
     conn.commit()
     if limit["attempts"]>10:
         raise HTTPException(429,"Too many MFA attempts")
-    row=conn.execute("SELECT * FROM zradius_admin_users WHERE id=%s AND enabled FOR UPDATE",(principal["id"],)).fetchone()
-    if not row or not verify_password(row["password_hash"],password):
+    row=conn.execute("SELECT u.*,c.web_password_hash FROM zradius_admin_users u LEFT JOIN zradius_identity_credentials c ON c.identity_id=u.identity_id WHERE u.id=%s AND u.enabled AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled)) FOR UPDATE OF u",(principal["id"],)).fetchone()
+    if row and row["identity_id"] is not None:
+        row["password_hash"]=row["web_password_hash"]
+    if not row or not row["password_hash"] or not verify_password(row["password_hash"],password):
         raise HTTPException(401,"Invalid credentials")
     return row
 
@@ -2349,6 +2370,7 @@ class IdentityCreate(BaseModel):
     hotspot:IdentityHotspotAssignment|None=None
     dot1x:IdentityEapAssignment|None=None
     wpa_enterprise:IdentityEapAssignment|None=None
+    console_role:Literal["admin","operator","auditor"]|None=None
 
 @app.get("/api/v1/identities",dependencies=[Depends(auth)])
 def identities(limit:int=100,offset:int=0):
@@ -2361,17 +2383,21 @@ def identities(limit:int=100,offset:int=0):
             pp.identity_id IS NOT NULL AS pppoe_assigned,pp.enabled AS pppoe_enabled,
             hs.identity_id IS NOT NULL AS hotspot_assigned,hs.enabled AS hotspot_enabled,
             dx.identity_id IS NOT NULL AS dot1x_assigned,dx.enabled AS dot1x_enabled,
-            we.identity_id IS NOT NULL AS wpa_assigned,we.enabled AS wpa_enabled
+            we.identity_id IS NOT NULL AS wpa_assigned,we.enabled AS wpa_enabled,
+            au.id AS console_id,au.role AS console_role,au.enabled AS console_enabled
             FROM zradius_identities i LEFT JOIN zradius_identity_credentials c ON c.identity_id=i.id LEFT JOIN zradius_device_users d ON d.identity_id=i.id
             LEFT JOIN zradius_l2tp_users v ON v.identity_id=i.id
             LEFT JOIN zradius_identity_pppoe pp ON pp.identity_id=i.id
             LEFT JOIN zradius_identity_hotspot hs ON hs.identity_id=i.id
             LEFT JOIN zradius_identity_eap dx ON dx.identity_id=i.id AND dx.service_code='dot1x'
             LEFT JOIN zradius_identity_eap we ON we.identity_id=i.id AND we.service_code='wpa-enterprise'
+            LEFT JOIN zradius_admin_users au ON au.identity_id=i.id
             ORDER BY i.username LIMIT %s OFFSET %s""",(limit,offset)).fetchall()
 
 @app.post("/api/v1/identities",status_code=201,dependencies=[Depends(auth)])
-def create_identity(body:IdentityCreate):
+def create_identity(body:IdentityCreate,principal=Depends(auth)):
+    if body.console_role:
+        personal_admin(principal)
     if __import__('re').fullmatch(r'hs-[a-f0-9]{20}',body.username):
         raise HTTPException(422,'Reserved voucher username')
     try:
@@ -2382,6 +2408,7 @@ def create_identity(body:IdentityCreate):
     try:
         with db() as conn:
             lock_ppp_policy(conn)
+            conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
             # Never merge or adopt a pre-existing service login by name.
             if conn.execute("""SELECT 1 FROM zradius_device_users WHERE username=%s
                 UNION ALL SELECT 1 FROM zradius_l2tp_users WHERE username=%s
@@ -2391,7 +2418,7 @@ def create_identity(body:IdentityCreate):
                 UNION ALL SELECT 1 FROM zradius_hotspot_vouchers WHERE username=%s LIMIT 1""",(body.username,)*6).fetchone():
                 raise HTTPException(409,"Existing service login requires explicit migration")
             row=conn.execute("INSERT INTO zradius_identities(username,full_name,department) VALUES (%s,%s,%s) RETURNING id,username,enabled",(body.username,body.full_name,body.department)).fetchone()
-            conn.execute("INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password) VALUES (%s,%s,%s)",(row["id"],digest,nt))
+            conn.execute("INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password,web_password_hash) VALUES (%s,%s,%s,%s)",(row["id"],digest,nt,hash_password(body.password.get_secret_value())))
             if body.device:
                 d=body.device
                 if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(d.nas_id,)).fetchone():
@@ -2413,14 +2440,24 @@ def create_identity(body:IdentityCreate):
             for service,assignment in (("dot1x",body.dot1x),("wpa-enterprise",body.wpa_enterprise)):
                 if assignment:
                     set_identity_eap(conn,row["id"],service,assignment)
+            if body.console_role:
+                conn.execute("INSERT INTO zradius_admin_users(username,password_hash,role,identity_id) VALUES (%s,%s,%s,%s)",(body.username,hash_password(secrets.token_urlsafe(48)),body.console_role,row["id"]))
             audit(conn,"identity.create",body.username)
             return row
     except UniqueViolation:
         raise HTTPException(409,"Identity, username or static IP already assigned")
 
 @app.put("/api/v1/identities/{identity_id}/state",dependencies=[Depends(auth)])
-def identity_state(identity_id:int,body:UserState):
+def identity_state(identity_id:int,body:UserState,principal=Depends(auth)):
     with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        account=conn.execute("SELECT id,role,enabled FROM zradius_admin_users WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if account:
+            personal_admin(principal)
+            if not body.enabled and account["enabled"] and account["role"]=="admin":
+                ensure_other_admin(conn,account["id"])
+            if not body.enabled:
+                conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(account["id"],))
         row=conn.execute("UPDATE zradius_identities SET enabled=%s,updated_at=now() WHERE id=%s RETURNING id,username,enabled",(body.enabled,identity_id)).fetchone()
         if not row:
             raise HTTPException(404,"Identity not found")
@@ -2428,17 +2465,24 @@ def identity_state(identity_id:int,body:UserState):
         return row
 
 @app.put("/api/v1/identities/{identity_id}/password",dependencies=[Depends(auth)])
-def identity_password(identity_id:int,body:PppPassword):
+def identity_password(identity_id:int,body:PppPassword,principal=Depends(auth)):
     try:
         nt,digest=ppp_credentials(body.password.get_secret_value())
     except ValueError:
         raise HTTPException(422,"Invalid password")
     with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        account=conn.execute("SELECT id FROM zradius_admin_users WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if account:
+            personal_admin(principal)
         row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
         if not row:
             raise HTTPException(404,"Identity not found")
-        conn.execute("""INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password) VALUES (%s,%s,%s)
-            ON CONFLICT(identity_id) DO UPDATE SET password_hash=excluded.password_hash,nt_password=excluded.nt_password,updated_at=now()""",(identity_id,digest,nt))
+        conn.execute("""INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password,web_password_hash) VALUES (%s,%s,%s,%s)
+            ON CONFLICT(identity_id) DO UPDATE SET password_hash=excluded.password_hash,nt_password=excluded.nt_password,web_password_hash=excluded.web_password_hash,updated_at=now()""",(identity_id,digest,nt,hash_password(body.password.get_secret_value())))
+        if account:
+            conn.execute("UPDATE zradius_admin_users SET mfa_pending=NULL,mfa_pending_until=NULL WHERE id=%s",(account["id"],))
+            conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(account["id"],))
         conn.execute("UPDATE zradius_identities SET updated_at=now() WHERE id=%s",(identity_id,))
         audit(conn,"identity.password",row["username"])
     return {"status":"updated"}
@@ -2788,4 +2832,37 @@ def update_identity_eap(identity_id:int,service:Literal["dot1x","wpa-enterprise"
         if body.enabled and not changed:
             raise HTTPException(422,"EAP assignment required")
         audit(conn,"identity.eap."+service,row["username"])
+    return {"status":"updated"}
+
+
+def ensure_other_admin(conn,user_id):
+    if not conn.execute("""SELECT 1 FROM zradius_admin_users u WHERE u.role='admin' AND u.enabled AND u.id<>%s AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))
+        AND (u.identity_id IS NULL OR EXISTS(SELECT 1 FROM zradius_identity_credentials c WHERE c.identity_id=u.identity_id AND c.web_password_hash IS NOT NULL))""",(user_id,)).fetchone():
+        raise HTTPException(409,"Cannot remove last active administrator")
+
+class IdentityConsoleUpdate(BaseModel):
+    enabled:bool
+    role:Literal["admin","operator","auditor"]="auditor"
+
+@app.put("/api/v1/identities/{identity_id}/console")
+def update_identity_console(identity_id:int,body:IdentityConsoleUpdate,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        account=conn.execute("SELECT id,role,enabled FROM zradius_admin_users WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
+        row=conn.execute("SELECT username,enabled FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Identity not found")
+        if body.enabled and not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s AND web_password_hash IS NOT NULL",(identity_id,)).fetchone():
+            raise HTTPException(409,"Reset unified password first")
+        if account:
+            if account["enabled"] and account["role"]=="admin" and (not body.enabled or body.role!="admin"):
+                ensure_other_admin(conn,account["id"])
+            conn.execute("UPDATE zradius_admin_users SET enabled=%s,role=%s WHERE id=%s",(body.enabled,body.role,account["id"]))
+            conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(account["id"],))
+        elif body.enabled:
+            if conn.execute("SELECT 1 FROM zradius_admin_users WHERE username=%s",(row["username"],)).fetchone():
+                raise HTTPException(409,"Existing legacy console account requires migration")
+            conn.execute("INSERT INTO zradius_admin_users(username,password_hash,role,identity_id) VALUES (%s,%s,%s,%s)",(row["username"],hash_password(secrets.token_urlsafe(48)),body.role,identity_id))
+        audit(conn,"identity.console",row["username"])
     return {"status":"updated"}
