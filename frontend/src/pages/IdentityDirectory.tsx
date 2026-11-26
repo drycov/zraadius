@@ -33,6 +33,10 @@ function LinkedIdentities({request,profileId}:{request:Request;profileId:number}
  const d=useData<LinkedIdentity[]>(request,path+'/linked-identities');
  const a=useAction(d.refresh);
  const [plan,setPlan]=useState<{guid:string;result:IdentitySync}>();
+ const [revoke,setRevoke]=useState<{guid:string;username:string}>();
+ const [disconnect,setDisconnect]=useState(false);
+ const [revoked,setRevoked]=useState<{username:string;disconnect_status?:string;disconnect_results?:{session_id:number;status:string}[];network_more?:boolean}>();
+
  return <Space direction="vertical" className="full">
  <Alert type="info" message="Связанные пользователи AD. Синхронизация обновляет только метаданные каталога, не локальный логин и не сетевой доступ. Список ограничен 1000 записями."/>
  <Fault error={d.error}/>
@@ -41,11 +45,16 @@ function LinkedIdentities({request,profileId}:{request:Request;profileId:number}
  {title:'Логин AD',dataIndex:'directory_username'},
  {title:'AD (сохранённое)',render:(_,r)=><Tag color={r.directory_enabled?'green':'red'}>{r.directory_enabled?'Активен':'Отключён / неизвестно'}</Tag>},
  {title:'Локальная запись',render:(_,r)=><Tag color={r.enabled?'green':'red'}>{r.enabled?'Активна':'Отключена'}</Tag>},
- {title:'Действия',render:(_,r)=><Button disabled={a.busy} onClick={()=>a.run(async()=>{setPlan(undefined);const result=await request<IdentitySync>(path+'/identity-sync','POST',{object_guid:r.object_guid,preview:true});setPlan({guid:r.object_guid,result})})}>Проверить состояние</Button>}
+ {title:'Действия',render:(_,r)=><Button disabled={a.busy} onClick={()=>a.run(async()=>{setPlan(undefined);setRevoke(undefined);setDisconnect(false);setRevoked(undefined);const result=await request<IdentitySync>(path+'/identity-sync','POST',{object_guid:r.object_guid,preview:true});setPlan({guid:r.object_guid,result})})}>Проверить состояние</Button>}
  ]}/>
  {plan&&<><Alert type={plan.result.status==='observed'?'info':'warning'} message={plan.result.status==='not_observed'?'Объект не найден в области поиска AD; это не подтверждение удаления.':plan.result.status==='incompatible_login'?'Несовместимый доменный логин; локальный логин не изменяется.':'Состояние AD: '+(plan.result.directory_enabled?'активен':'отключён / неизвестно')}/>
  {plan.result.directory_username!==undefined&&<span>Логин AD: {plan.result.previous_directory_username} → {plan.result.directory_username}</span>}
- <Space wrap>{plan.result.changed&&<Popconfirm title="Обновить только метаданные AD?" onConfirm={()=>a.run(async()=>{const result=await request<IdentitySync>(path+'/identity-sync','POST',{object_guid:plan.guid,preview:false});setPlan({guid:plan.guid,result})})}><Button type="primary" disabled={a.busy||!plan.result.preview}>Сохранить состояние</Button></Popconfirm>}<Button disabled={a.busy} onClick={()=>setPlan(undefined)}>Закрыть</Button></Space></>}
+ <Space wrap>{plan.result.changed&&<Popconfirm title="Обновить только метаданные AD?" onConfirm={()=>a.run(async()=>{const result=await request<IdentitySync>(path+'/identity-sync','POST',{object_guid:plan.guid,preview:false});setPlan({guid:plan.guid,result})})}><Button type="primary" disabled={a.busy||!plan.result.preview}>Сохранить состояние</Button></Popconfirm>}{plan.result.status==='observed'&&plan.result.directory_enabled===false&&<Button danger disabled={a.busy} onClick={()=>a.run(async()=>{setRevoke(undefined);setRevoked(undefined);setDisconnect(false);const r=await request<{username:string}>(path+'/revoke-disabled','POST',{object_guid:plan.guid,preview:true});setRevoke({guid:plan.guid,username:r.username})})}>Проверить отзыв доступа</Button>}<Button disabled={a.busy} onClick={()=>{setPlan(undefined);setRevoke(undefined);setDisconnect(false)}}>Закрыть</Button></Space></>}
+ {revoke&&<><Alert type="warning" message={'Блокировка локальной записи '+revoke.username+'. Автоматическое повторное включение не выполняется.'}/>
+ <Checkbox disabled={a.busy} checked={disconnect} onChange={e=>setDisconnect(e.target.checked)}>Попытаться отключить активные поддерживаемые сессии через CoA</Checkbox>
+ <Space wrap><Popconfirm title="Подтвердить блокировку локальной записи?" onConfirm={()=>a.run(async()=>{const r=await request<{username:string;disconnect_status?:string;disconnect_results?:{session_id:number;status:string}[];network_more?:boolean}>(path+'/revoke-disabled','POST',{object_guid:revoke.guid,preview:false,confirm:true,disconnect_sessions:disconnect});setRevoked(r);setRevoke(undefined);setPlan(undefined);setDisconnect(false)})}><Button danger disabled={a.busy}>Блокировать</Button></Popconfirm><Button disabled={a.busy} onClick={()=>{setRevoke(undefined);setDisconnect(false)}}>Отменить</Button></Space></>}
+ {revoked&&<><Alert type="info" message={'Локальная запись заблокирована: '+revoked.username+'; CoA: '+(revoked.disconnect_status??'не запрошен')+(revoked.network_more?'; есть дополнительные сессии':'')}/>
+ <Table<{session_id:number;status:string}> rowKey="session_id" dataSource={revoked.disconnect_results??[]} columns={[{title:'Сессия',dataIndex:'session_id'},{title:'Результат CoA',dataIndex:'status'}]}/></>}
  </Space>
 }
 export default function IdentityDirectory({request}:{request:Request}){
