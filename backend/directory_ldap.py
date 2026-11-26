@@ -1,9 +1,14 @@
 """Read-only AD discovery. No password synchronization or RADIUS bind."""
 import os
+import json
+import logging
 import re
 import ssl
 from uuid import UUID
 from ldap3 import Server, Connection, Tls, SUBTREE, NONE
+from ldap3.core.exceptions import LDAPSocketOpenError, LDAPSocketReceiveError, LDAPSocketSendError
+
+log = logging.getLogger(__name__)
 
 
 def _paged_entries(conn, base, filt, attributes, limit):
@@ -52,6 +57,32 @@ def discover(profile=None, test_only=False, object_guid=None, groups=False, memb
     allowed={x.strip().lower() for x in os.environ.get("ZRADIUS_LDAP_ALLOWED_HOSTS","").split(",") if x.strip()}
     if host.lower() not in allowed:
         raise ValueError("LDAP host is not allowlisted")
+    # Explicit primary-to-replica mapping; never infer replicas from the global allowlist.
+    try:
+        mapping=json.loads(os.environ.get("ZRADIUS_LDAP_FAILOVER_MAP","{}"))
+    except (ValueError,TypeError):
+        raise ValueError("Invalid LDAP failover mapping") from None
+    if not isinstance(mapping,dict):
+        raise ValueError("Invalid LDAP failover mapping")
+    replicas=mapping.get(host.lower(),[])
+    if not isinstance(replicas,list) or len(replicas)>2 or any(
+        not isinstance(h,str) or not re.fullmatch(r"[A-Za-z0-9.-]{1,253}",h)
+        or h.lower() not in allowed for h in replicas):
+        raise ValueError("Invalid or non-allowlisted LDAP replica")
+    hosts=list(dict.fromkeys(h.lower() for h in [host,*replicas]))
+    for index, candidate in enumerate(hosts):
+        try:
+            result=_discover_host(candidate,base,bind,password,test_only,object_guid,groups,member_dn,limit)
+            return {**result,"directory_host":candidate,"failover_used":index>0}
+        except (LDAPSocketOpenError,LDAPSocketReceiveError,LDAPSocketSendError):
+            # Start the entire query again; never reuse paging cookies across DCs.
+            if index+1==len(hosts):
+                raise
+            log.warning("LDAP transport failure on %s; trying configured replica",candidate)
+    raise ValueError("No LDAP controller available")
+
+
+def _discover_host(host,base,bind,password,test_only,object_guid,groups,member_dn,limit):
     tls=Tls(validate=ssl.CERT_REQUIRED,version=ssl.PROTOCOL_TLS_CLIENT,ca_certs_file=os.environ.get("ZRADIUS_LDAP_CA_FILE") or None)
     server=Server(host,port=636,use_ssl=True,tls=tls,get_info=NONE,connect_timeout=5)
     with Connection(server,user=bind,password=password,auto_bind=True,receive_timeout=10,raise_exceptions=True,auto_referrals=False,read_only=True) as conn:
