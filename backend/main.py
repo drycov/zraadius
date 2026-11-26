@@ -2388,13 +2388,101 @@ class IdentityCreate(BaseModel):
     wpa_enterprise:IdentityEapAssignment|None=None
     console_role:Literal["admin","operator","auditor"]|None=None
 
+class DirectoryProfile(BaseModel):
+    name:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    host:str=Field(min_length=1,max_length=253,pattern=r"^[A-Za-z0-9.-]+$")
+    base_dn:str=Field(min_length=1,max_length=1024)
+    bind_dn:str=Field(min_length=1,max_length=1024)
+    password:SecretStr=Field(min_length=1,max_length=1024)
+    enabled:bool=False
+    model_config={"extra":"forbid"}
+
+def directory_host_allowed(host):
+    if host.lower() not in {v.strip().lower() for v in os.getenv("ZRADIUS_LDAP_ALLOWED_HOSTS","").split(",") if v.strip()}:
+        raise HTTPException(422,"LDAP host is not allowlisted")
+
+@app.get("/api/v1/identities/directory-profiles")
+def directory_profiles(principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        return conn.execute("SELECT id,name,host,base_dn,bind_dn,enabled,updated_at FROM zradius_directory_profiles ORDER BY name").fetchall()
+
+@app.post("/api/v1/identities/directory-profiles",status_code=201)
+def create_directory_profile(body:DirectoryProfile,principal=Depends(auth)):
+    personal_admin(principal)
+    directory_host_allowed(body.host)
+    from directory_crypto import seal_bind
+    try:
+        with db() as conn:
+            row=conn.execute("INSERT INTO zradius_directory_profiles(name,host,base_dn,bind_dn,bind_secret,enabled) VALUES (%s,%s,%s,%s,'pending',%s) RETURNING id",(body.name,body.host,body.base_dn,body.bind_dn,body.enabled)).fetchone()
+            cipher=seal_bind(body.password.get_secret_value(),row["id"],body.host,body.bind_dn)
+            conn.execute("UPDATE zradius_directory_profiles SET bind_secret=%s WHERE id=%s",(cipher,row["id"]))
+            audit(conn,"directory.profile.create",str(row["id"]))
+            return row
+    except ValueError:
+        raise HTTPException(422,"Invalid directory credentials")
+
+@app.put("/api/v1/identities/directory-profiles/{profile_id}")
+def update_directory_profile(profile_id:int,body:DirectoryProfile,principal=Depends(auth)):
+    personal_admin(principal)
+    directory_host_allowed(body.host)
+    from directory_crypto import seal_bind
+    try:
+        cipher=seal_bind(body.password.get_secret_value(),profile_id,body.host,body.bind_dn)
+    except ValueError:
+        raise HTTPException(422,"Invalid directory credentials")
+    with db() as conn:
+        row=conn.execute("UPDATE zradius_directory_profiles SET name=%s,host=%s,base_dn=%s,bind_dn=%s,bind_secret=%s,enabled=%s,updated_at=now() WHERE id=%s RETURNING id",(body.name,body.host,body.base_dn,body.bind_dn,cipher,body.enabled,profile_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"Directory profile not found")
+        audit(conn,"directory.profile.update",str(profile_id))
+        return row
+
+@app.delete("/api/v1/identities/directory-profiles/{profile_id}")
+def delete_directory_profile(profile_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        if not conn.execute("DELETE FROM zradius_directory_profiles WHERE id=%s AND NOT enabled RETURNING id",(profile_id,)).fetchone():
+            raise HTTPException(409,"Disable profile before deletion or profile not found")
+        audit(conn,"directory.profile.delete",str(profile_id))
+    return {"status":"deleted"}
+
+def directory_profile_config(profile_id,require_enabled=True):
+    from directory_crypto import open_bind
+    with db() as conn:
+        row=conn.execute("SELECT host,base_dn,bind_dn,bind_secret,enabled FROM zradius_directory_profiles WHERE id=%s",(profile_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Directory profile not found")
+    if require_enabled and not row["enabled"]:
+        raise HTTPException(409,"Directory profile disabled")
+    directory_host_allowed(row["host"])
+    try:
+        password=open_bind(row.pop("bind_secret"),profile_id,row["host"],row["bind_dn"])
+    except (ValueError,InvalidTag):
+        raise HTTPException(503,"Directory credential unavailable")
+    return {**row,"password":password}
+
+@app.post("/api/v1/identities/directory-profiles/{profile_id}/test")
+def test_directory_profile(profile_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    from directory_ldap import discover
+    from ldap3.core.exceptions import LDAPException
+    config=directory_profile_config(profile_id,require_enabled=False)
+    try:
+        result=discover(config,test_only=True)
+    except (ValueError,LDAPException,OSError):
+        raise HTTPException(502,"LDAPS bind or base search failed; check TLS, DNS and credentials")
+    with db() as conn:
+        audit(conn,"directory.profile.test",str(profile_id))
+    return result
+
 @app.get("/api/v1/identities/directory-preview")
-def directory_preview(principal=Depends(auth)):
+def directory_preview(profile_id:int|None=None,principal=Depends(auth)):
     personal_admin(principal)
     from directory_ldap import discover
     from ldap3.core.exceptions import LDAPException
     try:
-        result=discover()
+        result=discover(directory_profile_config(profile_id) if profile_id is not None else None)
     except ValueError:
         raise HTTPException(503,"LDAP discovery not configured or invalid configuration")
     except (LDAPException,OSError):
