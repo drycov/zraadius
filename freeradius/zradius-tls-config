@@ -1,0 +1,20 @@
+ tls-config tls-client {
+  private_key_file = /run/zradius-pki/server.key
+  certificate_file = /run/zradius-pki/server.pem
+  ca_file = /run/zradius-pki/ca.pem
+  tls_min_version = "1.2"
+  tls_max_version = "1.2"
+  fragment_size = 1024
+  include_length = yes
+  verify {
+   tmpdir = /run/zradius-client-certs
+   client = "/usr/local/bin/zradius-verify-cert %{TLS-Client-Cert-Filename} %{Packet-Src-IP-Address}"
+  }
+  cache {
+   enable = no
+  }
+ }
+ tls {
+  tls = tls-client
+  virtual_server = zradius-check-eap-tls
+ }

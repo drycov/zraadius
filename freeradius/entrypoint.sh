@@ -41,13 +41,22 @@ if [ "${RADIUS_ENABLE_EAP:-false}" = true ]; then
     [ -r "/run/zradius-pki/$f" ] || { echo "Missing EAP PKI file: $f" >&2; exit 1; }
   done
   until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.zradius_eap_users') IS NOT NULL AND to_regclass('public.zradius_eap_grants') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
-  ln -sf ../mods-available/zradius-eap /etc/freeradius/3.0/mods-enabled/eap
+  if [ "${RADIUS_ENABLE_EAP_TLS:-false}" = true ]; then
+    until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.zradius_pki_certificates') IS NOT NULL AND to_regclass('public.zradius_pki_grants') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
+    install -d -m 0700 -o freerad -g freerad /run/zradius-client-certs
+    sed '/# ZRADIUS_TLS_CONFIG/r /etc/freeradius/3.0/zradius-tls-config' /etc/freeradius/3.0/mods-available/zradius-eap > /etc/freeradius/3.0/mods-available/zradius-eap-tls-runtime
+    ln -sf ../mods-available/zradius-eap-tls-runtime /etc/freeradius/3.0/mods-enabled/eap
+    ln -sf ../sites-available/zradius-check-eap-tls /etc/freeradius/3.0/sites-enabled/zradius-check-eap-tls
+  else
+    rm -f /etc/freeradius/3.0/sites-enabled/zradius-check-eap-tls
+    ln -sf ../mods-available/zradius-eap /etc/freeradius/3.0/mods-enabled/eap
+  fi
   ln -sf ../sites-available/zradius-inner-tunnel /etc/freeradius/3.0/sites-enabled/zradius-inner-tunnel
   cp -L /etc/freeradius/3.0/sites-enabled/zradius /tmp/zradius-eap-site
   sed '/# ZRADIUS_EAP_AUTHORIZE/r /etc/freeradius/3.0/zradius-eap-authorize' /tmp/zradius-eap-site | sed '/# ZRADIUS_EAP_AUTHENTICATE/a\  Auth-Type EAP {\n   eap\n  }' > /etc/freeradius/3.0/sites-available/zradius-eap-runtime
   ln -sf ../sites-available/zradius-eap-runtime /etc/freeradius/3.0/sites-enabled/zradius
 else
-  rm -f /etc/freeradius/3.0/mods-enabled/eap /etc/freeradius/3.0/sites-enabled/zradius-inner-tunnel
+  rm -f /etc/freeradius/3.0/mods-enabled/eap /etc/freeradius/3.0/sites-enabled/zradius-inner-tunnel /etc/freeradius/3.0/sites-enabled/zradius-check-eap-tls
 fi
 unset PGPASSWORD
 freeradius -C

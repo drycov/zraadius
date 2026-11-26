@@ -1,0 +1,5 @@
+# Experimental opt-in, requires compose.eap.yaml as well.
+services:
+  radius:
+    environment:
+      RADIUS_ENABLE_EAP_TLS: "true"

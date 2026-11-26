@@ -14,6 +14,7 @@ eap {
    enable = no
   }
  }
+ # ZRADIUS_TLS_CONFIG
  peap {
   tls = tls-common
   default_eap_type = mschapv2
