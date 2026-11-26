@@ -3098,6 +3098,48 @@ def update_identity_console(identity_id:int,body:IdentityConsoleUpdate,principal
     return {"status":"updated"}
 
 
+@app.get("/api/v1/identities/{identity_id}/audit")
+def identity_audit(identity_id:int,source:Literal["all","management","radius","device"]="all",limit:int=100,offset:int=0,principal=Depends(auth)):
+    personal_admin(principal)
+    if not 1<=limit<=500 or not 0<=offset<=100000:
+        raise HTTPException(422,"Invalid pagination")
+    with db() as conn:
+        identity=conn.execute("SELECT username,created_at FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone()
+        if not identity:
+            raise HTTPException(404,"Identity not found")
+        # Historical username-only events are observations, not proof of ownership.
+        # Never select radpostauth.pass, class, or credential columns.
+        rows=conn.execute("""WITH events AS (
+            SELECT 'management'::text AS source,a.id,a.created_at AS event_at,a.action AS event,
+                a.actor::text AS actor,NULL::text AS nas
+            FROM zradius_audit a
+            WHERE a.created_at >= %s AND (
+                (a.subject=%s AND a.action IN (
+                'identity.create','identity.metadata','identity.state','identity.password',
+                'identity.services','identity.device.policy','identity.vpn.policy',
+                'identity.groups','identity.vpn.template.apply','identity.pppoe','identity.hotspot',
+                'identity.eap.dot1x','identity.eap.wpa-enterprise','identity.console',
+                'identity.bulk.enable','identity.bulk.disable','identity.bulk.device',
+                'identity.bulk.l2tp','identity.bulk.pppoe','identity.bulk.hotspot',
+                'identity.bulk.dot1x','identity.bulk.wpa_enterprise',
+                'identity.legacy.migrate.device','identity.legacy.migrate.l2tp',
+                'device.user.state','ppp.l2tp.state','ppp.l2tp.assignment',
+                'iam.password.change','iam.password.reset','iam.user.state',
+                'iam.mfa.setup','iam.mfa.enabled','iam.mfa.disabled','iam.logout'))
+                OR (a.subject=%s AND a.action IN ('identity.bulk.web.revoke','identity.web.sessions.revoke'))
+            )
+            UNION ALL
+            SELECT 'radius',r.id,r.authdate,COALESCE(r.reply,'unknown'),NULL,NULL
+            FROM radpostauth r WHERE r.username=%s AND r.authdate >= %s
+            UNION ALL
+            SELECT 'device',d.id,d.created_at,d.result,NULL,host(d.source_ip)
+            FROM zradius_device_auth_log d WHERE d.username=%s AND d.created_at >= %s
+        ) SELECT source,id::text AS id,event_at,event,actor,nas FROM events
+        WHERE (%s='all' OR source=%s)
+        ORDER BY event_at DESC,source,id::bigint DESC LIMIT %s OFFSET %s""",
+        (identity["created_at"],identity["username"],str(identity_id),identity["username"],identity["created_at"],identity["username"],identity["created_at"],source,source,limit+1,offset)).fetchall()
+        return {"items":rows[:limit],"more":len(rows)>limit,"attribution":"username_observation"}
+
 @app.get("/api/v1/identities/{identity_id}/sessions")
 def identity_sessions(identity_id:int,limit:int=100,principal=Depends(auth)):
     if not 1<=limit<=200:

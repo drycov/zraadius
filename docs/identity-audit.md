@@ -1,0 +1,3 @@
+# Identity audit
+
+Personal administrators can GET /api/v1/identities/{id}/audit?source=all|management|radius|device&limit=100&offset=0. The endpoint merges allowlisted management events and observed RADIUS/Device AAA results since identity creation, never selecting passwords, hashes or RADIUS Class. Username-only events are observations and not proof of identity or service attribution. Historical events before migration, group-wide policy changes, individual web session revocations and network disconnect history are not joined; use existing session views for the latter. CSV exports only the visible page, with spreadsheet formula prefix mitigation. Offset pagination may shift during concurrent writes. No schema migration. Build/runtime verification pending.

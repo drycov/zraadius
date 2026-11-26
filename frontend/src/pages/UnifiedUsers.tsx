@@ -1,5 +1,6 @@
 import {useState} from 'react';
 import Tabs from '../ui/Tabs';
+import IdentityAudit from './IdentityAudit';
 import IdentityLegacy from './IdentityLegacy';
 import IdentityBulkState from './IdentityBulkState';
 import IdentityBulk from './IdentityBulk';
@@ -44,7 +45,8 @@ export default function UnifiedUsers({request}:{request:Request}){
  {id:'wpa',label:'WPA Enterprise',content:<IdentityEap request={request} id={editing.id} service="wpa-enterprise" refresh={d.refresh}/>},
  {id:'console',label:'Web Console',content:<ConsolePolicy request={request} identity={editing} refresh={()=>{setEditing(undefined);d.refresh()}}/>},
  {id:'groups',label:'Группы',content:<IdentityMembership request={request} id={editing.id}/>},
- {id:'sessions',label:'Сессии',content:<IdentitySessions request={request} id={editing.id}/>}
+ {id:'sessions',label:'Сессии',content:<IdentitySessions request={request} id={editing.id}/>},
+ {id:'audit',label:'Аудит',content:<IdentityAudit key={editing.id} request={request} id={editing.id}/>}
  ]}/>}</Modal></Space>
 }
 function ConsolePolicy({request,identity,refresh}:{request:Request;identity:Identity;refresh:()=>void}){
