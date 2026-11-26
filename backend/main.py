@@ -2491,6 +2491,8 @@ def directory_import(profile_id:int,body:DirectoryImport,principal=Depends(auth)
         result=discover(config,object_guid=body.object_guid)
     except (ValueError,LDAPException,OSError):
         raise HTTPException(502,"Directory lookup failed")
+    if result["limited"]:
+        raise HTTPException(409,"Incomplete directory lookup; no changes applied")
     if len(result["items"])!=1 or result["items"][0]["object_guid"]!=str(body.object_guid):
         raise HTTPException(404,"Unique directory object not found")
     entry=result["items"][0]
@@ -2546,6 +2548,7 @@ def directory_group_inventory(profile_id:int,principal=Depends(auth)):
 class DirectoryGroupSync(BaseModel):
     object_guid:UUID
     preview:bool=True
+    confirm_removals:bool=False
     model_config={"extra":"forbid"}
 
 @app.post("/api/v1/identities/directory-profiles/{profile_id}/group-sync")
@@ -2556,14 +2559,16 @@ def directory_group_sync(profile_id:int,body:DirectoryGroupSync,principal=Depend
     if result["limited"] or len(result["items"])!=1 or result["items"][0]["object_guid"]!=str(body.object_guid):
         raise HTTPException(404,"Unique security group not found")
     group=result["items"][0]
-    members=read_directory_inventory(config,member_dn=group["distinguished_name"])
+    members=read_directory_inventory(config,member_dn=group["distinguished_name"],limit=10000)
     if members["limited"] or any(not m["object_guid"] for m in members["items"]):
         raise HTTPException(409,"Incomplete membership snapshot; no changes applied")
     # Recheck GUID and DN before storing a bounded direct-membership observation.
     again=read_directory_inventory(config,groups=True,object_guid=body.object_guid)
     if again["limited"] or again["items"]!=[group]:
         raise HTTPException(409,"Directory group changed; retry")
-    guids=list({UUID(m["object_guid"]) for m in members["items"]})
+    guids=sorted({UUID(m["object_guid"]) for m in members["items"]})
+    if len(guids)!=len(members["items"]):
+        raise HTTPException(409,"Duplicate directory GUIDs; retry synchronization")
     with db() as conn:
         profile=conn.execute("SELECT host,base_dn,bind_dn,bind_secret,enabled FROM zradius_directory_profiles WHERE id=%s FOR UPDATE",(profile_id,)).fetchone()
         if not profile or not profile["enabled"]:
@@ -2576,16 +2581,27 @@ def directory_group_sync(profile_id:int,body:DirectoryGroupSync,principal=Depend
         if any(profile[k]!=config[k] for k in ("host","base_dn","bind_dn")) or password!=config["password"]:
             raise HTTPException(409,"Directory profile changed; retry")
         linked=conn.execute("SELECT identity_id FROM zradius_directory_identities WHERE profile_id=%s AND object_guid=ANY(%s::uuid[])",(profile_id,guids)).fetchall()
-        response={"preview":body.preview,"name":group["name"],"observed_members":len(guids),"imported_members":len(linked)}
+        previous=conn.execute("""SELECT m.identity_id FROM zradius_directory_group_members m
+            JOIN zradius_directory_groups g ON g.id=m.group_id
+            WHERE g.profile_id=%s AND g.object_guid=%s""",(profile_id,body.object_guid)).fetchall()
+        old_ids={m["identity_id"] for m in previous}
+        new_ids={m["identity_id"] for m in linked}
+        added=sorted(new_ids-old_ids)
+        removed=sorted(old_ids-new_ids)
+        response={"preview":body.preview,"name":group["name"],"observed_members":len(guids),"imported_members":len(linked),
+                  "added_count":len(added),"removed_count":len(removed),"requires_removal_confirmation":bool(removed)}
         if body.preview:
             return response
+        if removed and not body.confirm_removals:
+            raise HTTPException(409,"Membership removal requires explicit confirmation")
         row=conn.execute("""INSERT INTO zradius_directory_groups(profile_id,object_guid,name,distinguished_name)
             VALUES (%s,%s,%s,%s) ON CONFLICT(profile_id,object_guid) DO UPDATE SET
             name=excluded.name,distinguished_name=excluded.distinguished_name,observed_at=now() RETURNING id""",
             (profile_id,body.object_guid,group["name"],group["distinguished_name"])).fetchone()
-        conn.execute("DELETE FROM zradius_directory_group_members WHERE group_id=%s",(row["id"],))
-        for member in linked:
-            conn.execute("INSERT INTO zradius_directory_group_members(group_id,identity_id) VALUES (%s,%s)",(row["id"],member["identity_id"]))
+        if removed:
+            conn.execute("DELETE FROM zradius_directory_group_members WHERE group_id=%s AND identity_id=ANY(%s::bigint[])",(row["id"],removed))
+        for identity_id in added:
+            conn.execute("INSERT INTO zradius_directory_group_members(group_id,identity_id) VALUES (%s,%s)",(row["id"],identity_id))
         audit(conn,"directory.group.sync",str(row["id"]))
         return {**response,"group_id":row["id"]}
 
