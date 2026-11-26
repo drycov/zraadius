@@ -49,3 +49,13 @@ CREATE TABLE IF NOT EXISTS nas (
  ports integer, secret varchar(253) NOT NULL, server varchar(64),
  community varchar(64), description varchar(200)
 );
+
+CREATE TABLE IF NOT EXISTS zradius_coa_requests (
+ id bigserial PRIMARY KEY,
+ radacctid bigint NOT NULL,
+ action text NOT NULL CHECK (action IN ('disconnect','coa')),
+ status text NOT NULL CHECK (status IN ('pending','ack','nak','unknown')),
+ created_at timestamptz NOT NULL DEFAULT now(),
+ completed_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS zradius_coa_pending_idx ON zradius_coa_requests(radacctid) WHERE status='pending';

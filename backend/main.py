@@ -9,6 +9,8 @@ from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, SecretStr, IPvAnyAddress
 from typing import Literal
+from psycopg.errors import UniqueViolation
+from coa import send, destination_allowed
 
 ROOT = Path(__file__).parent
 bearer = HTTPBearer(auto_error=False)
@@ -231,6 +233,8 @@ def list_nas():
 @app.post("/api/v1/nas", status_code=201, dependencies=[Depends(auth)])
 def create_nas(body: NAS):
     address=str(body.address)
+    if body.address.is_loopback or body.address.is_unspecified or body.address.is_multicast or body.address.is_link_local:
+        raise HTTPException(422,"Invalid NAS address")
     secret=body.secret.get_secret_value()
     if not secret.isascii() or not secret.isalnum():
         raise HTTPException(422,"Use an alphanumeric random shared secret")
@@ -272,3 +276,53 @@ def dashboard():
             (SELECT count(*) FROM radacct) AS accounting_records,
             (SELECT count(*) FROM zradius_audit WHERE created_at >= now()-interval '24 hours') AS audit_24h
         """).fetchone()
+
+class RateChange(BaseModel):
+    upload_mbps: int = Field(ge=1,le=100000)
+    download_mbps: int = Field(ge=1,le=100000)
+
+def session_action(session_id: int, rate: str | None = None):
+    if os.environ.get("COA_ENABLED","false").lower() != "true":
+        raise HTTPException(409,"CoA is disabled")
+    action = "coa" if rate else "disconnect"
+    try:
+        with db() as conn:
+            row = conn.execute("""SELECT a.username,a.acctsessionid,host(a.nasipaddress) AS address,n.secret,n.type
+              FROM radacct a JOIN nas n ON n.nasname=host(a.nasipaddress)
+              WHERE a.radacctid=%s AND a.acctstoptime IS NULL""",(session_id,)).fetchone()
+            if not row:
+                raise HTTPException(404,"Open session with registered NAS not found")
+            if rate and row["type"]!="mikrotik":
+                raise HTTPException(422,"Rate change supported only for MikroTik")
+            try:
+                allowed=destination_allowed(row["address"])
+            except ValueError:
+                allowed=False
+            if not allowed:
+                raise HTTPException(403,"NAS outside allowed networks")
+            request_id=conn.execute("INSERT INTO zradius_coa_requests(radacctid,action,status) VALUES (%s,%s,'pending') RETURNING id",(session_id,action)).fetchone()["id"]
+            audit(conn,"session."+action+".requested",str(session_id))
+    except UniqueViolation:
+        raise HTTPException(409,"Session already has a pending request")
+    try:
+        status=send(row["address"],row["secret"],row["username"],row["acctsessionid"],rate)
+    except (ValueError,TypeError):
+        status="unknown"
+    with db() as conn:
+        conn.execute("UPDATE zradius_coa_requests SET status=%s,completed_at=now() WHERE id=%s",(status,request_id))
+        audit(conn,"session."+action+"."+status,str(session_id))
+    # Only real Accounting-Stop closes the session record.
+    return {"id":request_id,"status":status,"action":action,"accounting_updated":False}
+
+@app.post("/api/v1/sessions/{session_id}/disconnect", dependencies=[Depends(auth)])
+def disconnect(session_id: int):
+    return session_action(session_id)
+
+@app.post("/api/v1/sessions/{session_id}/rate", dependencies=[Depends(auth)])
+def change_rate(session_id: int, body: RateChange):
+    return session_action(session_id,f"{body.upload_mbps}M/{body.download_mbps}M")
+
+@app.get("/api/v1/coa", dependencies=[Depends(auth)])
+def coa_history():
+    with db() as conn:
+        return conn.execute("SELECT * FROM zradius_coa_requests ORDER BY id DESC LIMIT 100").fetchall()

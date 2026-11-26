@@ -17,12 +17,13 @@ services:
     environment:
       RADIUS_DB_PASSWORD: ${POSTGRES_PASSWORD:?required}
       RADIUS_TEST_SECRET: ${RADIUS_TEST_SECRET:?required}
+      RADIUS_ENABLE_NAS: ${RADIUS_ENABLE_NAS:-false}
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "127.0.0.1:1812:1812/udp"
-      - "127.0.0.1:1813:1813/udp"
+      - "${RADIUS_BIND_IP:-127.0.0.1}:1812:1812/udp"
+      - "${RADIUS_BIND_IP:-127.0.0.1}:1813:1813/udp"
     restart: unless-stopped
   api:
     build: ./backend
@@ -32,6 +33,8 @@ services:
       PGUSER: radius
       PGPASSWORD: ${POSTGRES_PASSWORD:?required}
       ADMIN_TOKEN: ${ADMIN_TOKEN:?required}
+      COA_ENABLED: ${COA_ENABLED:-false}
+      COA_ALLOWED_NETWORKS: ${COA_ALLOWED_NETWORKS:-}
     depends_on:
       postgres:
         condition: service_healthy
