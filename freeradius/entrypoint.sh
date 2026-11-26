@@ -12,7 +12,7 @@ client localhost {
 }
 EOF
 export PGPASSWORD="$RADIUS_DB_PASSWORD"
-until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.radcheck') IS NOT NULL AND to_regclass('public.radacct') IS NOT NULL AND to_regclass('public.nas') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
+until [ "$(psql -h postgres -U radius -d radius -Atqc "SELECT to_regclass('public.radcheck') IS NOT NULL AND to_regclass('public.radacct') IS NOT NULL AND to_regclass('public.nas') IS NOT NULL AND to_regclass('public.nasreload') IS NOT NULL" 2>/dev/null || true)" = t ]; do sleep 2; done
 if [ "${RADIUS_ENABLE_NAS:-false}" = true ]; then
   umask 027
   psql -h postgres -U radius -d radius -v ON_ERROR_STOP=1 -At <<'SQL' > /etc/freeradius/3.0/zradius-clients.conf
@@ -27,5 +27,5 @@ SQL
   printf '\n$INCLUDE /etc/freeradius/3.0/zradius-clients.conf\n' >> /etc/freeradius/3.0/clients.conf
 fi
 unset PGPASSWORD
-freeradius -XC
-exec freeradius -f
+freeradius -C
+exec freeradius -f -l stdout

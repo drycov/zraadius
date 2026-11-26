@@ -59,3 +59,9 @@ CREATE TABLE IF NOT EXISTS zradius_coa_requests (
  completed_at timestamptz
 );
 CREATE UNIQUE INDEX IF NOT EXISTS zradius_coa_pending_idx ON zradius_coa_requests(radacctid) WHERE status='pending';
+
+CREATE TABLE IF NOT EXISTS nasreload (
+ nasipaddress inet PRIMARY KEY,
+ reloadtime timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS radacct_nas_open_idx ON radacct(nasipaddress) WHERE acctstoptime IS NULL;

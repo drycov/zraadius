@@ -24,3 +24,25 @@ jobs:
           cp .env.example .env
           docker compose config --quiet
           docker compose build
+      - name: Start isolated AAA stack
+        run: |
+          printf 'POSTGRES_PASSWORD=%s\nADMIN_TOKEN=%s\nRADIUS_TEST_SECRET=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
+          docker compose up -d
+          for i in $(seq 1 60); do
+            if docker compose exec -T radius sh -c 'test -s /run/freeradius/freeradius.pid' 2>/dev/null; then break; fi
+            sleep 2
+          done
+      - name: AAA integration
+        run: |
+          set -a
+          . ./.env
+          set +a
+          python scripts/integration-radius.py
+      - name: Service diagnostics
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --tail=100
+      - name: Remove isolated CI stack
+        if: always()
+        run: docker compose down -v
