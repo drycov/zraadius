@@ -120,6 +120,7 @@ def _discover_host(host,base,bind,password,test_only,object_guid,groups,member_d
             username=first("sAMAccountName")
             state=first("userAccountControl")
             rows.append({"object_guid":guid,"username":username,"full_name":first("displayName")[:200],"department":first("department")[:200],
+                         "directory_state_known":state.isdecimal(),
                          "directory_enabled":state.isdecimal() and not bool(int(state)&2),
                          "compatible":bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,64}",username)) and not bool(re.fullmatch(r"hs-[a-f0-9]{20}",username))})
         return {"items":rows,"limited":limited}
