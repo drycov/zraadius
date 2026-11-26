@@ -2375,7 +2375,35 @@ def set_identity_eap(conn,identity_id,service,assignment):
         VALUES (%s,%s,%s,%s) ON CONFLICT(identity_id,service_code) DO UPDATE SET nas_id=excluded.nas_id,vlan_id=excluded.vlan_id""",
         (identity_id,service,assignment.nas_id,assignment.vlan_id))
 
+class TemplateDeviceParameters(IdentityDeviceAssignment):
+    model_config={"extra":"forbid"}
+
+class TemplateL2tpParameters(BaseModel):
+    nas_id:int=Field(gt=0)
+    profile_id:int=Field(gt=0)
+    model_config={"extra":"forbid"}
+
+class TemplatePppoeParameters(IdentityPppoeAssignment):
+    model_config={"extra":"forbid"}
+
+class TemplateHotspotParameters(IdentityHotspotAssignment):
+    model_config={"extra":"forbid"}
+
+class TemplateEapParameters(IdentityEapAssignment):
+    model_config={"extra":"forbid"}
+
+class AccessTemplateParameters(BaseModel):
+    device:TemplateDeviceParameters|None=None
+    l2tp:TemplateL2tpParameters|None=None
+    pppoe:TemplatePppoeParameters|None=None
+    hotspot:TemplateHotspotParameters|None=None
+    dot1x:TemplateEapParameters|None=None
+    wpa_enterprise:TemplateEapParameters|None=None
+    console_role:Literal["admin","operator","auditor"]|None=None
+    model_config={"extra":"forbid"}
+
 class AccessTemplate(BaseModel):
+    parameters:AccessTemplateParameters=Field(default_factory=AccessTemplateParameters)
     name:str=Field(min_length=1,max_length=100)
     account_type:Literal["person","service"]
     description:str=Field(default="",max_length=500)
@@ -2384,6 +2412,9 @@ class AccessTemplate(BaseModel):
     model_config={"extra":"forbid"}
 
 def validate_access_template(body):
+    for field,service in (("device","device-aaa"),("l2tp","l2tp"),("pppoe","pppoe"),("hotspot","hotspot"),("dot1x","dot1x"),("wpa_enterprise","wpa-enterprise"),("console_role","console")):
+        if getattr(body.parameters,field) is not None and service not in body.services:
+            raise HTTPException(422,"Parameters require selected service: "+service)
     if not body.name.strip() or len(set(body.services))!=len(body.services):
         raise HTTPException(422,"Template name required; duplicate services prohibited")
     if body.account_type=="service" and "console" in body.services:
@@ -2391,19 +2422,40 @@ def validate_access_template(body):
     if any(ord(ch)<32 or 127<=ord(ch)<=159 for ch in body.name+body.description):
         raise HTTPException(422,"Control characters are not allowed")
 
+def validate_template_targets(conn,body):
+    p=body.parameters
+    for service,a in (("device-aaa",p.device),("l2tp",p.l2tp),("pppoe",p.pppoe),("hotspot",p.hotspot),("dot1x",p.dot1x),("wpa-enterprise",p.wpa_enterprise)):
+        if a is None:
+            continue
+        nas=conn.execute("SELECT type FROM nas WHERE id=%s FOR KEY SHARE",(a.nas_id,)).fetchone()
+        if not nas:
+            raise HTTPException(404,"Template NAS not found")
+        services={r["service_code"] for r in conn.execute("SELECT service_code FROM zradius_nas_services WHERE nas_id=%s",(a.nas_id,)).fetchall()}
+        if service not in services or (service not in ("dot1x","wpa-enterprise") and nas["type"]!="mikrotik"):
+            raise HTTPException(422,"Incompatible template NAS: "+service)
+        if service in ("dot1x","wpa-enterprise") and services.intersection({"dot1x","wpa-enterprise"})!={service}:
+            raise HTTPException(422,"Ambiguous EAP NAS")
+    if p.device:
+        resolve_device_grant(conn,p.device)
+    if p.l2tp:
+        validate_l2tp_assignment(conn,L2tpAssignment(**p.l2tp.model_dump()),None)
+    if p.hotspot and p.hotspot.idle_seconds>p.hotspot.session_seconds:
+        raise HTTPException(422,"Idle timeout exceeds session timeout")
+
 @app.get("/api/v1/identities/access-templates",dependencies=[Depends(auth)])
 def access_templates():
     with db() as conn:
-        return conn.execute("SELECT id,name,account_type,description,services,enabled FROM zradius_access_templates ORDER BY account_type,name").fetchall()
+        return conn.execute("SELECT id,name,account_type,description,services,enabled,parameters FROM zradius_access_templates ORDER BY account_type,name").fetchall()
 
 @app.post("/api/v1/identities/access-templates",status_code=201)
 def create_access_template(body:AccessTemplate,principal=Depends(auth)):
     personal_admin(principal)
     validate_access_template(body)
     with db() as conn:
-        row=conn.execute("""INSERT INTO zradius_access_templates(name,account_type,description,services,enabled)
-            VALUES (%s,%s,%s,%s::text[],%s) RETURNING id,name,account_type,description,services,enabled""",
-            (body.name.strip(),body.account_type,body.description.strip(),body.services,body.enabled)).fetchone()
+        validate_template_targets(conn,body)
+        row=conn.execute("""INSERT INTO zradius_access_templates(name,account_type,description,services,enabled,parameters)
+            VALUES (%s,%s,%s,%s::text[],%s,%s::jsonb) RETURNING id,name,account_type,description,services,enabled,parameters""",
+            (body.name.strip(),body.account_type,body.description.strip(),body.services,body.enabled,body.parameters.model_dump_json(exclude_none=True))).fetchone()
         audit(conn,"identity.template.create",str(row["id"]))
         return row
 
@@ -2412,9 +2464,10 @@ def update_access_template(template_id:int,body:AccessTemplate,principal=Depends
     personal_admin(principal)
     validate_access_template(body)
     with db() as conn:
-        row=conn.execute("""UPDATE zradius_access_templates SET name=%s,account_type=%s,description=%s,services=%s::text[],enabled=%s
-            WHERE id=%s RETURNING id,name,account_type,description,services,enabled""",
-            (body.name.strip(),body.account_type,body.description.strip(),body.services,body.enabled,template_id)).fetchone()
+        validate_template_targets(conn,body)
+        row=conn.execute("""UPDATE zradius_access_templates SET name=%s,account_type=%s,description=%s,services=%s::text[],enabled=%s,parameters=%s::jsonb
+            WHERE id=%s RETURNING id,name,account_type,description,services,enabled,parameters""",
+            (body.name.strip(),body.account_type,body.description.strip(),body.services,body.enabled,body.parameters.model_dump_json(exclude_none=True),template_id)).fetchone()
         if not row:
             raise HTTPException(404,"Access template not found")
         audit(conn,"identity.template.update",str(template_id))
