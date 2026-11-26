@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, SecretStr, IPvAnyAddress
 from typing import Literal
+from datetime import datetime
 from psycopg.errors import UniqueViolation
 from coa import send, destination_allowed
 from schema_version import require_schema
@@ -3107,14 +3108,68 @@ def update_identity_profile(identity_id:int,body:IdentityProfile,principal=Depen
         raise HTTPException(422,"Control characters are not allowed")
     with db() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
-        row=conn.execute("SELECT id,username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        row=conn.execute("SELECT id,username,account_expires_at,rotation_interval_days FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
         if not row:
             raise HTTPException(404,"Identity not found")
+        if body.account_type=="person" and (row["account_expires_at"] is not None or row["rotation_interval_days"] is not None):
+            raise HTTPException(409,"Clear service lifecycle settings before converting account type")
         if body.account_type=="service" and (conn.execute("SELECT 1 FROM zradius_admin_users WHERE identity_id=%s",(identity_id,)).fetchone() or conn.execute("SELECT 1 FROM zradius_directory_identities WHERE identity_id=%s",(identity_id,)).fetchone()):
             raise HTTPException(409,"Console or directory identity cannot be converted to service account")
         result=conn.execute("UPDATE zradius_identities SET account_type=%s,account_owner=%s,account_purpose=%s,updated_at=now() WHERE id=%s RETURNING id,account_type,account_owner,account_purpose",(body.account_type,owner,purpose,identity_id)).fetchone()
         audit(conn,"identity.profile",row["username"])
         return result
+
+class ServiceLifecycle(BaseModel):
+    account_expires_at:datetime|None=None
+    rotation_interval_days:int|None=Field(default=None,ge=1,le=3650)
+    model_config={"extra":"forbid"}
+
+SERVICE_LIFECYCLE_SQL="""SELECT i.id,i.username,i.account_owner,i.account_purpose,i.enabled,
+    i.account_expires_at,i.rotation_interval_days,c.updated_at AS credential_updated_at,
+    c.updated_at + i.rotation_interval_days * interval '1 day' AS rotation_due_at,
+    CASE WHEN i.account_expires_at<=now() THEN 'expired'
+         WHEN NOT i.enabled THEN 'disabled'
+         WHEN i.account_expires_at<=now()+interval '30 days' THEN 'expiring'
+         ELSE 'active' END AS lifecycle_status,
+    CASE WHEN c.identity_id IS NULL THEN 'missing'
+         WHEN i.rotation_interval_days IS NULL THEN 'not_configured'
+         WHEN c.updated_at IS NULL THEN 'unknown'
+         WHEN c.updated_at+i.rotation_interval_days*interval '1 day'<=now() THEN 'overdue'
+         WHEN c.updated_at+i.rotation_interval_days*interval '1 day'<=now()+interval '14 days' THEN 'due_soon'
+         ELSE 'current' END AS rotation_status
+    FROM zradius_identities i LEFT JOIN zradius_identity_credentials c ON c.identity_id=i.id
+    WHERE i.account_type='service'"""
+
+@app.get("/api/v1/identities/service-registry")
+def service_account_registry(limit:int=100,offset:int=0,principal=Depends(auth)):
+    personal_admin(principal)
+    if not 1<=limit<=200 or offset<0:
+        raise HTTPException(422,"Invalid pagination")
+    with db() as conn:
+        rows=conn.execute(SERVICE_LIFECYCLE_SQL+" ORDER BY i.username,i.id LIMIT %s OFFSET %s",(limit+1,offset)).fetchall()
+        return {"items":rows[:limit],"more":len(rows)>limit}
+
+@app.get("/api/v1/identities/{identity_id}/lifecycle")
+def get_service_lifecycle(identity_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        row=conn.execute(SERVICE_LIFECYCLE_SQL+" AND i.id=%s",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Service identity not found")
+        return row
+
+@app.put("/api/v1/identities/{identity_id}/lifecycle")
+def update_service_lifecycle(identity_id:int,body:ServiceLifecycle,principal=Depends(auth)):
+    personal_admin(principal)
+    if body.account_expires_at is not None and body.account_expires_at.utcoffset() is None:
+        raise HTTPException(422,"Expiration requires an explicit timezone")
+    with db() as conn:
+        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s AND account_type='service' FOR UPDATE",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Service identity not found")
+        conn.execute("UPDATE zradius_identities SET account_expires_at=%s,rotation_interval_days=%s,updated_at=now() WHERE id=%s",(body.account_expires_at,body.rotation_interval_days,identity_id))
+        audit(conn,"identity.lifecycle.update",row["username"])
+        return conn.execute(SERVICE_LIFECYCLE_SQL+" AND i.id=%s",(identity_id,)).fetchone()
 
 class IdentityBulkState(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
