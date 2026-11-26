@@ -2471,6 +2471,25 @@ def create_identity(body:IdentityCreate,principal=Depends(auth)):
     except UniqueViolation:
         raise HTTPException(409,"Identity, username or static IP already assigned")
 
+class IdentityMetadata(BaseModel):
+    full_name:str=Field(max_length=200)
+    department:str=Field(max_length=200)
+    model_config={"extra":"forbid"}
+
+@app.put("/api/v1/identities/{identity_id}/metadata",dependencies=[Depends(auth)])
+def identity_metadata(identity_id:int,body:IdentityMetadata):
+    full_name,department=body.full_name.strip(),body.department.strip()
+    if any(ord(ch)<32 or 127<=ord(ch)<=159 for ch in full_name+department):
+        raise HTTPException(422,"Control characters are not allowed")
+    with db() as conn:
+        row=conn.execute("SELECT id,username,full_name,department FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Identity not found")
+        if (row["full_name"],row["department"])!=(full_name,department):
+            row=conn.execute("UPDATE zradius_identities SET full_name=%s,department=%s,updated_at=now() WHERE id=%s RETURNING id,username,full_name,department",(full_name,department,identity_id)).fetchone()
+            audit(conn,"identity.metadata",row["username"])
+        return row
+
 @app.put("/api/v1/identities/{identity_id}/state",dependencies=[Depends(auth)])
 def identity_state(identity_id:int,body:UserState,principal=Depends(auth)):
     with db() as conn:

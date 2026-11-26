@@ -1,0 +1,3 @@
+# Identity metadata
+
+Admin-only PUT `/api/v1/identities/{id}/metadata` accepts both `full_name` and `department` (strings up to 200 characters, empty allowed). Unknown fields are rejected; surrounding whitespace is trimmed and embedded control characters rejected. The transaction locks the identity row, updates only metadata and updated_at, and records identity.metadata with the actor and username only if values changed. Unknown identity returns 404. No password, login, grant or session changes. Concurrent edits use last-write-wins. No migration. UI uses a separate tab and refreshes the catalog after save. Build and runtime tests pending.
