@@ -1,5 +1,6 @@
 import {useState} from 'react';
 import Tabs from '../ui/Tabs';
+import IdentityLegacy from './IdentityLegacy';
 import IdentityBulkState from './IdentityBulkState';
 import IdentityBulk from './IdentityBulk';
 import IdentitySessions from './IdentitySessions';
@@ -31,6 +32,7 @@ export default function UnifiedUsers({request}:{request:Request}){
  <Checkbox checked={pppoe} onChange={e=>setPppoe(e.target.checked)}>PPPoE</Checkbox>{pppoe&&<PppoeFields nas={n.data??[]}/>}<Checkbox checked={hotspot} onChange={e=>setHotspot(e.target.checked)}>Hotspot</Checkbox>{hotspot&&<HotspotFields nas={n.data??[]}/>}<Checkbox checked={dot1x} onChange={e=>setDot1x(e.target.checked)}>802.1X</Checkbox>{dot1x&&<EapFields nas={n.data??[]} service="dot1x"/>}<Checkbox checked={wpa} onChange={e=>setWpa(e.target.checked)}>WPA Enterprise</Checkbox>{wpa&&<EapFields nas={n.data??[]} service="wpa-enterprise"/>}<Checkbox checked={consoleAccess} onChange={e=>setConsoleAccess(e.target.checked)}>Web Console</Checkbox>{consoleAccess&&<Form.Item name="console_role" label="Роль Web Console" rules={[{required:true}]}><Select options={[{value:"auditor",label:"Auditor"},{value:"operator",label:"Operator"},{value:"admin",label:"Administrator"}]}/></Form.Item>}<Button type="primary" htmlType="submit" loading={a.busy}>Создать единого пользователя</Button></Form></>},
  {id:'bulk',label:'Массовое назначение',content:<IdentityBulk request={request} refresh={d.refresh}/>},
  {id:'bulk-state',label:'Массовая блокировка',content:<IdentityBulkState request={request} refresh={d.refresh}/>},
+ {id:'legacy',label:'Миграция Legacy',content:<IdentityLegacy request={request} refresh={d.refresh}/>},
  {id:'groups',label:'Глобальные группы',content:<IdentityGroups request={request}/>}
  ]}/><Modal wide title={editing?.username} open={!!editing} onCancel={()=>setEditing(undefined)} footer={null}>{editing&&<Tabs key={editing.id} label="Настройки пользователя" items={[
  {id:'metadata',label:'Персональные данные',content:<IdentityMetadata key={editing.id} request={request} identity={editing} onSaved={value=>{setEditing(current=>current?.id===value.id?{...current,...value}:current);d.refresh()}}/>},

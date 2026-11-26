@@ -2417,6 +2417,67 @@ def identities(limit:int=100,offset:int=0,q:str="",enabled:bool|None=None):
             AND (%s::boolean IS NULL OR i.enabled=%s::boolean)
             ORDER BY i.username,i.id LIMIT %s OFFSET %s""",(q,q,q,q,enabled,enabled,limit,offset)).fetchall()
 
+class LegacyIdentityMigration(BaseModel):
+    service:Literal["device","l2tp"]
+    user_id:int=Field(gt=0)
+    password:SecretStr|None=Field(default=None,min_length=16,max_length=128)
+    preview:bool=True
+    model_config={"extra":"forbid"}
+
+@app.get("/api/v1/identities/legacy-candidates")
+def legacy_identity_candidates(service:Literal["device","l2tp"],q:str="",limit:int=100,offset:int=0,principal=Depends(auth)):
+    personal_admin(principal)
+    if not 1<=limit<=101 or offset<0 or len(q)>200:
+        raise HTTPException(422,"Invalid search or pagination")
+    table={"device":"zradius_device_users","l2tp":"zradius_l2tp_users"}[service]
+    with db() as conn:
+        return conn.execute("SELECT id,username,enabled FROM "+table+" WHERE identity_id IS NULL AND strpos(lower(username),lower(%s))>0 ORDER BY username,id LIMIT %s OFFSET %s",(q.strip(),limit,offset)).fetchall() if q.strip() else conn.execute("SELECT id,username,enabled FROM "+table+" WHERE identity_id IS NULL ORDER BY username,id LIMIT %s OFFSET %s",(limit,offset)).fetchall()
+
+@app.post("/api/v1/identities/legacy-migrate")
+def migrate_legacy_identity(body:LegacyIdentityMigration,principal=Depends(auth)):
+    personal_admin(principal)
+    table={"device":"zradius_device_users","l2tp":"zradius_l2tp_users"}[body.service]
+    other={"device":"zradius_l2tp_users","l2tp":"zradius_device_users"}[body.service]
+    if not body.preview and body.password is None:
+        raise HTTPException(422,"New unified password required")
+    try:
+        with db() as conn:
+            lock_ppp_policy(conn)
+            conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+            candidate=conn.execute("SELECT username FROM "+table+" WHERE id=%s AND identity_id IS NULL",(body.user_id,)).fetchone()
+            if not candidate:
+                raise HTTPException(404,"Independent legacy user not found")
+            username=candidate["username"]
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",(username,))
+            row=conn.execute("SELECT id,username,enabled FROM "+table+" WHERE id=%s AND username=%s AND identity_id IS NULL FOR UPDATE",(body.user_id,username)).fetchone()
+            if not row:
+                raise HTTPException(409,"Legacy user changed; reload")
+            if not __import__('re').fullmatch(r"[A-Za-z0-9_.-]{1,64}",username) or __import__('re').fullmatch(r"hs-[a-f0-9]{20}",username):
+                raise HTTPException(422,"Username incompatible with unified namespace")
+            for conflict in ("zradius_identities",other,"radcheck","zradius_eap_users","zradius_admin_users","zradius_hotspot_vouchers"):
+                if conn.execute("SELECT 1 FROM "+conflict+" WHERE username=%s LIMIT 1",(username,)).fetchone():
+                    raise HTTPException(409,"Conflicting account in "+conflict)
+            result={"preview":body.preview,"username":username,"service":body.service,"legacy_enabled":row["enabled"],"identity_enabled":False}
+            if body.preview:
+                return result
+            nt,digest=ppp_credentials(body.password.get_secret_value())
+            web=hash_password(body.password.get_secret_value())
+            # The existing immediate namespace trigger forbids inserting the identity
+            # while its independent row owns the name. Move that row temporarily
+            # within this transaction; other transactions never see the temporary name.
+            temporary="migration-"+secrets.token_hex(24)
+            conn.execute("UPDATE "+table+" SET username=%s WHERE id=%s",(temporary,row["id"]))
+            identity=conn.execute("INSERT INTO zradius_identities(username,enabled) VALUES (%s,false) RETURNING id",(username,)).fetchone()
+            conn.execute("INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password,web_password_hash) VALUES (%s,%s,%s,%s)",(identity["id"],digest,nt,web))
+            extra=",nt_password=NULL" if body.service=="l2tp" else ""
+            conn.execute("UPDATE "+table+" SET username=%s,identity_id=%s,password_hash=NULL"+extra+" WHERE id=%s",(username,identity["id"],row["id"]))
+            audit(conn,"identity.legacy.migrate."+body.service,username)
+            return {**result,"identity_id":identity["id"]}
+    except ValueError:
+        raise HTTPException(422,"Invalid unified password")
+    except UniqueViolation:
+        raise HTTPException(409,"Concurrent login or assignment conflict")
+
 @app.post("/api/v1/identities",status_code=201,dependencies=[Depends(auth)])
 def create_identity(body:IdentityCreate,principal=Depends(auth)):
     if body.console_role:
