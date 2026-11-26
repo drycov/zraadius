@@ -2288,6 +2288,22 @@ def vpn_monitoring():
 class IdentityDeviceAssignment(DeviceGrant):
     nas_id:int=Field(gt=0)
 
+class IdentityPppoeAssignment(BaseModel):
+    nas_id:int=Field(gt=0)
+    rate_limit:str=Field(pattern=r"^[1-9][0-9]{0,5}M/[1-9][0-9]{0,5}M$")
+    pool:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    interim_seconds:int=Field(default=300,ge=60,le=86400)
+
+def set_identity_pppoe(conn,identity_id,assignment):
+    if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(assignment.nas_id,)).fetchone():
+        raise HTTPException(404,"MikroTik NAS not found")
+    if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='pppoe'",(assignment.nas_id,)).fetchone():
+        raise HTTPException(409,"Assign PPPoE service to NAS first")
+    conn.execute("""INSERT INTO zradius_identity_pppoe(identity_id,nas_id,rate_limit,pool,interim_seconds)
+        VALUES (%s,%s,%s,%s,%s) ON CONFLICT(identity_id) DO UPDATE SET
+        nas_id=excluded.nas_id,rate_limit=excluded.rate_limit,pool=excluded.pool,interim_seconds=excluded.interim_seconds""",
+        (identity_id,assignment.nas_id,assignment.rate_limit,assignment.pool,assignment.interim_seconds))
+
 class IdentityCreate(BaseModel):
     username:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
     full_name:str=Field(default="",max_length=200)
@@ -2295,6 +2311,7 @@ class IdentityCreate(BaseModel):
     password:SecretStr=Field(min_length=16,max_length=128)
     device:IdentityDeviceAssignment|None=None
     l2tp:L2tpAssignment|None=None
+    pppoe:IdentityPppoeAssignment|None=None
 
 @app.get("/api/v1/identities",dependencies=[Depends(auth)])
 def identities(limit:int=100,offset:int=0):
@@ -2303,9 +2320,11 @@ def identities(limit:int=100,offset:int=0):
     with db() as conn:
         return conn.execute("""SELECT i.id,i.username,i.full_name,i.department,i.enabled,
             d.id AS device_id,d.enabled AS device_enabled,v.id AS l2tp_id,v.enabled AS l2tp_enabled,
-            (c.identity_id IS NOT NULL) AS credentials_ready,(c.nt_password IS NOT NULL) AS mschap_ready
+            (c.identity_id IS NOT NULL) AS credentials_ready,(c.nt_password IS NOT NULL) AS mschap_ready,
+            pp.identity_id IS NOT NULL AS pppoe_assigned,pp.enabled AS pppoe_enabled
             FROM zradius_identities i LEFT JOIN zradius_identity_credentials c ON c.identity_id=i.id LEFT JOIN zradius_device_users d ON d.identity_id=i.id
             LEFT JOIN zradius_l2tp_users v ON v.identity_id=i.id
+            LEFT JOIN zradius_identity_pppoe pp ON pp.identity_id=i.id
             ORDER BY i.username LIMIT %s OFFSET %s""",(limit,offset)).fetchall()
 
 @app.post("/api/v1/identities",status_code=201,dependencies=[Depends(auth)])
@@ -2342,6 +2361,8 @@ def create_identity(body:IdentityCreate):
                 validate_l2tp_assignment(conn,v,address)
                 conn.execute("""INSERT INTO zradius_l2tp_users(username,nas_id,profile_id,group_id,address_space_id,static_ip,description,identity_id)
                     VALUES (%s,%s,%s,%s,%s,%s::inet,%s,%s)""",(body.username,v.nas_id,v.profile_id,v.group_id,v.address_space_id,address,v.description,row["id"]))
+            if body.pppoe:
+                set_identity_pppoe(conn,row["id"],body.pppoe)
             audit(conn,"identity.create",body.username)
             return row
     except UniqueViolation:
@@ -2637,3 +2658,29 @@ def apply_identity_vpn_template(identity_id:int):
         return {"status":"created_disabled"}
     except UniqueViolation:
         raise HTTPException(409,"Existing VPN login conflict")
+
+
+class IdentityPppoeUpdate(BaseModel):
+    enabled:bool
+    assignment:IdentityPppoeAssignment|None=None
+
+@app.get("/api/v1/identities/{identity_id}/pppoe",dependencies=[Depends(auth)])
+def identity_pppoe(identity_id:int):
+    with db() as conn:
+        return conn.execute("SELECT nas_id,rate_limit,pool,interim_seconds,enabled FROM zradius_identity_pppoe WHERE identity_id=%s",(identity_id,)).fetchone()
+
+@app.put("/api/v1/identities/{identity_id}/pppoe",dependencies=[Depends(auth)])
+def update_identity_pppoe(identity_id:int,body:IdentityPppoeUpdate):
+    with db() as conn:
+        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Identity not found")
+        if body.enabled and not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s",(identity_id,)).fetchone():
+            raise HTTPException(409,"Set unified password first")
+        if body.assignment:
+            set_identity_pppoe(conn,identity_id,body.assignment)
+        changed=conn.execute("UPDATE zradius_identity_pppoe SET enabled=%s WHERE identity_id=%s RETURNING identity_id",(body.enabled,identity_id)).fetchone()
+        if body.enabled and not changed:
+            raise HTTPException(422,"PPPoE assignment required")
+        audit(conn,"identity.pppoe",row["username"])
+    return {"status":"updated"}
