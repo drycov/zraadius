@@ -31,13 +31,26 @@ export PGPASSWORD="$RADIUS_DB_PASSWORD"
 export PGCONNECT_TIMEOUT=3
 wait_schema() {
   attempt=0
-  until [ "$(psql -h postgres -U zradius_runtime -d radius -Atqc "$1" 2>/dev/null || true)" = t ]; do
+  while :; do
+    if result=$(psql -X -w -h postgres -U zradius_runtime -d radius -v ON_ERROR_STOP=1 -Atqc "$1" 2>&1); then
+      if [ "$result" = t ]; then return 0; fi
+      reason='required schema or privileges missing'
+    else
+      reason="$result"
+    fi
     attempt=$((attempt + 1))
-    if [ "$attempt" -ge 60 ]; then echo 'Database schema readiness timeout' >&2; exit 1; fi
+    if [ "$attempt" -eq 1 ] || [ "$((attempt % 10))" -eq 0 ]; then
+      printf 'ZRADIUS database readiness (%s/60): %s\n' "$attempt" "$reason" >&2
+    fi
+    if [ "$attempt" -ge 60 ]; then
+      echo 'Database schema readiness timeout; run docker compose run --rm migrate and verify runtime credentials' >&2
+      exit 1
+    fi
     sleep 2
   done
 }
-wait_schema "SELECT to_regclass('public.radcheck') IS NOT NULL AND to_regclass('public.radacct') IS NOT NULL AND to_regclass('public.nas') IS NOT NULL AND to_regclass('public.nasreload') IS NOT NULL AND to_regclass('public.zradius_device_auth_log') IS NOT NULL AND to_regclass('public.zradius_hotspot_vouchers') IS NOT NULL AND to_regclass('public.zradius_ipoe_bindings') IS NOT NULL AND to_regclass('public.zradius_nas_services') IS NOT NULL"
+wait_schema "SELECT NOT EXISTS (SELECT 1 FROM unnest(ARRAY['radcheck','radreply','radgroupcheck','radgroupreply','radusergroup','radacct','radpostauth','nas','nasreload','zradius_device_auth_log','zradius_hotspot_vouchers','zradius_ipoe_bindings','zradius_nas_services','zradius_device_users','zradius_device_grants']) AS t(name) WHERE to_regclass('public.'||name) IS NULL OR NOT COALESCE(has_table_privilege(current_user,to_regclass('public.'||name),'SELECT'),false))"
+
 if [ "${RADIUS_ENABLE_NAS:-false}" = true ]; then
   umask 027
   python3 /opt/zradius/render_secrets.py nas > /etc/freeradius/3.0/zradius-clients.conf
