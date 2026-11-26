@@ -59,7 +59,7 @@ def discover(profile=None, test_only=False, object_guid=None, groups=False, memb
         raise ValueError("LDAP host is not allowlisted")
     # Explicit primary-to-replica mapping; never infer replicas from the global allowlist.
     try:
-        mapping=json.loads(os.environ.get("ZRADIUS_LDAP_FAILOVER_MAP","{}"))
+        mapping=json.loads(os.environ.get("ZRADIUS_LDAP_FAILOVER_MAP") or "{}")
     except (ValueError,TypeError):
         raise ValueError("Invalid LDAP failover mapping") from None
     if not isinstance(mapping,dict):
