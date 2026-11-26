@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from starlette.concurrency import run_in_threadpool
 from iam import hash_password, verify_password, token_digest, new_token, permitted
 from uuid import UUID
+from mfa import new_seed, seed_from_envelope, match_step, recovery_codes, uri as mfa_uri
 actor_context=ContextVar('actor',default=None)
 
 ROOT = Path(__file__).parent
@@ -53,7 +54,7 @@ async def auth(request:Request, credentials: HTTPAuthorizationCredentials | None
         principal=await run_in_threadpool(lookup)
         if not principal:
             raise HTTPException(401,"Unauthorized")
-    if request.url.path not in ("/api/v1/iam/me","/api/v1/iam/logout","/api/v1/iam/password","/api/v1/iam/my-sessions") and not permitted(principal["role"],request.method,request.url.path):
+    if request.url.path not in ("/api/v1/iam/me","/api/v1/iam/logout","/api/v1/iam/password","/api/v1/iam/my-sessions","/api/v1/iam/mfa/status","/api/v1/iam/mfa/setup","/api/v1/iam/mfa/confirm","/api/v1/iam/mfa/disable") and not permitted(principal["role"],request.method,request.url.path):
         raise HTTPException(403,"Forbidden")
     actor_context.set(principal["username"])
     return principal
@@ -1092,11 +1093,14 @@ class ManagementLogin(BaseModel):
     username:str=Field(min_length=1,max_length=64,pattern=r"^[a-zA-Z0-9_.-]+$")
     password:SecretStr=Field(min_length=1,max_length=128)
 
+class ManagementSignIn(ManagementLogin):
+    otp:SecretStr|None=Field(default=None,max_length=64)
+
 class ManagementUser(ManagementLogin):
     role:Literal["admin","operator","auditor"]="auditor"
 
 @app.post("/api/v1/iam/login")
-def management_login(body:ManagementLogin,request:Request,response:Response):
+def management_login(body:ManagementSignIn,request:Request,response:Response):
     # Shared database limiter: global and per identity, independent of forwarded headers.
     buckets=sorted([token_digest("global-login"),token_digest("login:"+body.username.lower())])
     with db() as conn:
@@ -1108,10 +1112,18 @@ def management_login(body:ManagementLogin,request:Request,response:Response):
             if row["attempts"]>(100 if bucket==token_digest("global-login") else 10):
                 conn.commit()
                 raise HTTPException(429,"Too many login attempts")
-        user=conn.execute("SELECT id,username,password_hash,role,enabled FROM zradius_admin_users WHERE username=%s FOR UPDATE",(body.username,)).fetchone()
+        user=conn.execute("SELECT id,username,password_hash,role,enabled,mfa_secret,mfa_last_step,mfa_recovery FROM zradius_admin_users WHERE username=%s FOR UPDATE",(body.username,)).fetchone()
         if not user or not user["enabled"] or not verify_password(user["password_hash"],body.password.get_secret_value()):
             conn.commit()
             raise HTTPException(401,"Invalid credentials")
+        if user["mfa_secret"]:
+            if body.otp is None:
+                conn.commit()
+                response.headers["Cache-Control"]="no-store"
+                return {"mfa_required":True}
+            if not consume_mfa(conn,user,body.otp.get_secret_value()):
+                conn.commit()
+                raise HTTPException(401,"Invalid credentials or second factor")
         token,digest=new_token()
         conn.execute("DELETE FROM zradius_admin_sessions WHERE expires_at<=now()")
         conn.execute("INSERT INTO zradius_admin_sessions(token_hash,user_id,expires_at) VALUES (%s,%s,now()+interval '8 hours')",(digest,user["id"]))
@@ -1133,7 +1145,7 @@ def management_logout(credentials:HTTPAuthorizationCredentials=Depends(bearer),p
 @app.get("/api/v1/iam/users",dependencies=[Depends(auth)])
 def management_users():
     with db() as conn:
-        return conn.execute("SELECT id,username,role,enabled,created_at FROM zradius_admin_users ORDER BY username").fetchall()
+        return conn.execute("SELECT id,username,role,enabled,created_at,mfa_secret IS NOT NULL AS mfa_enabled FROM zradius_admin_users ORDER BY username").fetchall()
 
 @app.post("/api/v1/iam/users",status_code=201,dependencies=[Depends(auth)])
 def management_create(body:ManagementUser):
@@ -1235,3 +1247,84 @@ def revoke_management_session(session_id:UUID):
             raise HTTPException(404,"Session not found")
         audit(conn,"iam.session.revoke",str(session_id))
     return {"status":"revoked"}
+
+def consume_mfa(conn,row,code):
+    if not row["mfa_secret"]:
+        return False
+    step=match_step(seed_from_envelope(row["mfa_secret"],row["id"]),code,row["mfa_last_step"])
+    if step is not None:
+        conn.execute("UPDATE zradius_admin_users SET mfa_last_step=%s WHERE id=%s",(step,row["id"]))
+        return True
+    digest=token_digest(code)
+    if any(secrets.compare_digest(digest,item) for item in row["mfa_recovery"]):
+        conn.execute("UPDATE zradius_admin_users SET mfa_recovery=array_remove(mfa_recovery,%s) WHERE id=%s",(digest,row["id"]))
+        audit(conn,"iam.mfa.recovery.used",str(row["id"]))
+        return True
+    return False
+
+class MfaPassword(BaseModel):
+    password:SecretStr=Field(min_length=1,max_length=128)
+
+class MfaProof(MfaPassword):
+    otp:SecretStr=Field(min_length=6,max_length=64)
+
+def mfa_user(conn,principal,password):
+    if not principal.get("id"):
+        raise HTTPException(403,"Personal session required")
+    bucket=token_digest("mfa-proof:"+str(principal["id"]))
+    limit=conn.execute("""INSERT INTO zradius_login_limits(bucket,attempts) VALUES (%s,1)
+        ON CONFLICT(bucket) DO UPDATE SET attempts=CASE WHEN zradius_login_limits.window_start<now()-interval '5 minutes' THEN 1 ELSE zradius_login_limits.attempts+1 END,
+        window_start=CASE WHEN zradius_login_limits.window_start<now()-interval '5 minutes' THEN now() ELSE zradius_login_limits.window_start END RETURNING attempts""",(bucket,)).fetchone()
+    conn.commit()
+    if limit["attempts"]>10:
+        raise HTTPException(429,"Too many MFA attempts")
+    row=conn.execute("SELECT * FROM zradius_admin_users WHERE id=%s AND enabled FOR UPDATE",(principal["id"],)).fetchone()
+    if not row or not verify_password(row["password_hash"],password):
+        raise HTTPException(401,"Invalid credentials")
+    return row
+
+@app.get("/api/v1/iam/mfa/status")
+def mfa_status(principal=Depends(auth)):
+    if not principal.get("id"):
+        raise HTTPException(403,"Personal session required")
+    with db() as conn:
+        return conn.execute("SELECT mfa_secret IS NOT NULL AS enabled, cardinality(mfa_recovery) AS recovery_remaining FROM zradius_admin_users WHERE id=%s",(principal["id"],)).fetchone()
+
+@app.post("/api/v1/iam/mfa/setup")
+def mfa_setup(body:MfaPassword,response:Response,principal=Depends(auth)):
+    with db() as conn:
+        row=mfa_user(conn,principal,body.password.get_secret_value())
+        if row["mfa_secret"]:
+            raise HTTPException(409,"MFA already enabled")
+        envelope,seed=new_seed(row["id"])
+        conn.execute("UPDATE zradius_admin_users SET mfa_pending=%s,mfa_pending_until=now()+interval '10 minutes' WHERE id=%s",(envelope,row["id"]))
+        audit(conn,"iam.mfa.setup",row["username"])
+    response.headers["Cache-Control"]="no-store"
+    return {"secret":seed,"otpauth_uri":mfa_uri(row["username"],seed),"expires_in":600}
+
+@app.post("/api/v1/iam/mfa/confirm")
+def mfa_confirm(body:MfaProof,response:Response,principal=Depends(auth)):
+    with db() as conn:
+        row=mfa_user(conn,principal,body.password.get_secret_value())
+        if row["mfa_secret"] or not row["mfa_pending"] or not conn.execute("SELECT 1 FROM zradius_admin_users WHERE id=%s AND mfa_pending_until>now()",(row["id"],)).fetchone():
+            raise HTTPException(409,"No active enrollment")
+        step=match_step(seed_from_envelope(row["mfa_pending"],row["id"]),body.otp.get_secret_value())
+        if step is None:
+            raise HTTPException(401,"Invalid OTP")
+        codes,digests=recovery_codes()
+        conn.execute("UPDATE zradius_admin_users SET mfa_secret=mfa_pending,mfa_pending=NULL,mfa_pending_until=NULL,mfa_last_step=%s,mfa_recovery=%s WHERE id=%s",(step,digests,row["id"]))
+        conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(row["id"],))
+        audit(conn,"iam.mfa.enabled",row["username"])
+    response.headers["Cache-Control"]="no-store"
+    return {"recovery_codes":codes,"reauthentication_required":True}
+
+@app.post("/api/v1/iam/mfa/disable")
+def mfa_disable(body:MfaProof,principal=Depends(auth)):
+    with db() as conn:
+        row=mfa_user(conn,principal,body.password.get_secret_value())
+        if not consume_mfa(conn,row,body.otp.get_secret_value()):
+            raise HTTPException(401,"Invalid second factor")
+        conn.execute("UPDATE zradius_admin_users SET mfa_secret=NULL,mfa_pending=NULL,mfa_pending_until=NULL,mfa_last_step=-1,mfa_recovery='{}' WHERE id=%s",(row["id"],))
+        conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(row["id"],))
+        audit(conn,"iam.mfa.disabled",row["username"])
+    return {"status":"disabled","reauthentication_required":True}
