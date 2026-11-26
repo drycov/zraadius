@@ -1684,3 +1684,98 @@ def create_device_reply_profile(body:DeviceReplyProfileCreate):
             raise HTTPException(409,"Reply profile already exists")
         audit(conn,"device.reply.profile.create",str(row["id"]))
         return row
+
+
+# Dedicated L2TP identities; no fallback to subscriber radcheck.
+from ppp_vpn import credentials as ppp_credentials, static_address
+
+class PppProfileCreate(BaseModel):
+    name:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    pool:str|None=Field(default=None,min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    interim_seconds:int=Field(default=300,ge=60,le=86400)
+    description:str=Field(default="",max_length=200)
+
+class L2tpUserCreate(BaseModel):
+    username:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.@-]+$")
+    password:SecretStr=Field(min_length=16,max_length=128)
+    nas_id:int=Field(gt=0)
+    profile_id:int=Field(gt=0)
+    static_ip:str|None=Field(default=None,max_length=15)
+    description:str=Field(default="",max_length=200)
+
+@app.get("/api/v1/ppp/profiles",dependencies=[Depends(auth)])
+def ppp_profiles():
+    with db() as conn:
+        return conn.execute("SELECT id,name,pool,interim_seconds,description FROM zradius_ppp_profiles ORDER BY name").fetchall()
+
+@app.post("/api/v1/ppp/profiles",status_code=201,dependencies=[Depends(auth)])
+def create_ppp_profile(body:PppProfileCreate):
+    with db() as conn:
+        row=conn.execute("""INSERT INTO zradius_ppp_profiles(name,pool,interim_seconds,description)
+            VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id,name,pool,interim_seconds,description""",
+            (body.name,body.pool,body.interim_seconds,body.description)).fetchone()
+        if not row:
+            raise HTTPException(409,"PPP profile exists")
+        audit(conn,"ppp.profile.create",body.name)
+        return row
+
+@app.get("/api/v1/ppp/l2tp/users",dependencies=[Depends(auth)])
+def l2tp_users(limit:int=100,offset:int=0):
+    if not 1<=limit<=500 or offset<0:
+        raise HTTPException(422,"Invalid pagination")
+    with db() as conn:
+        return conn.execute("""SELECT u.id,u.username,u.enabled,u.nas_id,n.shortname AS nas,u.profile_id,p.name AS profile,
+            host(u.static_ip) AS static_ip,p.pool,u.description FROM zradius_l2tp_users u
+            JOIN nas n ON n.id=u.nas_id JOIN zradius_ppp_profiles p ON p.id=u.profile_id
+            ORDER BY u.username LIMIT %s OFFSET %s""",(limit,offset)).fetchall()
+
+@app.post("/api/v1/ppp/l2tp/users",status_code=201,dependencies=[Depends(auth)])
+def create_l2tp_user(body:L2tpUserCreate):
+    try:
+        nt,digest=ppp_credentials(body.password.get_secret_value())
+        address=static_address(body.static_ip)
+    except ValueError:
+        raise HTTPException(422,"Invalid password encoding/length or static IPv4")
+    try:
+        with db() as conn:
+            if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(body.nas_id,)).fetchone():
+                raise HTTPException(404,"MikroTik NAS not found")
+            if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='l2tp'",(body.nas_id,)).fetchone():
+                raise HTTPException(409,"Assign L2TP service first")
+            profile=conn.execute("SELECT id,pool FROM zradius_ppp_profiles WHERE id=%s",(body.profile_id,)).fetchone()
+            if not profile:
+                raise HTTPException(404,"PPP profile not found")
+            if address is None and not profile["pool"]:
+                raise HTTPException(422,"Static IPv4 or named NAS pool required")
+            row=conn.execute("""INSERT INTO zradius_l2tp_users(username,nt_password,password_hash,nas_id,profile_id,static_ip,description)
+                VALUES (%s,%s,%s,%s,%s,%s::inet,%s) RETURNING id,username,enabled""",
+                (body.username,nt,digest,body.nas_id,body.profile_id,address,body.description)).fetchone()
+            audit(conn,"ppp.l2tp.create",body.username)
+            return row
+    except UniqueViolation:
+        raise HTTPException(409,"L2TP username or static IP on NAS already assigned")
+
+@app.put("/api/v1/ppp/l2tp/users/{user_id}/state",dependencies=[Depends(auth)])
+def l2tp_user_state(user_id:int,body:UserState):
+    with db() as conn:
+        row=conn.execute("UPDATE zradius_l2tp_users SET enabled=%s WHERE id=%s RETURNING id,username,enabled",(body.enabled,user_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"L2TP user not found")
+        audit(conn,"ppp.l2tp.state",row["username"])
+        return row
+
+class PppPassword(BaseModel):
+    password:SecretStr=Field(min_length=16,max_length=128)
+
+@app.put("/api/v1/ppp/l2tp/users/{user_id}/password",dependencies=[Depends(auth)])
+def l2tp_password(user_id:int,body:PppPassword):
+    try:
+        nt,digest=ppp_credentials(body.password.get_secret_value())
+    except ValueError:
+        raise HTTPException(422,"Invalid password encoding/length")
+    with db() as conn:
+        row=conn.execute("UPDATE zradius_l2tp_users SET nt_password=%s,password_hash=%s WHERE id=%s RETURNING username",(nt,digest,user_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"L2TP user not found")
+        audit(conn,"ppp.l2tp.password",row["username"])
+    return {"status":"updated"}

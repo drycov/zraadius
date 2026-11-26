@@ -72,7 +72,40 @@ server zradius {
     Auth-Type := Accept
    }
   }
-  elsif (&Mikrotik-Realm == "pppoe" || &Mikrotik-Realm == "l2tp") {
+  elsif (&Mikrotik-Realm == "l2tp") {
+   if (!&User-Name || &User-Name !~ /^[A-Za-z0-9_.@-]{1,64}$/ || !&Service-Type || &Service-Type != Framed-User || !&Framed-Protocol || &Framed-Protocol != PPP || &CHAP-Password) {
+    reject
+   }
+   # Only PAP or MS-CHAPv2; no subscriber fallback.
+   if (&User-Password && !&MS-CHAP-Challenge && !&MS-CHAP2-Response && !&MS-CHAP-Response) {
+    update control {
+     Tmp-String-0 := "%{sql:SELECT u.password_hash FROM zradius_l2tp_users u JOIN zradius_ppp_profiles p ON p.id=u.profile_id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+    }
+    if (&control:Tmp-String-0 !~ /^[A-Za-z0-9+\/]{107}=$/) {
+     reject
+    }
+    update control {
+     Password-With-Header := "{ssha512}%{control:Tmp-String-0}"
+    }
+    pap
+   }
+   elsif (!&User-Password && &MS-CHAP-Challenge && &MS-CHAP2-Response && !&MS-CHAP-Response) {
+    update control {
+     Tmp-String-0 := "%{sql:SELECT u.nt_password FROM zradius_l2tp_users u JOIN zradius_ppp_profiles p ON p.id=u.profile_id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+    }
+    if (&control:Tmp-String-0 !~ /^[0-9a-f]{32}$/) {
+     reject
+    }
+    update control {
+     NT-Password := "0x%{control:Tmp-String-0}"
+    }
+    mschap
+   }
+   else {
+    reject
+   }
+  }
+  elsif (&Mikrotik-Realm == "pppoe") {
    if (!&Service-Type || &Service-Type != Framed-User || !&Framed-Protocol || &Framed-Protocol != PPP) {
     reject
    }
@@ -191,7 +224,38 @@ server zradius {
     }
    }
   }
-  elsif (&Mikrotik-Realm == "pppoe" || &Mikrotik-Realm == "l2tp" || (&Packet-Src-IP-Address == 127.0.0.1 && !&Mikrotik-Realm)) {
+  elsif (&Mikrotik-Realm == "l2tp") {
+   update control {
+    Tmp-String-0 := "%{sql:SELECT p.name || ':' || COALESCE(host(u.static_ip),'') || ':' || COALESCE(p.pool,'') || ':' || p.interim_seconds FROM zradius_l2tp_users u JOIN zradius_ppp_profiles p ON p.id=u.profile_id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled}"
+   }
+   if (&control:Tmp-String-0 =~ /^([A-Za-z0-9_.-]{1,64}):([0-9.]{0,15}):([A-Za-z0-9_.-]{0,64}):([0-9]{2,5})$/) {
+    update reply {
+     Mikrotik-Group := "%{1}"
+     Acct-Interim-Interval := "%{4}"
+    }
+    update control {
+     Tmp-String-1 := "%{2}"
+     Tmp-String-2 := "%{3}"
+    }
+    if (&control:Tmp-String-1 != "") {
+     update reply {
+      Framed-IP-Address := "%{control:Tmp-String-1}"
+     }
+    }
+    elsif (&control:Tmp-String-2 != "") {
+     update reply {
+      Framed-Pool := "%{control:Tmp-String-2}"
+     }
+    }
+    else {
+     reject
+    }
+   }
+   else {
+    reject
+   }
+  }
+  elsif (&Mikrotik-Realm == "pppoe" || (&Packet-Src-IP-Address == 127.0.0.1 && !&Mikrotik-Realm)) {
    # ZRADIUS_POOL_POLICY
    noop
   }

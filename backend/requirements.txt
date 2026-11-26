@@ -5,3 +5,4 @@ cryptography==46.0.5
 alembic==1.16.5
 SQLAlchemy==2.0.44
 argon2-cffi==25.1.0
+pycryptodome==3.23.0

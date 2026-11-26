@@ -34,7 +34,7 @@ jobs:
       - name: Import API and generate OpenAPI
         working-directory: backend
         run: python -c 'from main import app; assert app.openapi()["paths"]'
-      - run: python -m unittest test_ipam test_ipoe test_hotspot test_secret_crypto test_iam test_mfa test_service_tokens
+      - run: python -m unittest test_ipam test_ipoe test_hotspot test_secret_crypto test_iam test_mfa test_service_tokens test_ppp_vpn
         working-directory: backend
       - run: |
           cp .env.example .env
