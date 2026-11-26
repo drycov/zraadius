@@ -1696,6 +1696,7 @@ class PppProfileCreate(BaseModel):
     description:str=Field(default="",max_length=200)
 
 class L2tpAssignment(BaseModel):
+    address_space_id:int|None=Field(default=None,gt=0)
     nas_id:int=Field(gt=0)
     profile_id:int|None=Field(default=None,gt=0)
     group_id:int|None=Field(default=None,gt=0)
@@ -1710,6 +1711,8 @@ def lock_ppp_policy(conn):
     conn.execute("SELECT pg_advisory_xact_lock(7281192214)")
 
 def validate_l2tp_assignment(conn,body,address):
+    if body.address_space_id is not None and not conn.execute('SELECT id FROM zradius_vpn_address_spaces WHERE id=%s',(body.address_space_id,)).fetchone():
+        raise HTTPException(404,'VPN address space not found')
     if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(body.nas_id,)).fetchone():
         raise HTTPException(404,"MikroTik NAS not found")
     if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='l2tp'",(body.nas_id,)).fetchone():
@@ -1749,11 +1752,12 @@ def l2tp_users(limit:int=100,offset:int=0):
     if not 1<=limit<=500 or offset<0:
         raise HTTPException(422,"Invalid pagination")
     with db() as conn:
-        return conn.execute("""SELECT u.id,u.username,u.enabled,u.nas_id,n.shortname AS nas,u.profile_id,u.group_id,g.name AS vpn_group,p.name AS profile,
+        return conn.execute("""SELECT u.id,u.username,u.enabled,u.nas_id,n.shortname AS nas,u.profile_id,u.group_id,u.address_space_id,asp.name AS address_space,g.name AS vpn_group,p.name AS profile,
             CASE WHEN u.profile_id IS NULL THEN 'group' ELSE 'direct' END AS profile_source,
             host(u.static_ip) AS static_ip,p.pool,u.description FROM zradius_l2tp_users u
             JOIN nas n ON n.id=u.nas_id JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id
             LEFT JOIN zradius_vpn_groups g ON g.id=u.group_id
+            LEFT JOIN zradius_vpn_address_spaces asp ON asp.id=u.address_space_id
             ORDER BY u.username LIMIT %s OFFSET %s""",(limit,offset)).fetchall()
 
 @app.post("/api/v1/ppp/l2tp/users",status_code=201,dependencies=[Depends(auth)])
@@ -1767,13 +1771,13 @@ def create_l2tp_user(body:L2tpUserCreate):
         with db() as conn:
             lock_ppp_policy(conn)
             validate_l2tp_assignment(conn,body,address)
-            row=conn.execute("""INSERT INTO zradius_l2tp_users(username,nt_password,password_hash,nas_id,profile_id,group_id,static_ip,description)
-                VALUES (%s,%s,%s,%s,%s,%s,%s::inet,%s) RETURNING id,username,enabled""",
-                (body.username,nt,digest,body.nas_id,body.profile_id,body.group_id,address,body.description)).fetchone()
+            row=conn.execute("""INSERT INTO zradius_l2tp_users(username,nt_password,password_hash,nas_id,profile_id,group_id,address_space_id,static_ip,description)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s::inet,%s) RETURNING id,username,enabled""",
+                (body.username,nt,digest,body.nas_id,body.profile_id,body.group_id,body.address_space_id,address,body.description)).fetchone()
             audit(conn,"ppp.l2tp.create",body.username)
             return row
     except UniqueViolation:
-        raise HTTPException(409,"L2TP username or static IP on NAS already assigned")
+        raise HTTPException(409,"L2TP username or static IP in NAS/address space already assigned")
 
 @app.put("/api/v1/ppp/l2tp/users/{user_id}/state",dependencies=[Depends(auth)])
 def l2tp_user_state(user_id:int,body:UserState):
@@ -1879,11 +1883,39 @@ def update_l2tp_assignment(user_id:int,body:L2tpAssignment):
         with db() as conn:
             lock_ppp_policy(conn)
             validate_l2tp_assignment(conn,body,address)
-            row=conn.execute("""UPDATE zradius_l2tp_users SET nas_id=%s,profile_id=%s,group_id=%s,static_ip=%s::inet,description=%s
+            row=conn.execute("""UPDATE zradius_l2tp_users SET nas_id=%s,profile_id=%s,group_id=%s,address_space_id=%s,static_ip=%s::inet,description=%s
                 WHERE id=%s RETURNING id,username""",(body.nas_id,body.profile_id,body.group_id,address,body.description,user_id)).fetchone()
             if not row:
                 raise HTTPException(404,"L2TP user not found")
             audit(conn,"ppp.l2tp.assignment",row["username"])
             return row
     except UniqueViolation:
-        raise HTTPException(409,"Static IP on NAS already assigned")
+        raise HTTPException(409,"Static IP in NAS/address space already assigned")
+
+
+@app.get("/api/v1/ppp/address-spaces",dependencies=[Depends(auth)])
+def vpn_address_spaces():
+    with db() as conn:
+        return conn.execute("""SELECT s.id,s.name,s.description,
+            (SELECT count(*) FROM zradius_l2tp_users u WHERE u.address_space_id=s.id) AS members
+            FROM zradius_vpn_address_spaces s ORDER BY s.name""").fetchall()
+
+@app.post("/api/v1/ppp/address-spaces",status_code=201,dependencies=[Depends(auth)])
+def create_vpn_address_space(body:DeviceRoleCreate):
+    with db() as conn:
+        lock_ppp_policy(conn)
+        row=conn.execute("INSERT INTO zradius_vpn_address_spaces(name,description) VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING id,name,description",(body.name,body.description)).fetchone()
+        if not row:
+            raise HTTPException(409,"VPN address space exists")
+        audit(conn,"ppp.address_space.create",body.name)
+        return row
+
+@app.get("/api/v1/ppp/address-spaces/conflicts",dependencies=[Depends(auth)])
+def vpn_address_conflicts():
+    # Equal addresses across NAS are candidates for review, not proof of a routing conflict.
+    with db() as conn:
+        return conn.execute("""SELECT host(static_ip) AS static_ip,count(*) AS assignments,
+            array_agg(username ORDER BY username) AS usernames
+            FROM zradius_l2tp_users WHERE static_ip IS NOT NULL
+            GROUP BY static_ip HAVING count(*)>1 AND bool_or(address_space_id IS NULL)
+            ORDER BY static_ip LIMIT 500""").fetchall()
