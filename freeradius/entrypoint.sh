@@ -121,6 +121,15 @@ for f in "$conf/sites-available"/zradius-*-runtime "$conf/mods-available"/zradiu
 done
 unset PGPASSWORD ZRADIUS_SECRET_KEY
 echo 'ZRADIUS: validating configuration'
-freeradius -C
-echo 'ZRADIUS: configuration validation complete'
+# Explicit diagnostic mode only: verbose configuration output can contain secrets.
+if [ "${1:-}" = --check-debug ]; then exec freeradius -XC; fi
+if freeradius -C -l stdout; then
+  echo 'ZRADIUS: configuration validation complete'
+else
+  status=$?
+  printf 'ZRADIUS: configuration validation failed (exit=%s)\n' "$status" >&2
+  echo 'For a local configuration trace, run the radius service with --check-debug; redact all secrets before sharing output.' >&2
+  exit "$status"
+fi
+if [ "${1:-}" = --check-config ]; then exit 0; fi
 exec freeradius -f -l stdout
