@@ -2622,6 +2622,8 @@ def directory_group_sync(profile_id:int,body:DirectoryGroupSync,principal=Depend
         raise HTTPException(409,"Incomplete membership snapshot; no changes applied")
     # Recheck GUID and DN before storing a bounded direct-membership observation.
     again=read_directory_inventory(config,groups=True,object_guid=body.object_guid)
+    if len({result.get("directory_host"),members.get("directory_host"),again.get("directory_host")})!=1:
+        raise HTTPException(409,"Directory controller changed during membership lookup; retry")
     if again["limited"] or again["items"]!=[group]:
         raise HTTPException(409,"Directory group changed; retry")
     guids=sorted({UUID(m["object_guid"]) for m in members["items"]})
