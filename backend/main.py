@@ -2532,6 +2532,64 @@ def read_directory_inventory(config,**kwargs):
     except (ValueError,LDAPException,OSError):
         raise HTTPException(502,"Directory query failed or result exceeded server limits")
 
+class DirectoryIdentitySync(BaseModel):
+    object_guid:UUID
+    preview:bool=True
+    model_config={"extra":"forbid"}
+
+@app.get("/api/v1/identities/directory-profiles/{profile_id}/linked-identities")
+def directory_linked_identities(profile_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        return conn.execute("""SELECT d.object_guid,d.directory_username,d.directory_enabled,
+            i.id AS identity_id,i.username,i.enabled
+            FROM zradius_directory_identities d JOIN zradius_identities i ON i.id=d.identity_id
+            WHERE d.profile_id=%s ORDER BY i.username,i.id LIMIT 1000""",(profile_id,)).fetchall()
+
+@app.post("/api/v1/identities/directory-profiles/{profile_id}/identity-sync")
+def directory_identity_sync(profile_id:int,body:DirectoryIdentitySync,principal=Depends(auth)):
+    personal_admin(principal)
+    config=directory_profile_config(profile_id)
+    result=read_directory_inventory(config,object_guid=body.object_guid)
+    if result["limited"] or len(result["items"])>1:
+        raise HTTPException(409,"Incomplete or ambiguous directory lookup")
+    entry=result["items"][0] if result["items"] else None
+    if entry is not None and entry["object_guid"]!=str(body.object_guid):
+        raise HTTPException(409,"Directory GUID mismatch")
+    with db() as conn:
+        profile=conn.execute("SELECT host,base_dn,bind_dn,bind_secret,enabled FROM zradius_directory_profiles WHERE id=%s FOR UPDATE",(profile_id,)).fetchone()
+        if not profile or not profile["enabled"]:
+            raise HTTPException(409,"Directory profile changed")
+        from directory_crypto import open_bind
+        try:
+            password=open_bind(profile["bind_secret"],profile_id,profile["host"],profile["bind_dn"])
+        except (ValueError,InvalidTag):
+            raise HTTPException(503,"Directory credential unavailable")
+        if any(profile[k]!=config[k] for k in ("host","base_dn","bind_dn")) or password!=config["password"]:
+            raise HTTPException(409,"Directory profile changed; retry")
+        row=conn.execute("""SELECT d.identity_id,d.directory_username,d.directory_enabled,i.username
+            FROM zradius_directory_identities d JOIN zradius_identities i ON i.id=d.identity_id
+            WHERE d.profile_id=%s AND d.object_guid=%s FOR UPDATE OF d""",(profile_id,body.object_guid)).fetchone()
+        if not row:
+            raise HTTPException(404,"Directory identity not linked")
+        if entry is None:
+            return {"preview":body.preview,"status":"not_observed","identity_id":row["identity_id"],
+                    "username":row["username"],"changed":False,"authorization_applied":False}
+        compatible=entry["compatible"]
+        current_name=entry["username"] if compatible else row["directory_username"]
+        current_enabled=entry["directory_enabled"]
+        changed=current_name!=row["directory_username"] or current_enabled!=row["directory_enabled"]
+        response={"preview":body.preview,"status":"observed" if compatible else "incompatible_login",
+                  "identity_id":row["identity_id"],"username":row["username"],
+                  "previous_directory_username":row["directory_username"],"directory_username":entry["username"],
+                  "previous_directory_enabled":row["directory_enabled"],"directory_enabled":current_enabled,
+                  "changed":changed,"authorization_applied":False}
+        if not body.preview and changed:
+            conn.execute("""UPDATE zradius_directory_identities SET directory_username=%s,directory_enabled=%s
+                WHERE identity_id=%s""",(current_name,current_enabled,row["identity_id"]))
+            audit(conn,"directory.identity.sync",str(row["identity_id"]))
+        return response
+
 @app.get("/api/v1/identities/directory-profiles/{profile_id}/groups")
 def directory_groups(profile_id:int,principal=Depends(auth)):
     personal_admin(principal)
