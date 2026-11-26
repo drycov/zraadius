@@ -1,2 +1,30 @@
 # IPAM
-IPv4/IPv6 CIDR pools, optional inclusive range, global overlap exclusion, explicit reservations and first-free allocation. IPv4 network/broadcast are omitted for prefixes shorter than /31; IPv6 subnet-router anycast address omitted for prefixes shorter than /127. IPv6 counts are serialized as decimal strings. No address prepopulation. Per-pool row locks serialize management allocations/releases and database uniqueness prevents duplicates. Pool deletion requires empty inventory. No automatic expiry, VRF support, cross-check with IPoE/static RADIUS/NAS leases or sqlippool integration yet. Use separate address ranges until reconciliation is implemented. An allocation is not an active lease and release does not disconnect a client. IPv6 prefix delegation is not implemented.
+
+Routes `/api/v1/ipam/*`, bounds logic in `ipam.py`. UI: `#/ipam`.
+
+## Purpose
+
+Inventory of IPv4/IPv6 pools, allocations, RADIUS export/activate. **Not** a full DHCPd.
+
+## Pool bounds (`pool_bounds`)
+
+- Strict `ipaddress.ip_network`
+- IPv4 prefix < 31 excludes network/broadcast from usable range
+- IPv6 prefix < 127 excludes network address
+- Multicast / invalid networks rejected
+
+## API
+
+```
+GET/POST   /api/v1/ipam/pools
+DELETE     /api/v1/ipam/pools/{pool_id}
+GET/POST   /api/v1/ipam/pools/{pool_id}/allocations
+DELETE     /api/v1/ipam/pools/{pool_id}/allocations/{allocation_id}
+POST       /api/v1/ipam/pools/{pool_id}/radius-export
+GET        /api/v1/ipam/radius-exports
+DELETE     /api/v1/ipam/pools/{pool_id}/radius-export
+POST       /api/v1/ipam/pools/{pool_id}/radius-activate
+GET        /api/v1/ipam/radius-leases
+```
+
+Without `RADIUS_ENABLE_SQLIPPOOL=true`, pools remain management inventory.

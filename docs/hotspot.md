@@ -1,2 +1,19 @@
-# Experimental Hotspot
-Enable compose.hotspot.yaml alongside compose.yaml. Register MikroTik NAS by packet-source IPv4, assign hotspot service, enable RADIUS_ENABLE_NAS=true, restart radius. Configure Hotspot RADIUS authentication port 18121 and PAP over HTTPS captive portal with a valid certificate. Never enable plaintext HTTP PAP or publish RADIUS on the internet. Vouchers are generated server-side and displayed once. SSHA512 password hashes are stored separately from PPP credentials. Validity starts on issuance; session cap applies to every login, not a cumulative quota. NAS must enforce timeout. Revocation blocks new authentication only. No traffic quota, single-use enforcement, dedicated accounting, QR generation or portal implementation yet. Shared NAS registry still applies to other listeners. Verify installed FreeRADIUS PAP hash decoding and MikroTik compatibility before use. NAS deletion is restricted while vouchers exist.
+# Hotspot / vouchers
+
+Routes `/api/v1/hotspot/vouchers`, generation in `hotspot.py`. UI: `#/hotspot`. Realm: `hotspot`.
+
+## Voucher credentials
+
+- Username: `hs-` + 20 hex chars
+- Password: 32 hex chars
+- RADIUS form: **SSHA2-512-Password** = Base64(SHA512(password||salt)||salt)
+
+## API
+
+```
+POST   /api/v1/hotspot/vouchers
+GET    /api/v1/hotspot/vouchers
+DELETE /api/v1/hotspot/vouchers/{voucher_id}
+```
+
+`compose.hotspot.yaml` is a **deprecated empty stub**; use unified 1812/1813. Captive portal remains on the NAS.

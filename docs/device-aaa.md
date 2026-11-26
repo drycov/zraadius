@@ -1,2 +1,19 @@
-# Experimental Device AAA
-Separate PAP listener UDP 18122. Enable compose.device-aaa.yaml, register actual source IPv4 of MikroTik, assign device-aaa service, enable RADIUS_ENABLE_NAS=true and recreate radius. Create a dedicated device user, save generated password, grant read/write/full on individual NAS. No PPP or hotspot credential lookup. Existing group role mapping is not used. No default administrative privilege. Only accepted login Service-Type values and registered NAS source are allowed. PAP compatibility and SSHA512 decoding require lab validation; never use on untrusted transport. Keep local emergency administrator and restrict firewall/VPN. Logging records valid-format usernames only, never passwords. Revocation affects future logins, not existing sessions. Cisco/Huawei/Juniper, CHAP/MSCHAP, command accounting and management RBAC are not implemented. The shared client registry is not a full service isolation boundary; validate negative tests before production.
+# Device AAA
+
+Routes `/api/v1/device-aaa/*`. UI: `#/device`. RADIUS realm: `device-aaa`.
+
+## Purpose
+
+Separate equipment accounts (not subscriber PPP, not management IAM): roles, users, grants on NAS / NAS-groups, reply profiles, auth log.
+
+## API (summary)
+
+- Roles, users (state, rotate-password)
+- User grants and effective grants
+- Groups, members, grants, nas-group-grants
+- Reply profiles
+- Auth log
+
+Runtime writes `zradius_device_auth_log` as `zradius_runtime`.
+
+Requires registered NAS + realm when external clients are enabled.
