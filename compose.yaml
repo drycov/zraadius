@@ -12,6 +12,18 @@ services:
       interval: 5s
       timeout: 3s
       retries: 15
+  migrate:
+    build: ./backend
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      PGHOST: postgres
+      PGDATABASE: radius
+      PGUSER: radius
+      PGPASSWORD: ${POSTGRES_PASSWORD:?required}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
   radius:
     build: ./freeradius
     environment:
@@ -23,6 +35,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "${RADIUS_BIND_IP:-127.0.0.1}:1812:1812/udp"
       - "${RADIUS_BIND_IP:-127.0.0.1}:1813:1813/udp"
@@ -41,6 +55,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     expose:
       - "8080"
     restart: unless-stopped

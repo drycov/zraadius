@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, SecretStr, IPvAnyAddress
 from typing import Literal
 from psycopg.errors import UniqueViolation
 from coa import send, destination_allowed
+from schema_version import require_schema
 
 ROOT = Path(__file__).parent
 bearer = HTTPBearer(auto_error=False)
@@ -24,7 +25,7 @@ async def lifespan(app):
     if len(token) < 32 or token.startswith("replace_with"):
         raise RuntimeError("Set a random ADMIN_TOKEN of at least 32 characters")
     with db() as conn:
-        conn.execute((ROOT / "schema.sql").read_text())
+        require_schema(conn)
     yield
 
 app = FastAPI(title="ZRADIUS", version="0.1.0-alpha", lifespan=lifespan)
@@ -57,8 +58,8 @@ def live():
 def ready():
     try:
         with db() as conn:
-            conn.execute("SELECT 1")
-    except psycopg.Error:
+            require_schema(conn)
+    except (psycopg.Error, RuntimeError):
         raise HTTPException(503,"Database unavailable")
     return {"status":"ready"}
 
