@@ -1,0 +1,3 @@
+# Directory identity import (66.0.3)
+
+Migration 0029 adds unique profile/objectGUID links. The API rereads AD by binary GUID over verified LDAPS on preview and apply. Only enabled compatible accounts are imported, with global state disabled, no local credentials and no service grants. Exact namespace constraints remain in place; case-insensitive conflict checks are additional preflight checks, not a globally case-insensitive uniqueness guarantee. No existing account is merged. Profile deletion is restricted while links exist. GUID scope is the configured profile, not the forest; do not repurpose a linked profile for another directory. No automatic rename, disable synchronization or external authentication. Build, migration and live AD tests pending.

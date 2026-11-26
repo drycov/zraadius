@@ -2476,6 +2476,52 @@ def test_directory_profile(profile_id:int,principal=Depends(auth)):
         audit(conn,"directory.profile.test",str(profile_id))
     return result
 
+class DirectoryImport(BaseModel):
+    object_guid:UUID
+    preview:bool=True
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/identities/directory-profiles/{profile_id}/import")
+def directory_import(profile_id:int,body:DirectoryImport,principal=Depends(auth)):
+    personal_admin(principal)
+    from directory_ldap import discover
+    from ldap3.core.exceptions import LDAPException
+    config=directory_profile_config(profile_id)
+    try:
+        result=discover(config,object_guid=body.object_guid)
+    except (ValueError,LDAPException,OSError):
+        raise HTTPException(502,"Directory lookup failed")
+    if len(result["items"])!=1 or result["items"][0]["object_guid"]!=str(body.object_guid):
+        raise HTTPException(404,"Unique directory object not found")
+    entry=result["items"][0]
+    if not entry["compatible"] or not entry["directory_enabled"]:
+        raise HTTPException(409,"Directory account disabled or incompatible")
+    username=entry["username"]
+    with db() as conn:
+        profile=conn.execute("SELECT host,base_dn,bind_dn,bind_secret,enabled FROM zradius_directory_profiles WHERE id=%s FOR UPDATE",(profile_id,)).fetchone()
+        if not profile or not profile["enabled"]:
+            raise HTTPException(409,"Directory profile changed")
+        from directory_crypto import open_bind
+        try:
+            current_password=open_bind(profile["bind_secret"],profile_id,profile["host"],profile["bind_dn"])
+        except (ValueError,InvalidTag):
+            raise HTTPException(503,"Directory credential unavailable")
+        if any(profile[k]!=config[k] for k in ("host","base_dn","bind_dn")) or current_password!=config["password"]:
+            raise HTTPException(409,"Directory profile changed; retry")
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",(username,))
+        if conn.execute("SELECT 1 FROM zradius_directory_identities WHERE profile_id=%s AND object_guid=%s",(profile_id,body.object_guid)).fetchone():
+            raise HTTPException(409,"Directory object already linked")
+        for table in ("zradius_identities","radcheck","zradius_device_users","zradius_l2tp_users","zradius_eap_users","zradius_admin_users","zradius_hotspot_vouchers"):
+            if conn.execute("SELECT 1 FROM "+table+" WHERE lower(username)=lower(%s) LIMIT 1",(username,)).fetchone():
+                raise HTTPException(409,"Login conflict; no automatic merge")
+        response={"preview":body.preview,"username":username,"object_guid":str(body.object_guid),"enabled":False}
+        if body.preview:
+            return response
+        row=conn.execute("INSERT INTO zradius_identities(username,full_name,department,enabled) VALUES (%s,%s,%s,false) RETURNING id",(username,entry["full_name"],entry["department"])).fetchone()
+        conn.execute("INSERT INTO zradius_directory_identities(identity_id,profile_id,object_guid,directory_username,directory_enabled) VALUES (%s,%s,%s,%s,true)",(row["id"],profile_id,body.object_guid,username))
+        audit(conn,"directory.identity.import",username)
+        return {**response,"identity_id":row["id"]}
+
 @app.get("/api/v1/identities/directory-preview")
 def directory_preview(profile_id:int|None=None,principal=Depends(auth)):
     personal_admin(principal)
