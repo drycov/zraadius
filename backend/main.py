@@ -749,7 +749,7 @@ def radius_leases(pool_id:int,limit:int=100,offset:int=0):
         raise HTTPException(422,"Invalid pagination")
     with db() as conn:
         return conn.execute("""SELECT r.id,host(r.framedipaddress) AS address,r.username,r.nasipaddress,
-          r.expiry_time,(r.expiry_time>now() AT TIME ZONE 'UTC') AS leased
+          r.expiry_time,r.lease_session,r.lease_started_at,(r.expiry_time>now() AT TIME ZONE 'UTC') AS leased
           FROM radippool r JOIN zradius_ip_pools p ON p.name=r.pool_name
           JOIN zradius_radius_pool_active a ON a.pool_id=p.id WHERE p.id=%s
           ORDER BY r.framedipaddress LIMIT %s OFFSET %s""",(pool_id,limit,offset)).fetchall()

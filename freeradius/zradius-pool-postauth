@@ -11,6 +11,13 @@ post-auth {
   if (!&reply:Framed-IP-Address) {
    reject
   }
+  # Return the generation token; NAS must echo Class in Accounting.
+  update reply {
+   Class := "zradius:%{sql:SELECT lease_token::text FROM radippool WHERE framedipaddress='%{reply:Framed-IP-Address}' AND username='%{SQL-User-Name}' AND nasipaddress='%{NAS-IP-Address}'}"
+  }
+  if (&reply:Class == "zradius:") {
+   reject
+  }
   if (!&reply:Session-Timeout || &reply:Session-Timeout > 3600) {
    update reply {
     Session-Timeout := 3600

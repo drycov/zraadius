@@ -169,3 +169,41 @@ CREATE TABLE IF NOT EXISTS zradius_radius_pool_active (
  pool_id bigint PRIMARY KEY REFERENCES zradius_radius_pool_exports(pool_id) ON DELETE RESTRICT,
  activated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Lease correlation uses an opaque generation token returned in Class.
+ALTER TABLE radippool ADD COLUMN IF NOT EXISTS lease_token uuid;
+ALTER TABLE radippool ADD COLUMN IF NOT EXISTS lease_session text;
+ALTER TABLE radippool ADD COLUMN IF NOT EXISTS lease_started_at timestamptz;
+CREATE UNIQUE INDEX IF NOT EXISTS radippool_lease_token_idx ON radippool(lease_token) WHERE lease_token IS NOT NULL;
+
+CREATE OR REPLACE FUNCTION zradius_accounting_lease() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE token uuid;
+BEGIN
+ -- Never match by username, NAS port or IP alone.
+ IF NEW.class IS NULL OR NEW.class !~ '^zradius:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    OR NEW.framedipaddress IS NULL OR NEW.acctuniqueid IS NULL THEN
+   RETURN NEW;
+ END IF;
+ token := substring(NEW.class from 9)::uuid;
+ IF NEW.acctstoptime IS NOT NULL THEN
+   UPDATE radippool SET expiry_time=LEAST(expiry_time,now() AT TIME ZONE 'UTC'),
+     lease_token=NULL,lease_session=NULL,lease_started_at=NULL
+   WHERE lease_token=token AND framedipaddress=NEW.framedipaddress
+     AND username=NEW.username AND nasipaddress=host(NEW.nasipaddress)
+     AND lease_session=NEW.acctuniqueid
+     AND NEW.acctstoptime>=lease_started_at;
+ ELSE
+   UPDATE radippool SET lease_session=NEW.acctuniqueid
+   WHERE lease_token=token AND framedipaddress=NEW.framedipaddress
+     AND username=NEW.username AND nasipaddress=host(NEW.nasipaddress)
+     AND (lease_session IS NULL OR lease_session=NEW.acctuniqueid)
+     AND NEW.acctstarttime>=lease_started_at
+     AND expiry_time>now() AT TIME ZONE 'UTC';
+ END IF;
+ RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS zradius_accounting_lease_trigger ON radacct;
+CREATE TRIGGER zradius_accounting_lease_trigger AFTER INSERT OR UPDATE ON radacct
+FOR EACH ROW EXECUTE FUNCTION zradius_accounting_lease();
