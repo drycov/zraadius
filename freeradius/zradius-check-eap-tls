@@ -1,0 +1,25 @@
+# Secondary authorization gate; never authorizes without a unique registered serial.
+# Exact fingerprint verification is performed by the TLS verify hook.
+server zradius-check-eap-tls {
+ authorize {
+  if (!&TLS-Client-Cert-Serial || &TLS-Client-Cert-Serial !~ /^[0-9a-fA-F]+$/ || !&Packet-Src-IP-Address) {
+   reject
+  }
+  update control {
+   Tmp-String-0 := "%{sql:SELECT CASE WHEN count(*)=1 THEN max(COALESCE(g.vlan_id,0))::text ELSE 'deny' END FROM zradius_pki_certificates c JOIN zradius_pki_grants g ON g.fingerprint=c.fingerprint JOIN nas n ON n.id=g.nas_id WHERE ltrim(lower(c.serial),'0')=ltrim(lower('%{TLS-Client-Cert-Serial}'),'0') AND c.purpose='client' AND c.revoked_at IS NULL AND c.not_before<=now() AND c.not_after>now() AND n.nasname='%{Packet-Src-IP-Address}' AND EXISTS (SELECT 1 FROM zradius_nas_services s WHERE s.nas_id=n.id AND s.service_code IN ('dot1x','wpa-enterprise'))}"
+  }
+  if (&control:Tmp-String-0 !~ /^[0-9]+$/) {
+   reject
+  }
+  if (&control:Tmp-String-0 != "0") {
+   update reply {
+    Tunnel-Type := VLAN
+    Tunnel-Medium-Type := IEEE-802
+    Tunnel-Private-Group-Id := "%{control:Tmp-String-0}"
+   }
+  }
+  update control {
+   Auth-Type := Accept
+  }
+ }
+}
