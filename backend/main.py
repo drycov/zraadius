@@ -3713,6 +3713,71 @@ def migrate_legacy_identity(body:LegacyIdentityMigration,principal=Depends(auth)
     except UniqueViolation:
         raise HTTPException(409,"Concurrent login or assignment conflict")
 
+
+class LegacyEapMigration(BaseModel):
+    username:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    password:SecretStr|None=Field(default=None,min_length=16,max_length=128)
+    preview:bool=True
+    model_config={"extra":"forbid"}
+
+@app.get("/api/v1/identities/legacy-eap-candidates")
+def legacy_eap_candidates(q:str="",limit:int=100,offset:int=0,principal=Depends(auth)):
+    personal_admin(principal)
+    if not 1<=limit<=101 or offset<0 or len(q)>200:
+        raise HTTPException(422,"Invalid search or pagination")
+    with db() as conn:
+        return conn.execute("SELECT username,enabled,vlan_id FROM zradius_eap_users WHERE strpos(lower(username),lower(%s))>0 ORDER BY username LIMIT %s OFFSET %s",(q.strip(),limit,offset)).fetchall() if q.strip() else conn.execute("SELECT username,enabled,vlan_id FROM zradius_eap_users ORDER BY username LIMIT %s OFFSET %s",(limit,offset)).fetchall()
+
+@app.post("/api/v1/identities/legacy-eap-migrate")
+def migrate_legacy_eap(body:LegacyEapMigration,principal=Depends(auth)):
+    personal_admin(principal)
+    if not body.preview and body.password is None:
+        raise HTTPException(422,"New unified password required")
+    if __import__("re").fullmatch(r"hs-[a-f0-9]{20}",body.username):
+        raise HTTPException(422,"Reserved voucher username")
+    try:
+        with db() as conn:
+            lock_ppp_policy(conn)
+            conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",(body.username,))
+            row=conn.execute("SELECT enabled,vlan_id FROM zradius_eap_users WHERE username=%s FOR UPDATE",(body.username,)).fetchone()
+            if not row:
+                raise HTTPException(404,"Legacy EAP user not found")
+            for table in ("zradius_identities","zradius_device_users","zradius_l2tp_users","radcheck","radreply","radusergroup","zradius_admin_users","zradius_hotspot_vouchers"):
+                if conn.execute("SELECT 1 FROM "+table+" WHERE username=%s LIMIT 1",(body.username,)).fetchone():
+                    raise HTTPException(409,"Conflicting account or attributes in "+table)
+            grants=conn.execute("SELECT nas_id FROM zradius_eap_grants WHERE username=%s ORDER BY nas_id FOR UPDATE",(body.username,)).fetchall()
+            mapped={}
+            for grant in grants:
+                nas_id=grant["nas_id"]
+                conn.execute("SELECT id FROM nas WHERE id=%s FOR UPDATE",(nas_id,))
+                services=conn.execute("SELECT service_code FROM zradius_nas_services WHERE nas_id=%s AND service_code IN ('dot1x','wpa-enterprise')",(nas_id,)).fetchall()
+                if len(services)!=1:
+                    raise HTTPException(409,"NAS must have exactly one EAP service")
+                service=services[0]["service_code"]
+                if service in mapped:
+                    raise HTTPException(409,"Multiple NAS for one EAP service require manual migration")
+                mapped[service]=nas_id
+            if not mapped:
+                raise HTTPException(409,"No explicit EAP NAS grants; manual migration required")
+            result={"preview":body.preview,"username":body.username,"legacy_enabled":row["enabled"],"identity_enabled":False,"assignments":[{"service":service,"nas_id":nas_id,"vlan_id":row["vlan_id"]} for service,nas_id in mapped.items()]}
+            if body.preview:
+                return result
+            nt,digest=ppp_credentials(body.password.get_secret_value())
+            web=hash_password(body.password.get_secret_value())
+            conn.execute("DELETE FROM zradius_eap_users WHERE username=%s",(body.username,))
+            identity=conn.execute("INSERT INTO zradius_identities(username,enabled) VALUES (%s,false) RETURNING id",(body.username,)).fetchone()
+            conn.execute("INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password,web_password_hash) VALUES (%s,%s,%s,%s)",(identity["id"],digest,nt,web))
+            for service,nas_id in mapped.items():
+                set_identity_eap(conn,identity["id"],service,IdentityEapAssignment(nas_id=nas_id,vlan_id=row["vlan_id"]))
+            conn.execute("UPDATE zradius_identity_eap SET enabled=%s WHERE identity_id=%s",(row["enabled"],identity["id"]))
+            audit(conn,"identity.legacy.migrate.eap",body.username)
+            return {**result,"identity_id":identity["id"]}
+    except ValueError:
+        raise HTTPException(422,"Invalid unified password")
+    except UniqueViolation:
+        raise HTTPException(409,"Concurrent login or assignment conflict")
+
 @app.post("/api/v1/identities",status_code=201,dependencies=[Depends(auth)])
 def create_identity(body:IdentityCreate,principal=Depends(auth)):
     if body.account_type=="service" and (body.console_role or not body.account_owner.strip() or not body.account_purpose.strip()):
