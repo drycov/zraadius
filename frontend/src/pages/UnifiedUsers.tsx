@@ -16,6 +16,7 @@ import IdentityAaaPolicy from './IdentityAaaPolicy';
 import IdentityAccessProfile from './IdentityAccessProfile';
 import IdentityReconciliation from './IdentityReconciliation';
 import IdentityPolicyHistory from './IdentityPolicyHistory';
+import PolicyCompliance from './PolicyCompliance';
 import AccessTemplates,{type AccessTemplate} from './AccessTemplates';
 import ServiceAccountRegistry,{IdentityLifecycle} from './ServiceAccountRegistry';
 import IdentityGroups,{IdentityMembership} from './IdentityGroups';
@@ -46,6 +47,7 @@ export default function UnifiedUsers({request}:{request:Request}){
  {id:'templates',label:'Шаблоны доступа',content:<AccessTemplates request={request} refresh={templates.refresh}/>},
  {id:'bulk',label:'Массовое назначение',content:<IdentityBulk request={request} refresh={d.refresh}/>},
  {id:'bulk-profiles',label:'Массовые профили',content:<BulkAccessProfiles request={request} refresh={d.refresh}/>},
+ {id:'policy-compliance',label:'Соответствие политикам',content:<PolicyCompliance request={request}/>},
  {id:'bulk-state',label:'Массовая блокировка',content:<IdentityBulkState request={request} refresh={d.refresh}/>},
  {id:'legacy',label:'Миграция Legacy',content:<IdentityLegacy request={request} refresh={d.refresh}/>},
  {id:'directory',label:'Active Directory',content:<IdentityDirectory request={request}/>},
