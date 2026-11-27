@@ -3070,6 +3070,28 @@ def identity_policy_rule_matches(identity_id:int,service:Literal["device-aaa","l
         return {"identity_id":identity_id,"identity_enabled":identity["enabled"],"identity_expired":identity["expired"],
             "service":service,"nas":nas,"nas_service_configured":configured,**match_rules(rules,service,nas_id)}
 
+@app.get("/api/v1/identities/{identity_id}/policy-decision")
+def identity_policy_decision(identity_id:int,service:Literal["device-aaa","l2tp","pppoe","hotspot","dot1x","wpa-enterprise"],nas_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    from aaa_policy import inspect_identity
+    from policy_matching import match_rules
+    from policy_decision import resolve_decision
+    if nas_id<=0:
+        raise HTTPException(422,"Positive NAS ID required")
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        nas=conn.execute("SELECT id,shortname,type FROM nas WHERE id=%s",(nas_id,)).fetchone()
+        if not nas:
+            raise HTTPException(404,"NAS not found")
+        inspection=inspect_identity(conn,identity_id,nas_id)
+        if not inspection:
+            raise HTTPException(404,"Identity not found")
+        baseline=next(s for s in inspection["services"] if s["service"]==service)
+        configured=bool(conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code=%s",(nas_id,service)).fetchone())
+        matches=match_rules(collect_identity_policy_rules(conn,identity_id),service,nas_id)
+        return {"identity_id":identity_id,"service":service,"nas":nas,"nas_service_configured":configured,
+            "baseline":baseline,"matches":matches,**resolve_decision(baseline,matches,configured)}
+
 class BulkProfileAssignment(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
     template_id:int|None=Field(default=None,gt=0)
