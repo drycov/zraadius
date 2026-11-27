@@ -2474,7 +2474,61 @@ def update_access_template(template_id:int,body:AccessTemplate,principal=Depends
         audit(conn,"identity.template.update",str(template_id))
         return row
 
+def validate_profile_reference(conn,template_id,account_type):
+    row=conn.execute("SELECT id,name,account_type,services,enabled,parameters FROM zradius_access_templates WHERE id=%s FOR SHARE",(template_id,)).fetchone()
+    if not row or not row["enabled"] or row["account_type"]!=account_type:
+        raise HTTPException(409,"Access profile unavailable or incompatible")
+    return row
+
+class ProfileAssignment(BaseModel):
+    template_id:int|None=Field(default=None,gt=0)
+    preview:bool=True
+    model_config={"extra":"forbid"}
+
+def profile_comparison(conn,identity,template):
+    identity_id=identity["id"]
+    rows=conn.execute("""SELECT 'device-aaa' AS service,enabled FROM zradius_device_users WHERE identity_id=%s
+        UNION ALL SELECT 'l2tp',enabled FROM zradius_l2tp_users WHERE identity_id=%s
+        UNION ALL SELECT 'pppoe',enabled FROM zradius_identity_pppoe WHERE identity_id=%s
+        UNION ALL SELECT 'hotspot',enabled FROM zradius_identity_hotspot WHERE identity_id=%s
+        UNION ALL SELECT service_code,enabled FROM zradius_identity_eap WHERE identity_id=%s
+        UNION ALL SELECT 'console',enabled FROM zradius_admin_users WHERE identity_id=%s""",(identity_id,)*6).fetchall()
+    actual={r["service"] for r in rows if r["enabled"]}
+    expected=set(template["services"]) if template else set()
+    return {"identity_id":identity_id,"assigned_template_id":identity["access_template_id"],
+        "template":template,"actual_services":sorted(actual),"expected_services":sorted(expected),
+        "missing_services":sorted(expected-actual) if template else [],
+        "extra_services":sorted(actual-expected) if template else [],
+        "comparison_scope":"enabled_service_flags","runtime_changed":False}
+
+@app.get("/api/v1/identities/{identity_id}/access-profile")
+def get_identity_access_profile(identity_id:int,principal=Depends(auth)):
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        row=conn.execute("SELECT id,account_type,access_template_id FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Identity not found")
+        t=conn.execute("SELECT id,name,account_type,services,enabled,parameters FROM zradius_access_templates WHERE id=%s",(row["access_template_id"],)).fetchone() if row["access_template_id"] else None
+        return profile_comparison(conn,row,t)
+
+@app.put("/api/v1/identities/{identity_id}/access-profile")
+def assign_identity_access_profile(identity_id:int,body:ProfileAssignment,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        row=conn.execute("SELECT id,username,account_type,access_template_id FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Identity not found")
+        template=validate_profile_reference(conn,body.template_id,row["account_type"]) if body.template_id else None
+        result=profile_comparison(conn,row,template)
+        result["preview"]=body.preview
+        if not body.preview:
+            conn.execute("UPDATE zradius_identities SET access_template_id=%s,updated_at=now() WHERE id=%s",(body.template_id,identity_id))
+            audit(conn,"identity.access-profile.assign",row["username"])
+            result["assigned_template_id"]=body.template_id
+        return result
+
 class IdentityCreate(BaseModel):
+    access_template_id:int|None=Field(default=None,gt=0)
     account_type:Literal["person","service"]="person"
     account_owner:str=Field(default="",max_length=200)
     account_purpose:str=Field(default="",max_length=500)
@@ -2934,7 +2988,7 @@ def identities(limit:int=100,offset:int=0,q:str="",enabled:bool|None=None,accoun
     if len(q)>200:
         raise HTTPException(422,"Search query too long")
     with db() as conn:
-        return conn.execute("""SELECT i.id,i.username,i.full_name,i.department,i.enabled,i.account_type,i.account_owner,i.account_purpose,
+        return conn.execute("""SELECT i.id,i.username,i.full_name,i.department,i.enabled,i.account_type,i.account_owner,i.account_purpose,i.access_template_id,
             d.id AS device_id,d.enabled AS device_enabled,v.id AS l2tp_id,v.enabled AS l2tp_enabled,
             (c.identity_id IS NOT NULL) AS credentials_ready,(c.nt_password IS NOT NULL) AS mschap_ready,
             pp.identity_id IS NOT NULL AS pppoe_assigned,pp.enabled AS pppoe_enabled,
@@ -3035,6 +3089,8 @@ def create_identity(body:IdentityCreate,principal=Depends(auth)):
             lock_ppp_policy(conn)
             conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
             conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",(body.username,))
+            if body.access_template_id is not None:
+                validate_profile_reference(conn,body.access_template_id,body.account_type)
             # Never merge or adopt a pre-existing service login by name.
             if conn.execute("""SELECT 1 FROM zradius_device_users WHERE username=%s
                 UNION ALL SELECT 1 FROM zradius_l2tp_users WHERE username=%s
@@ -3043,7 +3099,7 @@ def create_identity(body:IdentityCreate,principal=Depends(auth)):
                 UNION ALL SELECT 1 FROM zradius_admin_users WHERE username=%s
                 UNION ALL SELECT 1 FROM zradius_hotspot_vouchers WHERE username=%s LIMIT 1""",(body.username,)*6).fetchone():
                 raise HTTPException(409,"Existing service login requires explicit migration")
-            row=conn.execute("INSERT INTO zradius_identities(username,full_name,department,account_type,account_owner,account_purpose) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id,username,enabled,account_type",(body.username,body.full_name,body.department,body.account_type,body.account_owner.strip(),body.account_purpose.strip())).fetchone()
+            row=conn.execute("INSERT INTO zradius_identities(username,full_name,department,account_type,account_owner,account_purpose,access_template_id) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id,username,enabled,account_type,access_template_id",(body.username,body.full_name,body.department,body.account_type,body.account_owner.strip(),body.account_purpose.strip(),body.access_template_id)).fetchone()
             conn.execute("INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password,web_password_hash) VALUES (%s,%s,%s,%s)",(row["id"],digest,nt,hash_password(body.password.get_secret_value())))
             if body.device:
                 d=body.device
@@ -3108,9 +3164,11 @@ def update_identity_profile(identity_id:int,body:IdentityProfile,principal=Depen
         raise HTTPException(422,"Control characters are not allowed")
     with db() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
-        row=conn.execute("SELECT id,username,account_expires_at,rotation_interval_days FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+        row=conn.execute("SELECT id,username,account_expires_at,rotation_interval_days,account_type,access_template_id FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
         if not row:
             raise HTTPException(404,"Identity not found")
+        if row["access_template_id"] is not None and row["account_type"]!=body.account_type:
+            raise HTTPException(409,"Detach access profile before changing account type")
         if body.account_type=="person" and (row["account_expires_at"] is not None or row["rotation_interval_days"] is not None):
             raise HTTPException(409,"Clear service lifecycle settings before converting account type")
         if body.account_type=="service" and (conn.execute("SELECT 1 FROM zradius_admin_users WHERE identity_id=%s",(identity_id,)).fetchone() or conn.execute("SELECT 1 FROM zradius_directory_identities WHERE identity_id=%s",(identity_id,)).fetchone()):
