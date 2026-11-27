@@ -1,4 +1,4 @@
-import {useState} from 'react';
+import {useEffect,useState} from 'react';
 import Tabs from '../ui/Tabs';
 import IdentityDirectory from './IdentityDirectory';
 import IdentityAudit from './IdentityAudit';
@@ -30,7 +30,9 @@ type Profile={id:number;name:string};
 export default function UnifiedUsers({request}:{request:Request}){
  const [kind,setKind]=useState('all');const [createKind,setCreateKind]=useState('person');const [offset,setOffset]=useState(0);const [query,setQuery]=useState('');const [search,setSearch]=useState('');const [status,setStatus]=useState('all');const d=useData<Identity[]>(request,'identities?limit=101&offset='+offset+'&q='+encodeURIComponent(search)+(status==='all'?'':'&enabled='+status)+(kind==='all'?'':'&account_type='+kind));const n=useData<Nas[]>(request,'nas');const p=useData<Profile[]>(request,'ppp/profiles');const r=useData<{name:string}[]>(request,'device-aaa/roles');
  const a=useAction(d.refresh);const [form]=Form.useForm();const [editForm]=Form.useForm();const [consoleAccess,setConsoleAccess]=useState(false);const [dot1x,setDot1x]=useState(false);const [wpa,setWpa]=useState(false);const [hotspot,setHotspot]=useState(false);const [pppoe,setPppoe]=useState(false);const [device,setDevice]=useState(false);const [vpn,setVpn]=useState(false);const [editing,setEditing]=useState<Identity>();const [editDevice,setEditDevice]=useState(false);const [editVpn,setEditVpn]=useState(false);
- const [active,setActive]=useState('catalog');
+ const [active,setActive]=useState(()=>sessionStorage.getItem('zr-create-service')?'create':'catalog');
+ const [initialService]=useState(()=>sessionStorage.getItem('zr-create-service')??'');
+ useEffect(()=>{sessionStorage.removeItem('zr-create-service');if(initialService==='device-aaa')setDevice(true);if(initialService==='l2tp')setVpn(true);if(initialService==='console')setConsoleAccess(true);if(initialService==='pppoe')setPppoe(true);},[initialService]);
  const templates=useData<AccessTemplate[]>(request,'identities/access-templates');
  const [templateId,setTemplateId]=useState('manual');
  const applyTemplate=(value:string)=>{setTemplateId(value);const t=templates.data?.find(x=>String(x.id)===value&&x.enabled&&x.account_type===createKind);if(!t)return;const p=t.parameters??{};form.setFieldsValue({device_nas:p.device?.nas_id,device_role:p.device?.role,filter_id:p.device?.filter_id,vpn_nas:p.l2tp?.nas_id,vpn_profile:p.l2tp?.profile_id,pppoe_nas:p.pppoe?.nas_id,pppoe_rate:p.pppoe?.rate_limit,pppoe_pool:p.pppoe?.pool,pppoe_interim:p.pppoe?.interim_seconds,hotspot_nas:p.hotspot?.nas_id,hotspot_rate:p.hotspot?.rate_limit,hotspot_session:p.hotspot?.session_seconds,hotspot_idle:p.hotspot?.idle_seconds,dot1x_nas:p.dot1x?.nas_id,dot1x_vlan:p.dot1x?.vlan_id,'wpa-enterprise_nas':p.wpa_enterprise?.nas_id,'wpa-enterprise_vlan':p.wpa_enterprise?.vlan_id,console_role:p.console_role,static_ip:undefined});const s=t.services;setDevice(s.includes('device-aaa'));setVpn(s.includes('l2tp'));setPppoe(s.includes('pppoe'));setHotspot(s.includes('hotspot'));setDot1x(s.includes('dot1x'));setWpa(s.includes('wpa-enterprise'));setConsoleAccess(createKind==='person'&&s.includes('console'));};
