@@ -5,3 +5,7 @@ Personal administrator only. GET /identities/legacy-candidates lists independent
 ## EAP migration
 
 Dedicated legacy-eap-candidates and legacy-eap-migrate endpoints accept username and use explicit NAS grants. One NAS per EAP service, exclusive service classification, no conflicting legacy attributes, and new password are required. VLAN, username and local enabled state are preserved; central identity is disabled. Multi-NAS same-service and unassigned users require manual review. Generic PPPoE/radcheck migration remains unsupported because arbitrary RADIUS checks/replies/group policies cannot be represented losslessly by the unified PPPoE model.
+
+## Legacy RADIUS assessment
+
+GET /identities/legacy-radius-assessment?username=... is read-only and personal-admin-only. It inventories direct and group attribute names/operators, checks a strict PPPoE parameter subset, never returns credential values, and always sets can_apply=false. NAS scope, CHAP compatibility, pool policy and group precedence require explicit review before any destructive migration.

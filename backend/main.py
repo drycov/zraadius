@@ -3714,6 +3714,39 @@ def migrate_legacy_identity(body:LegacyIdentityMigration,principal=Depends(auth)
         raise HTTPException(409,"Concurrent login or assignment conflict")
 
 
+
+@app.get("/api/v1/identities/legacy-radius-assessment")
+def legacy_radius_assessment(username:str,principal=Depends(auth)):
+    personal_admin(principal)
+    if not 1<=len(username)<=64:
+        raise HTTPException(422,"Invalid username")
+    from legacy_radius import assess
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        checks=conn.execute("SELECT attribute,op,CASE WHEN attribute='Auth-Type' THEN value ELSE NULL END AS value FROM radcheck WHERE username=%s ORDER BY id",(username,)).fetchall()
+        if not checks:
+            raise HTTPException(404,"Legacy RADIUS user not found")
+        replies=conn.execute("SELECT attribute,op,CASE WHEN attribute IN ('Mikrotik-Rate-Limit','Framed-Pool','Acct-Interim-Interval') THEN value ELSE NULL END AS value FROM radreply WHERE username=%s ORDER BY id",(username,)).fetchall()
+        groups=conn.execute("SELECT groupname,priority FROM radusergroup WHERE username=%s ORDER BY priority,groupname",(username,)).fetchall()
+        disabled=bool(conn.execute("SELECT 1 FROM zradius_disabled_users WHERE username=%s",(username,)).fetchone())
+        group_attributes={}
+        for group in groups:
+            name=group["groupname"]
+            group_attributes[name]={table:conn.execute("SELECT attribute,op FROM "+table+" WHERE groupname=%s ORDER BY id",(name,)).fetchall() for table in ("radgroupcheck","radgroupreply")}
+        result=assess(checks,replies,groups,disabled)
+        for table in ("zradius_identities","zradius_device_users","zradius_l2tp_users","zradius_eap_users","zradius_admin_users","zradius_hotspot_vouchers"):
+            if conn.execute("SELECT 1 FROM "+table+" WHERE username=%s LIMIT 1",(username,)).fetchone():
+                result["blockers"].append("Conflicting account in "+table)
+        if not __import__("re").fullmatch(r"[A-Za-z0-9_.-]{1,64}",username) or __import__("re").fullmatch(r"hs-[a-f0-9]{20}",username):
+            result["blockers"].append("Username incompatible with unified namespace")
+        result["attributes_compatible"]=not result["blockers"]
+        if result["blockers"]:
+            result["proposed_parameters"]=None
+        result.update(username=username,groups=groups,group_attributes=group_attributes,
+                      checks=[{"attribute":r["attribute"],"op":r["op"]} for r in checks],
+                      replies=[{"attribute":r["attribute"],"op":r["op"]} for r in replies])
+        return result
+
 class LegacyEapMigration(BaseModel):
     username:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
     password:SecretStr|None=Field(default=None,min_length=16,max_length=128)
