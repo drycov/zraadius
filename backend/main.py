@@ -143,6 +143,7 @@ def create_group(group: Group):
 @app.put("/api/v1/users/{username}/groups/{group}", dependencies=[Depends(auth)])
 def assign_group(username: str, group: str):
     with db() as conn:
+        lock_user(conn,username)
         if not conn.execute("SELECT 1 FROM radcheck WHERE username=%s",(username,)).fetchone() or not conn.execute("SELECT 1 FROM zradius_groups WHERE name=%s",(group,)).fetchone():
             raise HTTPException(404,"User or group not found")
         conn.execute("INSERT INTO radusergroup(username,groupname) VALUES (%s,%s) ON CONFLICT DO NOTHING",(username,group))

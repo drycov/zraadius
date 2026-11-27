@@ -6,4 +6,5 @@ with psycopg.connect() as conn:
     assert not conn.execute("SELECT has_schema_privilege(current_user,'public','CREATE')").fetchone()[0]
     assert not conn.execute("SELECT has_table_privilege(current_user,'radacct','DELETE')").fetchone()[0]
     assert conn.execute("SELECT has_table_privilege(current_user,'radcheck','INSERT')").fetchone()[0]
+    assert conn.execute("SELECT has_table_privilege(current_user,'zradius_policy_attributes','INSERT')").fetchone()[0]
 print("API role checks passed")

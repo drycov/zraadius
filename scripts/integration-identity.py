@@ -37,6 +37,7 @@ def auth(service,secret,expected):
     result=subprocess.run(command,input="\n".join(f"{k} = {v}" for k,v in attrs.items())+"\n",text=True,capture_output=True,timeout=15)
     assert "Received Access-"+expected in result.stdout+result.stderr,(service,expected,result.returncode)
     print("PASS",service,expected,flush=True)
+    return result.stdout+result.stderr
 
 # localhost is the existing CI static client; do not enable dynamic NAS loading here.
 nas=int(sql("INSERT INTO nas(nasname,shortname,type,secret) VALUES ('127.0.0.1','unified-ci','mikrotik','unused-ci-fixture') RETURNING id"))
@@ -66,3 +67,26 @@ auth("hotspot",new,"Reject")
 auth("pppoe",new,"Accept")
 assert api("identities/"+str(identity)+"/sessions")["network"]==[]
 print("PASS unified identity lifecycle")
+
+# Exercise the actual SQL projection and RADIUS reply path, independent of
+# personal-admin login setup. Only synthetic identities in isolated CI.
+policy=int(sql(f"INSERT INTO zradius_policies(name,enabled) VALUES ('{user}-timeouts',true) RETURNING id"))
+sql(f"INSERT INTO zradius_policy_assignments(policy_id,identity_id) VALUES ({policy},{identity})")
+sql(f"""INSERT INTO zradius_policy_attributes(policy_id,service,name,attribute_list,operator,value,priority,runtime_apply)
+ VALUES ({policy},'pppoe','Idle-Timeout','reply',':=','123',100,true),
+ ({policy},'pppoe','Session-Timeout','reply',':=','456',100,true)""")
+import re
+reply=auth("pppoe",new,"Accept")
+assert re.search(r"Idle-Timeout\s*=\s*123\b",reply), "Missing runtime idle timeout"
+assert re.search(r"Session-Timeout\s*=\s*456\b",reply), "Missing runtime session timeout"
+other=int(sql(f"INSERT INTO zradius_policies(name,enabled) VALUES ('{user}-conflict',true) RETURNING id"))
+sql(f"INSERT INTO zradius_policy_assignments(policy_id,identity_id) VALUES ({other},{identity})")
+sql(f"""INSERT INTO zradius_policy_attributes(policy_id,service,name,attribute_list,operator,value,priority,runtime_apply)
+ VALUES ({other},'pppoe','Idle-Timeout','reply',':=','124',100,true)""")
+auth("pppoe",new,"Reject")
+sql(f"UPDATE zradius_policy_attributes SET runtime_apply=false WHERE policy_id={other}")
+auth("pppoe",new,"Accept")
+sql(f"UPDATE zradius_policies SET enabled=false WHERE id={policy}")
+reply=auth("pppoe",new,"Accept")
+assert not re.search(r"Idle-Timeout\s*=\s*123\b",reply), "Disabled policy still applied"
+print("PASS PPPoE runtime attributes and conflict rejection",flush=True)
