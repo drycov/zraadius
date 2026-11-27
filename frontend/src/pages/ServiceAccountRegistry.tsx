@@ -8,6 +8,27 @@ const statusLabels:Record<string,string>={active:'Активна',disabled:'За
 const color=(s:string)=>['active','current'].includes(s)?'green':['expired','overdue','disabled','missing'].includes(s)?'red':['expiring','due_soon'].includes(s)?'orange':undefined;
 const status=(s:string)=><Tag color={color(s)}>{statusLabels[s]??s}</Tag>;
 const date=(s:string|null)=>s?new Date(s).toLocaleString():'—';
+function CredentialRotation({request,initial,refresh}:{request:Request;initial:Lifecycle;refresh:()=>void}){
+ const [password,setPassword]=useState('');const [visible,setVisible]=useState(false);const [confirm,setConfirm]=useState(false);const [error,setError]=useState('');
+ const a=useAction(refresh);
+ const generate=()=>{
+  if(!globalThis.crypto?.getRandomValues){setError('Web Crypto недоступен');return}
+  const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  const bytes=crypto.getRandomValues(new Uint8Array(40));
+  setPassword(Array.from(bytes,b=>alphabet[b&63]).join(''));setConfirm(false);setVisible(false);setError('');
+ };
+ const copy=async()=>{try{await navigator.clipboard.writeText(password);setError('')}catch{setError('Буфер обмена недоступен; используйте показ пароля и сохраните его вручную.')}};
+ const clear=()=>{setPassword('');setVisible(false);setConfirm(false);setError('')};
+ return <Space direction="vertical" className="full">
+ <strong>Ротация единого пароля</strong>
+ <Alert type="warning" message="Новый пароль вступит в силу немедленно для новых запросов. Сохраните его в защищённом хранилище и согласуйте обновление всех интеграций. Активные сессии не разрываются автоматически."/>
+ <label>Новый пароль<input type={visible?'text':'password'} autoComplete="new-password" value={password} minLength={24} maxLength={128} onChange={e=>{setPassword(e.target.value);setConfirm(false)}} disabled={a.busy}/></label>
+ <Space wrap><Button disabled={a.busy} onClick={generate}>Сгенерировать 40 символов</Button><Button disabled={!password||a.busy} onClick={()=>setVisible(v=>!v)}>{visible?'Скрыть':'Показать'}</Button><Button disabled={!password||a.busy} onClick={()=>void copy()}>Копировать пароль</Button><Button disabled={a.busy} onClick={clear}>Очистить</Button></Space>
+ <Fault error={error}/>
+ <label><input type="checkbox" checked={confirm} disabled={a.busy} onChange={e=>setConfirm(e.target.checked)}/> Новый пароль сохранён, обновление интеграций согласовано</label>
+ <Button danger type="primary" loading={a.busy} disabled={!confirm||password.length<24||password.length>128||a.busy} onClick={()=>a.run(()=>request('identities/'+initial.id+'/rotate-credential','POST',{password,expected_updated_at:initial.credential_updated_at,confirm:true}),clear)}>Подтвердить ротацию</Button>
+ </Space>
+}
 function LifecycleEditor({request,initial,refresh}:{request:Request;initial:Lifecycle;refresh:()=>void}){
  const [expires,setExpires]=useState(initial.account_expires_at?new Date(initial.account_expires_at).toISOString().slice(0,16):'');
  const [days,setDays]=useState(initial.rotation_interval_days===null?'':String(initial.rotation_interval_days));
@@ -24,6 +45,7 @@ function LifecycleEditor({request,initial,refresh}:{request:Request;initial:Life
  <span>Последнее обновление реквизитов: {date(initial.credential_updated_at)}</span>
  <span>Следующая ротация: {date(initial.rotation_due_at)}</span>
  <Button type="primary" loading={a.busy} disabled={invalidDays||invalidDate||a.busy} onClick={()=>a.run(()=>request('identities/'+initial.id+'/lifecycle','PUT',{account_expires_at:expires?new Date(expires+'Z').toISOString():null,rotation_interval_days:days?Number(days):null}))}>Сохранить сроки</Button>
+ <CredentialRotation key={initial.id+'-'+initial.credential_updated_at} request={request} initial={initial} refresh={refresh}/>
  </Space>
 }
 export function IdentityLifecycle({request,id,refresh}:{request:Request;id:number;refresh:()=>void}){
