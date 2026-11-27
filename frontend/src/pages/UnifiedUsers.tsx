@@ -76,13 +76,22 @@ function IdentityWorkspace({request,identity,nas,profiles,roles,onSaved}:{reques
  type Rate={nas_id:number;rate_limit:string;pool?:string;interim_seconds?:number;session_seconds?:number;idle_seconds?:number};
  type Eap={nas_id:number;vlan_id:number|null};
  const path='identities/'+identity.id;
- const assignments=useData<{l2tp:Vpn|null}>(request,path+'/assignments');
+ type Grant={nas_id:number;role:string|null;filter_id:string|null;profile_id:number|null};
+ const assignments=useData<{l2tp:Vpn|null;device_grants:Grant[];device_groups:Profile[]}>(request,path+'/assignments');
  const pp=useData<Rate|null>(request,path+'/pppoe');
  const hs=useData<Rate|null>(request,path+'/hotspot');
  const dx=useData<Eap|null>(request,path+'/eap/dot1x');
  const wp=useData<Eap|null>(request,path+'/eap/wpa-enterprise');
  const vpnGroups=useData<Profile[]>(request,'ppp/groups');
  const spaces=useData<Profile[]>(request,'ppp/address-spaces');
+ const replyProfiles=useData<Profile[]>(request,'device-aaa/reply-profiles');
+ const deviceGroups=useData<Profile[]>(request,'device-aaa/groups');
+ const [grants,setGrants]=useState<Grant[]|null>(null);
+ const [members,setMembers]=useState<number[]>([]);
+ const [grantNas,setGrantNas]=useState<number|undefined>();
+ const [grantRole,setGrantRole]=useState('read');
+ const [grantFilter,setGrantFilter]=useState('');
+ const [grantProfile,setGrantProfile]=useState('manual');
  const [editParams,setEditParams]=useState<Record<string,boolean>>({});
  const ready=[assignments,pp,hs,dx,wp,vpnGroups,spaces].every(x=>!x.loading&&!x.error&&x.data!==undefined);
  const beginEdit=(key:string)=>{
@@ -125,6 +134,7 @@ function IdentityWorkspace({request,identity,nas,profiles,roles,onSaved}:{reques
  if(template!==String(identity.access_template_id??'none'))payload.access_profile={template_id:template==='none'?null:Number(template),preview:false};
  if(v.password)payload.password={password:v.password};
  if(changed('device')||changed('l2tp'))payload.services={device:enabled.device,l2tp:enabled.l2tp,device_assignment:enabled.device&&!assigned.device?{nas_id:v.device_nas,role:v.device_role,filter_id:v.filter_id||null}:null,l2tp_assignment:editingParams('l2tp')?{nas_id:v.vpn_nas,profile_id:v.vpn_profile||null,group_id:v.vpn_group||null,address_space_id:v.address_space_id||null,static_ip:v.static_ip||null,description:v.vpn_description??''}:null};
+ if(grants!==null&&assigned.device)payload.device_policy={grants:grants.map(g=>g.profile_id?{nas_id:g.nas_id,profile_id:g.profile_id}:{nas_id:g.nas_id,role:g.role,filter_id:g.filter_id}),group_ids:members};
  if(changed('pppoe'))payload.pppoe={enabled:enabled.pppoe,assignment:editingParams('pppoe')?{nas_id:v.pppoe_nas,rate_limit:v.pppoe_rate,pool:v.pppoe_pool,interim_seconds:v.pppoe_interim??300}:null};
  if(changed('hotspot'))payload.hotspot={enabled:enabled.hotspot,assignment:editingParams('hotspot')?{nas_id:v.hotspot_nas,rate_limit:v.hotspot_rate,session_seconds:v.hotspot_session??3600,idle_seconds:v.hotspot_idle??300}:null};
  for(const key of ['dot1x','wpa_enterprise'] as const){const field=key==='dot1x'?'dot1x':'wpa-enterprise';if(changed(key))payload[key]={enabled:enabled[key],assignment:editingParams(key)?{nas_id:v[field+'_nas'],vlan_id:v[field+'_vlan']||null}:null};}
@@ -141,7 +151,16 @@ function IdentityWorkspace({request,identity,nas,profiles,roles,onSaved}:{reques
  <label>Глобальные группы<Select mode="multiple" disabled={!membership.data||!groupList.data||a.busy} value={groupIds??membership.data?.group_ids??[]} onChange={setGroupIds} options={(groupList.data??[]).map(x=>({value:x.id,label:x.name}))}/></label>
  <label>Профиль доступа<Select value={template} disabled={!templateList.data||a.busy} onChange={v=>setTemplate(String(v))} options={[{value:'none',label:'Без профиля'},...(templateList.data??[]).filter(t=>t.enabled&&t.account_type===kind).map(t=>({value:String(t.id),label:t.name}))]}/></label>
  <Alert type="info" message="Назначение профиля не применяет автоматически сетевые настройки. Для этого используется согласование профиля."/>
- {toggle('device','Device AAA')}{assigned.device&&<Alert type="info" message="Прямые разрешения NAS и группы Device AAA редактируются во вкладке AAA / VPN."/>}
+ {toggle('device','Device AAA')}{assigned.device&&<><Fault error={replyProfiles.error||deviceGroups.error}/>{grants===null?<Button disabled={a.busy||!assignments.data||!replyProfiles.data||!deviceGroups.data} onClick={()=>{setGrants(assignments.data?.device_grants??[]);setMembers(assignments.data?.device_groups.map(g=>g.id)??[])}}>Настроить разрешения NAS и группы</Button>:<Space direction="vertical" className="full">
+ <Alert type="warning" message="Список прямых разрешений и групп заменяется только при общем сохранении. Удаление прямого разрешения не отменяет наследуемый доступ."/>
+ <Table<Grant> rowKey="nas_id" pagination={false} dataSource={grants} columns={[{title:'NAS',render:(_,g)=>nas.find(n=>n.id===g.nas_id)?.shortname??g.nas_id},{title:'Role',dataIndex:'role'},{title:'Filter-Id',dataIndex:'filter_id'},{title:'Reply Profile',render:(_,g)=>replyProfiles.data?.find(p=>p.id===g.profile_id)?.name??'—'},{title:'Действия',render:(_,g)=><Space><Button disabled={a.busy} onClick={()=>{setGrantNas(g.nas_id);setGrantRole(g.role??'read');setGrantFilter(g.filter_id??'');setGrantProfile(String(g.profile_id??'manual'))}}>Изменить</Button><Button danger disabled={a.busy} onClick={()=>setGrants(old=>old?.filter(x=>x.nas_id!==g.nas_id)??null)}>Убрать</Button></Space>}]}/>
+ <label>NAS<Select value={grantNas} onChange={v=>setGrantNas(Number(v))} options={eligible('device-aaa')}/></label>
+ <label>Reply Profile<Select value={grantProfile} onChange={v=>setGrantProfile(String(v))} options={[{value:'manual',label:'Ручные атрибуты'},...(replyProfiles.data??[]).map(p=>({value:String(p.id),label:p.name}))]}/></label>
+ {grantProfile==='manual'&&<><label>RouterOS Role<Select value={grantRole} onChange={v=>setGrantRole(String(v))} options={roles.map(r=>({value:r.name,label:r.name}))}/></label><label>Filter-Id<Input value={grantFilter} maxLength={64} onChange={e=>setGrantFilter(e.target.value)}/></label></>}
+ <Button disabled={a.busy||!grantNas||(grantProfile==='manual'&&!roles.some(r=>r.name===grantRole))} onClick={()=>{if(!grantNas)return;const g:Grant={nas_id:grantNas,role:grantProfile==='manual'?grantRole:null,filter_id:grantProfile==='manual'?grantFilter||null:null,profile_id:grantProfile==='manual'?null:Number(grantProfile)};setGrants(old=>[...(old??[]).filter(x=>x.nas_id!==g.nas_id),g]);setGrantNas(undefined)}}>Добавить / обновить разрешение</Button>
+ <label>Группы Device AAA<Select mode="multiple" value={members} onChange={setMembers} options={(deviceGroups.data??[]).map(g=>({value:g.id,label:g.name}))}/></label>
+ <Button disabled={a.busy} onClick={()=>setGrants(null)}>Отменить редактирование разрешений</Button>
+ </Space>}</>}
  {enabled.device&&!assigned.device&&<><Form.Item name="device_nas" label="Device NAS" rules={[{required:true}]}><Select options={eligible('device-aaa')}/></Form.Item><Form.Item name="device_role" label="RouterOS Role" rules={[{required:true}]}><Select options={roles.map(x=>({value:x.name,label:x.name}))}/></Form.Item><Form.Item name="filter_id" label="Filter-Id"><Input/></Form.Item></>}
  {toggle('l2tp','L2TP VPN')}{editButton('l2tp')}
  {editingParams('l2tp')&&<><Form.Item name="vpn_nas" label="VPN NAS" rules={[{required:true}]}><Select options={eligible('l2tp')}/></Form.Item><Form.Item name="vpn_profile" label="PPP Profile"><Select allowClear options={profiles.map(x=>({value:x.id,label:x.name}))}/></Form.Item><Form.Item name="vpn_group" label="VPN Group"><Select allowClear options={(vpnGroups.data??[]).map(x=>({value:x.id,label:x.name}))}/></Form.Item><Form.Item name="address_space_id" label="Address Space / VRF"><Select allowClear options={(spaces.data??[]).map(x=>({value:x.id,label:x.name}))}/></Form.Item><Form.Item name="static_ip" label="Static IPv4"><Input/></Form.Item><Form.Item name="vpn_description" label="Описание"><Input maxLength={200}/></Form.Item></>}

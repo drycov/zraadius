@@ -4076,36 +4076,39 @@ class IdentityGrantSet(BaseModel):
     grants:list[IdentityDeviceAssignment]=Field(max_length=200)
     group_ids:list[int]=Field(default_factory=list,max_length=200)
 
-@app.put("/api/v1/identities/{identity_id}/device-policy",dependencies=[Depends(auth)])
-def identity_device_policy(identity_id:int,body:IdentityGrantSet):
+def _identity_device_policy(conn,identity_id,body):
     if len({g.nas_id for g in body.grants})!=len(body.grants) or len(set(body.group_ids))!=len(body.group_ids):
         raise HTTPException(422,"Duplicate assignment")
-    with db() as conn:
-        identity=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
-        if not identity:
-            raise HTTPException(404,"Identity not found")
-        user=conn.execute("SELECT id FROM zradius_device_users WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
-        if not user:
+    identity=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not identity:
+        raise HTTPException(404,"Identity not found")
+    user=conn.execute("SELECT id FROM zradius_device_users WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not user:
+        raise HTTPException(409,"Assign Device AAA service first")
+    prepared=[]
+    for grant in sorted(body.grants,key=lambda x:x.nas_id):
+        if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(grant.nas_id,)).fetchone():
+            raise HTTPException(404,"MikroTik NAS not found")
+        if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='device-aaa'",(grant.nas_id,)).fetchone():
             raise HTTPException(409,"Assign Device AAA service first")
-        prepared=[]
-        for grant in sorted(body.grants,key=lambda x:x.nas_id):
-            if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(grant.nas_id,)).fetchone():
-                raise HTTPException(404,"MikroTik NAS not found")
-            if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='device-aaa'",(grant.nas_id,)).fetchone():
-                raise HTTPException(409,"Assign Device AAA service first")
-            role,filter_id,profile_id=resolve_device_grant(conn,grant)
-            prepared.append((user["id"],grant.nas_id,role,filter_id,profile_id))
-        for group_id in sorted(body.group_ids):
-            if not conn.execute("SELECT id FROM zradius_device_user_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone():
-                raise HTTPException(404,"Device group not found")
-        conn.execute("DELETE FROM zradius_device_grants WHERE user_id=%s",(user["id"],))
-        for row in prepared:
-            conn.execute("INSERT INTO zradius_device_grants(user_id,nas_id,role,filter_id,profile_id) VALUES (%s,%s,%s,%s,%s)",row)
-        conn.execute("DELETE FROM zradius_device_user_members WHERE user_id=%s",(user["id"],))
-        for group_id in body.group_ids:
-            conn.execute("INSERT INTO zradius_device_user_members(group_id,user_id) VALUES (%s,%s)",(group_id,user["id"]))
-        audit(conn,"identity.device.policy",identity["username"])
+        role,filter_id,profile_id=resolve_device_grant(conn,grant)
+        prepared.append((user["id"],grant.nas_id,role,filter_id,profile_id))
+    for group_id in sorted(body.group_ids):
+        if not conn.execute("SELECT id FROM zradius_device_user_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone():
+            raise HTTPException(404,"Device group not found")
+    conn.execute("DELETE FROM zradius_device_grants WHERE user_id=%s",(user["id"],))
+    for row in prepared:
+        conn.execute("INSERT INTO zradius_device_grants(user_id,nas_id,role,filter_id,profile_id) VALUES (%s,%s,%s,%s,%s)",row)
+    conn.execute("DELETE FROM zradius_device_user_members WHERE user_id=%s",(user["id"],))
+    for group_id in body.group_ids:
+        conn.execute("INSERT INTO zradius_device_user_members(group_id,user_id) VALUES (%s,%s)",(group_id,user["id"]))
+    audit(conn,"identity.device.policy",identity["username"])
     return {"status":"updated"}
+
+@app.put("/api/v1/identities/{identity_id}/device-policy",dependencies=[Depends(auth)])
+def identity_device_policy(identity_id:int,body:IdentityGrantSet):
+    with db() as conn:
+        return _identity_device_policy(conn,identity_id,body)
 
 @app.put("/api/v1/identities/{identity_id}/vpn-policy",dependencies=[Depends(auth)])
 def identity_vpn_policy(identity_id:int,body:L2tpAssignment):
@@ -4505,6 +4508,7 @@ def revoke_identity_web_sessions(identity_id:int,principal=Depends(auth)):
 
 
 class IdentityWorkspaceUpdate(BaseModel):
+    device_policy: IdentityGrantSet | None = None
     metadata: IdentityMetadata | None = None
     profile: IdentityProfile | None = None
     groups: IdentityGroupMembership | None = None
@@ -4545,6 +4549,8 @@ def update_identity_workspace(identity_id:int,body:IdentityWorkspaceUpdate,princ
                 _update_identity_console(conn,identity_id,body.console,principal)
             if body.services is not None:
                 _identity_services(conn,identity_id,body.services)
+            if body.device_policy is not None:
+                _identity_device_policy(conn,identity_id,body.device_policy)
             if body.pppoe is not None:
                 _update_identity_pppoe(conn,identity_id,body.pppoe)
             if body.hotspot is not None:
