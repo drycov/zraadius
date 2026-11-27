@@ -14,6 +14,7 @@ function LegacyNetworkPolicy({request}:{request:Request}){
 import Tabs from '../ui/Tabs';
 import {PolicyRuleEditor,type Rule} from './CentralizedPolicyRules';
 import AccessTemplates from './AccessTemplates';
+import ReusablePolicies from './ReusablePolicies';
 import PolicyCompliance from './PolicyCompliance';
 type Registry={items:Rule[];next_after_id:number|null};
 type IdentityChoice={id:number;username:string;account_type:'person'|'service'};
@@ -55,5 +56,5 @@ function RegistryView({request}:{request:Request}){
  </Space></Card></Space>
 }
 export default function PolicyPage({request}:{request:Request}){
- return <Tabs label="Единый центр политик" items={[{id:'registry',label:'Правила доступа',content:<RegistryView request={request}/>},{id:'profiles',label:'Профили доступа',content:<AccessTemplates request={request} refresh={()=>{}}/>},{id:'compliance',label:'Соответствие',content:<PolicyCompliance request={request}/>},{id:'legacy',label:'Legacy RADIUS атрибуты',content:<LegacyNetworkPolicy request={request}/>} ]}/>
+ return <Tabs label="Единый центр политик" items={[{id:'catalog',label:'Единый каталог политик',content:<ReusablePolicies request={request}/>},{id:'registry',label:'Прямые правила (совместимость)',content:<RegistryView request={request}/>},{id:'profiles',label:'Профили доступа',content:<AccessTemplates request={request} refresh={()=>{}}/>},{id:'compliance',label:'Соответствие',content:<PolicyCompliance request={request}/>},{id:'legacy',label:'Legacy RADIUS атрибуты',content:<LegacyNetworkPolicy request={request}/>} ]}/>
 }
