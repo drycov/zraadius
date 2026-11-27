@@ -19,9 +19,15 @@ function LegacyGroups({request}:{request:Request}){
  return <Card title="Группы абонентов"><Fault error={d.error}/><Space direction="vertical" className="full"><Form form={create} layout="inline" onFinish={v=>a.run(()=>request('groups','POST',v),()=>create.resetFields())}><Form.Item name="name" label="Название группы" rules={[{required:true}]}><Input placeholder="INTERNET-100M"/></Form.Item><Button type="primary" htmlType="submit" loading={a.busy}>Создать</Button></Form><GroupList items={(d.data??[]).map(x=>({...x,id:x.name}))} loading={d.loading} render={x=><GroupProfile key={x.name} request={request} group={x.name}/>}/></Space></Card>
 }
 
+type InventoryRow={id?:number;name:string;members:number;unified_members:number};
+function MigrationInventory({request}:{request:Request}){
+ const d=useData<{device:InventoryRow[];vpn:InventoryRow[];legacy:InventoryRow[]}>(request,'identities/group-migration-inventory');
+ return <Space direction="vertical" className="full"><Alert type="info" message="Инвентаризация: данные не изменяются. Совпадение логина Legacy не подтверждает принадлежность учётной записи."/><Fault error={d.error}/><Button disabled={d.loading} onClick={d.refresh}>Обновить</Button>{(['device','vpn','legacy'] as const).map(k=><Card key={k} title={k==='device'?'Device AAA':k==='vpn'?'VPN':'Legacy RADIUS'}><Table<InventoryRow> rowKey="name" loading={d.loading} dataSource={d.data?.[k]??[]} columns={[{title:'Группа',dataIndex:'name'},{title:'Участники',dataIndex:'members'},{title:'Связано / совпадает по логину',dataIndex:'unified_members'},{title:'Без связи',render:(_,r)=>r.members-r.unified_members}]}/></Card>)}</Space>
+}
 export default function Groups({request}:{request:Request}){
  return <Tabs label="Единый центр групп" items={[
  {id:'identity-groups',label:'Глобальные группы',content:<IdentityGroups request={request}/>},
+ {id:'inventory',label:'Инвентаризация миграции',content:<MigrationInventory request={request}/>},
  {id:'legacy-groups',label:'Legacy RADIUS группы',content:<><Alert type="warning" message="Совместимость с существующими абонентскими группами. Для новых персональных и сервисных УЗ используйте глобальные группы."/><LegacyGroups request={request}/></>}
  ]}/>
 }
