@@ -72,6 +72,28 @@ export default function UnifiedUsers({request}:{request:Request}){
 }
 function IdentityWorkspace({request,identity,nas,profiles,roles,onSaved}:{request:Request;identity:Identity;nas:Nas[];profiles:Profile[];roles:{name:string}[];onSaved:()=>void}){
  const [form]=Form.useForm();const a=useAction(()=>{});
+ type Vpn={nas_id:number;profile_id:number|null;group_id:number|null;address_space_id:number|null;static_ip:string|null;description:string};
+ type Rate={nas_id:number;rate_limit:string;pool?:string;interim_seconds?:number;session_seconds?:number;idle_seconds?:number};
+ type Eap={nas_id:number;vlan_id:number|null};
+ const path='identities/'+identity.id;
+ const assignments=useData<{l2tp:Vpn|null}>(request,path+'/assignments');
+ const pp=useData<Rate|null>(request,path+'/pppoe');
+ const hs=useData<Rate|null>(request,path+'/hotspot');
+ const dx=useData<Eap|null>(request,path+'/eap/dot1x');
+ const wp=useData<Eap|null>(request,path+'/eap/wpa-enterprise');
+ const vpnGroups=useData<Profile[]>(request,'ppp/groups');
+ const spaces=useData<Profile[]>(request,'ppp/address-spaces');
+ const [editParams,setEditParams]=useState<Record<string,boolean>>({});
+ const ready=[assignments,pp,hs,dx,wp,vpnGroups,spaces].every(x=>!x.loading&&!x.error&&x.data!==undefined);
+ const beginEdit=(key:string)=>{
+  const v=assignments.data?.l2tp,p=pp.data,h=hs.data,d=dx.data,w=wp.data;
+  if(key==='l2tp'&&v)form.setFieldsValue({vpn_nas:v.nas_id,vpn_profile:v.profile_id??undefined,vpn_group:v.group_id??undefined,address_space_id:v.address_space_id??undefined,static_ip:v.static_ip??'',vpn_description:v.description});
+  if(key==='pppoe'&&p)form.setFieldsValue({pppoe_nas:p.nas_id,pppoe_rate:p.rate_limit,pppoe_pool:p.pool,pppoe_interim:p.interim_seconds});
+  if(key==='hotspot'&&h)form.setFieldsValue({hotspot_nas:h.nas_id,hotspot_rate:h.rate_limit,hotspot_session:h.session_seconds,hotspot_idle:h.idle_seconds});
+  if(key==='dot1x'&&d)form.setFieldsValue({dot1x_nas:d.nas_id,dot1x_vlan:d.vlan_id});
+  if(key==='wpa_enterprise'&&w)form.setFieldsValue({'wpa-enterprise_nas':w.nas_id,'wpa-enterprise_vlan':w.vlan_id});
+  setEditParams(old=>({...old,[key]:true}));
+ };
  const initial={device:!!identity.device_enabled,l2tp:!!identity.l2tp_enabled,pppoe:!!identity.pppoe_enabled,hotspot:!!identity.hotspot_enabled,dot1x:!!identity.dot1x_enabled,wpa_enterprise:!!identity.wpa_enabled,console:!!identity.console_enabled};
  type Service=keyof typeof initial;
  const [enabled,setEnabled]=useState(initial);
@@ -89,7 +111,9 @@ function IdentityWorkspace({request,identity,nas,profiles,roles,onSaved}:{reques
  const [template,setTemplate]=useState(String(identity.access_template_id??'none'));
  const eligible=(service:string)=>nas.filter(x=>x.type==='mikrotik'&&x.services?.includes(service)).map(x=>({value:x.id,label:x.shortname}));
  const toggle=(key:Service,label:string)=><Checkbox checked={enabled[key]} disabled={a.busy||(key==='console'&&kind==='service')} onChange={e=>setEnabled(v=>({...v,[key]:e.target.checked}))}>{label}{assigned[key]?' — назначен':''}</Checkbox>;
- const changed=(key:Service)=>enabled[key]!==initial[key];
+ const changed=(key:Service)=>enabled[key]!==initial[key]||(enabled[key]&&!!editParams[key]);
+ const editingParams=(key:Service)=>enabled[key]&&(!assigned[key]||!!editParams[key]);
+ const editButton=(key:Service)=>(enabled[key]&&assigned[key]&&!editParams[key])?<Button disabled={!ready||a.busy} onClick={()=>beginEdit(key)}>Изменить параметры</Button>:null;
  return <Space direction="vertical" className="full">
  <Alert type="info" message="Все изменения сохраняются одной транзакцией. Отключение сохраняет параметры назначения; активные сетевые сессии могут продолжаться."/>
  {!identity.credentials_ready&&<Alert type="warning" message="Для включения сервисов установите единый пароль."/>}
@@ -100,10 +124,10 @@ function IdentityWorkspace({request,identity,nas,profiles,roles,onSaved}:{reques
  if(groupIds!==null)payload.groups={group_ids:groupIds};
  if(template!==String(identity.access_template_id??'none'))payload.access_profile={template_id:template==='none'?null:Number(template),preview:false};
  if(v.password)payload.password={password:v.password};
- if(changed('device')||changed('l2tp'))payload.services={device:enabled.device,l2tp:enabled.l2tp,device_assignment:enabled.device&&!assigned.device?{nas_id:v.device_nas,role:v.device_role,filter_id:v.filter_id||null}:null,l2tp_assignment:enabled.l2tp&&!assigned.l2tp?{nas_id:v.vpn_nas,profile_id:v.vpn_profile,static_ip:v.static_ip||null}:null};
- if(changed('pppoe'))payload.pppoe={enabled:enabled.pppoe,assignment:enabled.pppoe&&!assigned.pppoe?{nas_id:v.pppoe_nas,rate_limit:v.pppoe_rate,pool:v.pppoe_pool,interim_seconds:v.pppoe_interim??300}:null};
- if(changed('hotspot'))payload.hotspot={enabled:enabled.hotspot,assignment:enabled.hotspot&&!assigned.hotspot?{nas_id:v.hotspot_nas,rate_limit:v.hotspot_rate,session_seconds:v.hotspot_session??3600,idle_seconds:v.hotspot_idle??300}:null};
- for(const key of ['dot1x','wpa_enterprise'] as const){const field=key==='dot1x'?'dot1x':'wpa-enterprise';if(changed(key))payload[key]={enabled:enabled[key],assignment:enabled[key]&&!assigned[key]?{nas_id:v[field+'_nas'],vlan_id:v[field+'_vlan']||null}:null};}
+ if(changed('device')||changed('l2tp'))payload.services={device:enabled.device,l2tp:enabled.l2tp,device_assignment:enabled.device&&!assigned.device?{nas_id:v.device_nas,role:v.device_role,filter_id:v.filter_id||null}:null,l2tp_assignment:editingParams('l2tp')?{nas_id:v.vpn_nas,profile_id:v.vpn_profile||null,group_id:v.vpn_group||null,address_space_id:v.address_space_id||null,static_ip:v.static_ip||null,description:v.vpn_description??''}:null};
+ if(changed('pppoe'))payload.pppoe={enabled:enabled.pppoe,assignment:editingParams('pppoe')?{nas_id:v.pppoe_nas,rate_limit:v.pppoe_rate,pool:v.pppoe_pool,interim_seconds:v.pppoe_interim??300}:null};
+ if(changed('hotspot'))payload.hotspot={enabled:enabled.hotspot,assignment:editingParams('hotspot')?{nas_id:v.hotspot_nas,rate_limit:v.hotspot_rate,session_seconds:v.hotspot_session??3600,idle_seconds:v.hotspot_idle??300}:null};
+ for(const key of ['dot1x','wpa_enterprise'] as const){const field=key==='dot1x'?'dot1x':'wpa-enterprise';if(changed(key))payload[key]={enabled:enabled[key],assignment:editingParams(key)?{nas_id:v[field+'_nas'],vlan_id:v[field+'_vlan']||null}:null};}
  if(kind==='person'&&(changed('console')||(enabled.console&&role!==identity.console_role)))payload.console={enabled:enabled.console,role};
  if(!Object.keys(payload).length)return Promise.resolve();
  return request('identities/'+identity.id+'/workspace','PUT',payload);
@@ -113,20 +137,20 @@ function IdentityWorkspace({request,identity,nas,profiles,roles,onSaved}:{reques
  <label>ФИО<Input value={fullName} maxLength={200} onChange={e=>setFullName(e.target.value)}/></label>
  <label>Подразделение<Input value={department} maxLength={200} onChange={e=>setDepartment(e.target.value)}/></label>
  {kind==='service'&&<><label>Ответственный<Input value={owner} maxLength={200} onChange={e=>setOwner(e.target.value)}/></label><label>Назначение<Input value={purpose} maxLength={500} onChange={e=>setPurpose(e.target.value)}/></label></>}
- <Fault error={groupList.error||membership.error||templateList.error}/>
+ <Fault error={groupList.error||membership.error||templateList.error||assignments.error||pp.error||hs.error||dx.error||wp.error||vpnGroups.error||spaces.error}/>
  <label>Глобальные группы<Select mode="multiple" disabled={!membership.data||!groupList.data||a.busy} value={groupIds??membership.data?.group_ids??[]} onChange={setGroupIds} options={(groupList.data??[]).map(x=>({value:x.id,label:x.name}))}/></label>
  <label>Профиль доступа<Select value={template} disabled={!templateList.data||a.busy} onChange={v=>setTemplate(String(v))} options={[{value:'none',label:'Без профиля'},...(templateList.data??[]).filter(t=>t.enabled&&t.account_type===kind).map(t=>({value:String(t.id),label:t.name}))]}/></label>
  <Alert type="info" message="Назначение профиля не применяет автоматически сетевые настройки. Для этого используется согласование профиля."/>
- {toggle('device','Device AAA')}
+ {toggle('device','Device AAA')}{assigned.device&&<Alert type="info" message="Прямые разрешения NAS и группы Device AAA редактируются во вкладке AAA / VPN."/>}
  {enabled.device&&!assigned.device&&<><Form.Item name="device_nas" label="Device NAS" rules={[{required:true}]}><Select options={eligible('device-aaa')}/></Form.Item><Form.Item name="device_role" label="RouterOS Role" rules={[{required:true}]}><Select options={roles.map(x=>({value:x.name,label:x.name}))}/></Form.Item><Form.Item name="filter_id" label="Filter-Id"><Input/></Form.Item></>}
- {toggle('l2tp','L2TP VPN')}
- {enabled.l2tp&&!assigned.l2tp&&<><Form.Item name="vpn_nas" label="VPN NAS" rules={[{required:true}]}><Select options={eligible('l2tp')}/></Form.Item><Form.Item name="vpn_profile" label="PPP Profile" rules={[{required:true}]}><Select options={profiles.map(x=>({value:x.id,label:x.name}))}/></Form.Item><Form.Item name="static_ip" label="Static IPv4"><Input/></Form.Item></>}
- {toggle('pppoe','PPPoE')}{enabled.pppoe&&!assigned.pppoe&&<PppoeFields nas={nas}/>}
- {toggle('hotspot','Hotspot')}{enabled.hotspot&&!assigned.hotspot&&<HotspotFields nas={nas}/>}
- {toggle('dot1x','802.1X')}{enabled.dot1x&&!assigned.dot1x&&<EapFields nas={nas} service="dot1x"/>}
- {toggle('wpa_enterprise','WPA Enterprise')}{enabled.wpa_enterprise&&!assigned.wpa_enterprise&&<EapFields nas={nas} service="wpa-enterprise"/>}
+ {toggle('l2tp','L2TP VPN')}{editButton('l2tp')}
+ {editingParams('l2tp')&&<><Form.Item name="vpn_nas" label="VPN NAS" rules={[{required:true}]}><Select options={eligible('l2tp')}/></Form.Item><Form.Item name="vpn_profile" label="PPP Profile"><Select allowClear options={profiles.map(x=>({value:x.id,label:x.name}))}/></Form.Item><Form.Item name="vpn_group" label="VPN Group"><Select allowClear options={(vpnGroups.data??[]).map(x=>({value:x.id,label:x.name}))}/></Form.Item><Form.Item name="address_space_id" label="Address Space / VRF"><Select allowClear options={(spaces.data??[]).map(x=>({value:x.id,label:x.name}))}/></Form.Item><Form.Item name="static_ip" label="Static IPv4"><Input/></Form.Item><Form.Item name="vpn_description" label="Описание"><Input maxLength={200}/></Form.Item></>}
+ {toggle('pppoe','PPPoE')}{editButton('pppoe')}{editingParams('pppoe')&&<PppoeFields nas={nas}/>}
+ {toggle('hotspot','Hotspot')}{editButton('hotspot')}{editingParams('hotspot')&&<HotspotFields nas={nas}/>}
+ {toggle('dot1x','802.1X')}{editButton('dot1x')}{editingParams('dot1x')&&<EapFields nas={nas} service="dot1x"/>}
+ {toggle('wpa_enterprise','WPA Enterprise')}{editButton('wpa_enterprise')}{editingParams('wpa_enterprise')&&<EapFields nas={nas} service="wpa-enterprise"/>}
  {toggle('console','Web Console')}{enabled.console&&kind==='person'&&<Select value={role} onChange={v=>setRole(String(v))} options={['auditor','operator','admin'].map(x=>({value:x,label:x}))}/>}
  <Form.Item name="password" label="Новый единый пароль (необязательно)" rules={[{min:16,max:128}]}><Input.Password autoComplete="new-password"/></Form.Item>
- <Button type="primary" htmlType="submit" loading={a.busy} disabled={kind==='service'&&(!owner.trim()||!purpose.trim()||enabled.console)}>Сохранить профиль и сервисы</Button>
+ <Button type="primary" htmlType="submit" loading={a.busy} disabled={!ready||(kind==='service'&&(!owner.trim()||!purpose.trim()||enabled.console))}>Сохранить профиль и сервисы</Button>
  </Form></Space>
 }
