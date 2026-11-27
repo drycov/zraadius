@@ -2,10 +2,10 @@ import {useState} from 'react';
 import {Alert,Button,Checkbox,Input,Select,Space,Table,Tag} from '../ui';
 import {useData,Fault} from '../hooks';
 import type {Request,Nas} from '../api';
-type Rule={id:number;service:string|null;nas_id:number|null;effect:'ALLOW'|'DENY';enabled:boolean;reason:string;source?:string;group_name?:string|null};
+export type Rule={identity_id?:number|null;group_id?:number|null;subject_name?:string;subject?:'identity'|'group';id:number;service:string|null;nas_id:number|null;effect:'ALLOW'|'DENY';enabled:boolean;reason:string;source?:string;group_name?:string|null};
 type Rules={items:Rule[]};
 const services=['device-aaa','l2tp','pppoe','hotspot','dot1x','wpa-enterprise'];
-function Editor({request,path,nases,initial,onClose,onSaved}:{request:Request;path:string;nases:Nas[];initial:Rule|null;onClose:()=>void;onSaved:()=>void}){
+export function PolicyRuleEditor({request,path,nases,initial,onClose,onSaved}:{request:Request;path:string;nases:Nas[];initial:Rule|null;onClose:()=>void;onSaved:()=>void}){
  const [service,setService]=useState(initial?.service??'all');
  const [nas,setNas]=useState(String(initial?.nas_id??'all'));
  const [effect,setEffect]=useState<'ALLOW'|'DENY'>(initial?.effect??'DENY');
@@ -44,7 +44,7 @@ export default function CentralizedPolicyRules({request,id,subject='identity'}:{
  return <Space direction="vertical" className="full"><Alert type="warning" message="DENY имеет приоритет над ALLOW. ALLOW не выдаёт доступ без существующего назначения и аутентификации. Применение DENY зависит от версии развёрнутого FreeRADIUS; активные сессии не завершаются автоматически."/><Fault error={d.error||n.error||error}/>
  <Space wrap><Button type="primary" disabled={busy||d.loading||n.loading||editing!==undefined||!!deleting} onClick={()=>setEditing(null)}>Создать правило</Button><Button disabled={busy||editing!==undefined||!!deleting} onClick={()=>{d.refresh();n.refresh()}}>Обновить</Button></Space>
  <Table<Rule> rowKey="id" loading={d.loading} pagination={false} dataSource={d.data?.items??[]} columns={[{title:'ID',dataIndex:'id'},{title:'Effect',render:(_,r)=><Tag color={r.effect==='DENY'?'red':'green'}>{r.effect}</Tag>},{title:'Услуга',render:(_,r)=>r.service??'Все'},{title:'NAS',render:(_,r)=>r.nas_id===null?'Все':n.data?.find(x=>x.id===r.nas_id)?.shortname??('#'+r.nas_id)},{title:'Состояние',render:(_,r)=>r.enabled?'Активно':'Отключено'},{title:'Причина',dataIndex:'reason'},{title:'Действия',render:(_,r)=><Space wrap><Button disabled={busy||editing!==undefined||!!deleting} onClick={()=>setEditing(r)}>Изменить</Button><Button disabled={busy||editing!==undefined||!!deleting} onClick={()=>setDeleting(r)}>Удалить</Button></Space>}]}/>
- {editing!==undefined&&n.data&&<Editor key={editing?.id??'new'} request={request} path={path} nases={n.data} initial={editing} onClose={()=>setEditing(undefined)} onSaved={()=>{setEditing(undefined);d.refresh()}}/>}
+ {editing!==undefined&&n.data&&<PolicyRuleEditor key={editing?.id??'new'} request={request} path={path} nases={n.data} initial={editing} onClose={()=>setEditing(undefined)} onSaved={()=>{setEditing(undefined);d.refresh()}}/>}
  {deleting&&<Space direction="vertical"><Alert type="warning" message={'Удаление правила #'+deleting.id+' может изменить доступ к сети. Подтвердите операцию.'}/><Space wrap><Button type="primary" loading={busy} disabled={busy} onClick={()=>void remove()}>Подтвердить удаление</Button><Button disabled={busy} onClick={()=>setDeleting(undefined)}>Отмена</Button></Space></Space>}
  {subject==='identity'&&<Inherited request={request} id={id}/>}
  </Space>
