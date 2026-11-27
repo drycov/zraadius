@@ -2897,6 +2897,97 @@ def validate_centralized_rule(conn,body):
             raise HTTPException(409,"Selected service is not assigned to NAS")
     return reason
 
+class ReusablePolicyCreate(BaseModel):
+    name:str=Field(min_length=1,max_length=128)
+    description:str=Field(default="",max_length=500)
+    model_config={"extra":"forbid"}
+
+class ReusablePolicyUpdate(ReusablePolicyCreate):
+    enabled:bool
+    expected_revision:int=Field(gt=0)
+    confirm:bool=False
+
+def policy_name(value):
+    value=value.strip()
+    if not value or any(ord(ch)<32 or 127<=ord(ch)<=159 for ch in value):
+        raise HTTPException(422,"Valid policy name required")
+    return value
+
+def lock_reusable_policy(conn,policy_id,expected_revision):
+    row=conn.execute("SELECT * FROM zradius_policies WHERE id=%s FOR UPDATE",(policy_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Policy not found")
+    if row["revision"]!=expected_revision:
+        raise HTTPException(409,"Policy revision changed; reload before editing")
+    return row
+
+@app.get("/api/v1/identities/policy-catalog")
+def reusable_policy_catalog(limit:int=100,after_id:int=0,q:str="",principal=Depends(auth)):
+    personal_admin(principal)
+    q=q.strip()
+    if not 1<=limit<=200 or after_id<0 or len(q)>200:
+        raise HTTPException(422,"Invalid policy filters")
+    with db() as conn:
+        rows=conn.execute("""SELECT p.*,
+            (SELECT count(*) FROM zradius_policy_entries e WHERE e.policy_id=p.id) AS entry_count,
+            (SELECT count(*) FROM zradius_policy_assignments a WHERE a.policy_id=p.id) AS assignment_count
+            FROM zradius_policies p WHERE p.id>%s AND (%s='' OR strpos(lower(p.name),lower(%s))>0)
+            ORDER BY p.id LIMIT %s""",(after_id,q,q,limit+1)).fetchall()
+        return {"items":rows[:limit],"next_after_id":rows[limit-1]["id"] if len(rows)>limit else None,"runtime_enforced":False}
+
+@app.post("/api/v1/identities/policy-catalog",status_code=201)
+def create_reusable_policy(body:ReusablePolicyCreate,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        row=conn.execute("INSERT INTO zradius_policies(name,description) VALUES (%s,%s) RETURNING *",(policy_name(body.name),body.description.strip())).fetchone()
+        audit(conn,"policy.catalog.create",str(row["id"]))
+        return {"policy":row,"runtime_enforced":False}
+
+@app.get("/api/v1/identities/policy-catalog/{policy_id}")
+def get_reusable_policy(policy_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        row=conn.execute("SELECT * FROM zradius_policies WHERE id=%s",(policy_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Policy not found")
+        entries=conn.execute("SELECT * FROM zradius_policy_entries WHERE policy_id=%s ORDER BY id",(policy_id,)).fetchall()
+        count=conn.execute("SELECT count(*) AS n FROM zradius_policy_assignments WHERE policy_id=%s",(policy_id,)).fetchone()["n"]
+        return {"policy":row,"entries":entries,"assignment_count":count,"runtime_enforced":False}
+
+@app.put("/api/v1/identities/policy-catalog/{policy_id}")
+def update_reusable_policy(policy_id:int,body:ReusablePolicyUpdate,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        old=lock_reusable_policy(conn,policy_id,body.expected_revision)
+        if not body.confirm:
+            raise HTTPException(422,"Policy change confirmation required")
+        name=policy_name(body.name)
+        description=body.description.strip()
+        if body.enabled and not conn.execute("SELECT 1 FROM zradius_policy_entries WHERE policy_id=%s AND enabled LIMIT 1",(policy_id,)).fetchone():
+            raise HTTPException(409,"An enabled policy requires an enabled entry")
+        if (old["name"],old["description"],old["enabled"])==(name,description,body.enabled):
+            return {"policy":old,"runtime_enforced":False}
+        row=conn.execute("""UPDATE zradius_policies SET name=%s,description=%s,enabled=%s,revision=revision+1,updated_at=now()
+            WHERE id=%s RETURNING *""",(name,description,body.enabled,policy_id)).fetchone()
+        audit(conn,"policy.catalog.update",str(policy_id)+":revision:"+str(row["revision"]))
+        return {"policy":row,"runtime_enforced":False}
+
+@app.delete("/api/v1/identities/policy-catalog/{policy_id}")
+def delete_reusable_policy(policy_id:int,expected_revision:int,confirm:bool=False,principal=Depends(auth)):
+    personal_admin(principal)
+    if not confirm:
+        raise HTTPException(422,"Policy deletion confirmation required")
+    with db() as conn:
+        row=lock_reusable_policy(conn,policy_id,expected_revision)
+        if row["enabled"]:
+            raise HTTPException(409,"Disable policy before deletion")
+        if conn.execute("SELECT 1 FROM zradius_policy_assignments WHERE policy_id=%s LIMIT 1",(policy_id,)).fetchone():
+            raise HTTPException(409,"Remove policy assignments before deletion")
+        conn.execute("DELETE FROM zradius_policies WHERE id=%s",(policy_id,))
+        audit(conn,"policy.catalog.delete",str(policy_id))
+        return {"status":"deleted","runtime_enforced":False}
+
 def policy_subject(conn,subject,subject_id,lock=False):
     table,column=("zradius_identities","username") if subject=="identity" else ("zradius_identity_groups","name")
     row=conn.execute(f"SELECT {column} AS name FROM {table} WHERE id=%s"+(" FOR UPDATE" if lock else ""),(subject_id,)).fetchone()
