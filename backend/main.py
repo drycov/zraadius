@@ -3051,6 +3051,25 @@ def identity_policy_rule_candidates(identity_id:int,principal=Depends(auth)):
         return {"identity_id":identity_id,"items":rows,"active_count":sum(r["enabled"] for r in rows),
             "resolution":"not_evaluated","runtime_enforced":False}
 
+@app.get("/api/v1/identities/{identity_id}/policy-rule-matches")
+def identity_policy_rule_matches(identity_id:int,service:Literal["device-aaa","l2tp","pppoe","hotspot","dot1x","wpa-enterprise"],nas_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    from policy_matching import match_rules
+    if nas_id<=0:
+        raise HTTPException(422,"Positive NAS ID required")
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        identity=conn.execute("SELECT id,enabled,COALESCE(account_expires_at<=now(),false) AS expired FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone()
+        if not identity:
+            raise HTTPException(404,"Identity not found")
+        nas=conn.execute("SELECT id,shortname,type FROM nas WHERE id=%s",(nas_id,)).fetchone()
+        if not nas:
+            raise HTTPException(404,"NAS not found")
+        configured=bool(conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code=%s",(nas_id,service)).fetchone())
+        rules=collect_identity_policy_rules(conn,identity_id)
+        return {"identity_id":identity_id,"identity_enabled":identity["enabled"],"identity_expired":identity["expired"],
+            "service":service,"nas":nas,"nas_service_configured":configured,**match_rules(rules,service,nas_id)}
+
 class BulkProfileAssignment(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
     template_id:int|None=Field(default=None,gt=0)
