@@ -3854,27 +3854,30 @@ def identity_state(identity_id:int,body:UserState,principal=Depends(auth)):
         audit(conn,"identity.state",row["username"])
         return row
 
-@app.put("/api/v1/identities/{identity_id}/password",dependencies=[Depends(auth)])
-def identity_password(identity_id:int,body:PppPassword,principal=Depends(auth)):
+def _identity_password(conn,identity_id,body,principal):
     try:
         nt,digest=ppp_credentials(body.password.get_secret_value())
     except ValueError:
         raise HTTPException(422,"Invalid password")
+    conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+    account=conn.execute("SELECT id FROM zradius_admin_users WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if account:
+        personal_admin(principal)
+    row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Identity not found")
+    conn.execute("""INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password,web_password_hash) VALUES (%s,%s,%s,%s)
+        ON CONFLICT(identity_id) DO UPDATE SET password_hash=excluded.password_hash,nt_password=excluded.nt_password,web_password_hash=excluded.web_password_hash,updated_at=now()""",(identity_id,digest,nt,hash_password(body.password.get_secret_value())))
+    if account:
+        conn.execute("UPDATE zradius_admin_users SET mfa_pending=NULL,mfa_pending_until=NULL WHERE id=%s",(account["id"],))
+        conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(account["id"],))
+    conn.execute("UPDATE zradius_identities SET updated_at=now() WHERE id=%s",(identity_id,))
+    audit(conn,"identity.password",row["username"])
+
+@app.put("/api/v1/identities/{identity_id}/password",dependencies=[Depends(auth)])
+def identity_password(identity_id:int,body:PppPassword,principal=Depends(auth)):
     with db() as conn:
-        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
-        account=conn.execute("SELECT id FROM zradius_admin_users WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
-        if account:
-            personal_admin(principal)
-        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
-        if not row:
-            raise HTTPException(404,"Identity not found")
-        conn.execute("""INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password,web_password_hash) VALUES (%s,%s,%s,%s)
-            ON CONFLICT(identity_id) DO UPDATE SET password_hash=excluded.password_hash,nt_password=excluded.nt_password,web_password_hash=excluded.web_password_hash,updated_at=now()""",(identity_id,digest,nt,hash_password(body.password.get_secret_value())))
-        if account:
-            conn.execute("UPDATE zradius_admin_users SET mfa_pending=NULL,mfa_pending_until=NULL WHERE id=%s",(account["id"],))
-            conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(account["id"],))
-        conn.execute("UPDATE zradius_identities SET updated_at=now() WHERE id=%s",(identity_id,))
-        audit(conn,"identity.password",row["username"])
+        _identity_password(conn,identity_id,body,principal)
     return {"status":"updated"}
 
 class ServiceCredentialRotation(BaseModel):
@@ -4005,51 +4008,54 @@ def bulk_identity_assign(body:IdentityBulkAssignment):
     except UniqueViolation:
         raise HTTPException(409,"Conflicting login or assignment")
 
+def _identity_services(conn,identity_id,body):
+    lock_ppp_policy(conn)
+    row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Identity not found")
+    creds=conn.execute("SELECT nt_password FROM zradius_identity_credentials WHERE identity_id=%s",(identity_id,)).fetchone()
+    if (body.device or body.l2tp) and not creds:
+        raise HTTPException(409,"Reset unified password first")
+    if body.l2tp and not creds["nt_password"]:
+        raise HTTPException(409,"Reset unified password to enable L2TP")
+    d=conn.execute("SELECT id FROM zradius_device_users WHERE identity_id=%s",(identity_id,)).fetchone()
+    v=conn.execute("SELECT id FROM zradius_l2tp_users WHERE identity_id=%s",(identity_id,)).fetchone()
+    if body.device and (not d or body.device_assignment):
+        a=body.device_assignment
+        if not a:
+            raise HTTPException(422,"Device NAS and role required")
+        if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(a.nas_id,)).fetchone():
+            raise HTTPException(404,"MikroTik NAS not found")
+        if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='device-aaa'",(a.nas_id,)).fetchone():
+            raise HTTPException(409,"Assign Device AAA service first")
+        role,filter_id,profile_id=resolve_device_grant(conn,a)
+        if not d:
+            d=conn.execute("INSERT INTO zradius_device_users(username,identity_id) VALUES (%s,%s) RETURNING id",(row["username"],identity_id)).fetchone()
+        conn.execute("""INSERT INTO zradius_device_grants(user_id,nas_id,role,filter_id,profile_id) VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT(user_id,nas_id) DO UPDATE SET role=excluded.role,filter_id=excluded.filter_id,profile_id=excluded.profile_id""",(d["id"],a.nas_id,role,filter_id,profile_id))
+    if body.l2tp and (not v or body.l2tp_assignment):
+        a=body.l2tp_assignment
+        if not a:
+            raise HTTPException(422,"VPN NAS and PPP profile required")
+        try:
+            address=static_address(a.static_ip)
+        except ValueError:
+            raise HTTPException(422,"Invalid static IPv4")
+        validate_l2tp_assignment(conn,a,address)
+        if not v:
+            conn.execute("""INSERT INTO zradius_l2tp_users(username,identity_id,nas_id,profile_id,group_id,address_space_id,static_ip,description)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::inet,%s)""",(row["username"],identity_id,a.nas_id,a.profile_id,a.group_id,a.address_space_id,address,a.description))
+        else:
+            conn.execute("""UPDATE zradius_l2tp_users SET nas_id=%s,profile_id=%s,group_id=%s,address_space_id=%s,static_ip=%s::inet,description=%s WHERE id=%s""",(a.nas_id,a.profile_id,a.group_id,a.address_space_id,address,a.description,v["id"]))
+    conn.execute("UPDATE zradius_device_users SET enabled=%s WHERE identity_id=%s",(body.device,identity_id))
+    conn.execute("UPDATE zradius_l2tp_users SET enabled=%s WHERE identity_id=%s",(body.l2tp,identity_id))
+    audit(conn,"identity.services",row["username"])
+
 @app.put("/api/v1/identities/{identity_id}/services",dependencies=[Depends(auth)])
 def identity_services(identity_id:int,body:IdentityServices):
     try:
         with db() as conn:
-            lock_ppp_policy(conn)
-            row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
-            if not row:
-                raise HTTPException(404,"Identity not found")
-            creds=conn.execute("SELECT nt_password FROM zradius_identity_credentials WHERE identity_id=%s",(identity_id,)).fetchone()
-            if (body.device or body.l2tp) and not creds:
-                raise HTTPException(409,"Reset unified password first")
-            if body.l2tp and not creds["nt_password"]:
-                raise HTTPException(409,"Reset unified password to enable L2TP")
-            d=conn.execute("SELECT id FROM zradius_device_users WHERE identity_id=%s",(identity_id,)).fetchone()
-            v=conn.execute("SELECT id FROM zradius_l2tp_users WHERE identity_id=%s",(identity_id,)).fetchone()
-            if body.device and (not d or body.device_assignment):
-                a=body.device_assignment
-                if not a:
-                    raise HTTPException(422,"Device NAS and role required")
-                if not conn.execute("SELECT id FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(a.nas_id,)).fetchone():
-                    raise HTTPException(404,"MikroTik NAS not found")
-                if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='device-aaa'",(a.nas_id,)).fetchone():
-                    raise HTTPException(409,"Assign Device AAA service first")
-                role,filter_id,profile_id=resolve_device_grant(conn,a)
-                if not d:
-                    d=conn.execute("INSERT INTO zradius_device_users(username,identity_id) VALUES (%s,%s) RETURNING id",(row["username"],identity_id)).fetchone()
-                conn.execute("""INSERT INTO zradius_device_grants(user_id,nas_id,role,filter_id,profile_id) VALUES (%s,%s,%s,%s,%s)
-                    ON CONFLICT(user_id,nas_id) DO UPDATE SET role=excluded.role,filter_id=excluded.filter_id,profile_id=excluded.profile_id""",(d["id"],a.nas_id,role,filter_id,profile_id))
-            if body.l2tp and (not v or body.l2tp_assignment):
-                a=body.l2tp_assignment
-                if not a:
-                    raise HTTPException(422,"VPN NAS and PPP profile required")
-                try:
-                    address=static_address(a.static_ip)
-                except ValueError:
-                    raise HTTPException(422,"Invalid static IPv4")
-                validate_l2tp_assignment(conn,a,address)
-                if not v:
-                    conn.execute("""INSERT INTO zradius_l2tp_users(username,identity_id,nas_id,profile_id,group_id,address_space_id,static_ip,description)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s::inet,%s)""",(row["username"],identity_id,a.nas_id,a.profile_id,a.group_id,a.address_space_id,address,a.description))
-                else:
-                    conn.execute("""UPDATE zradius_l2tp_users SET nas_id=%s,profile_id=%s,group_id=%s,address_space_id=%s,static_ip=%s::inet,description=%s WHERE id=%s""",(a.nas_id,a.profile_id,a.group_id,a.address_space_id,address,a.description,v["id"]))
-            conn.execute("UPDATE zradius_device_users SET enabled=%s WHERE identity_id=%s",(body.device,identity_id))
-            conn.execute("UPDATE zradius_l2tp_users SET enabled=%s WHERE identity_id=%s",(body.l2tp,identity_id))
-            audit(conn,"identity.services",row["username"])
+            _identity_services(conn,identity_id,body)
         return {"status":"updated"}
     except UniqueViolation:
         raise HTTPException(409,"Existing independent login or static IP conflict")
@@ -4289,20 +4295,23 @@ def identity_pppoe(identity_id:int):
     with db() as conn:
         return conn.execute("SELECT nas_id,rate_limit,pool,interim_seconds,enabled FROM zradius_identity_pppoe WHERE identity_id=%s",(identity_id,)).fetchone()
 
+def _update_identity_pppoe(conn,identity_id,body):
+    row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Identity not found")
+    if body.enabled and not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s",(identity_id,)).fetchone():
+        raise HTTPException(409,"Set unified password first")
+    if body.assignment:
+        set_identity_pppoe(conn,identity_id,body.assignment)
+    changed=conn.execute("UPDATE zradius_identity_pppoe SET enabled=%s WHERE identity_id=%s RETURNING identity_id",(body.enabled,identity_id)).fetchone()
+    if body.enabled and not changed:
+        raise HTTPException(422,"PPPoE assignment required")
+    audit(conn,"identity.pppoe",row["username"])
+
 @app.put("/api/v1/identities/{identity_id}/pppoe",dependencies=[Depends(auth)])
 def update_identity_pppoe(identity_id:int,body:IdentityPppoeUpdate):
     with db() as conn:
-        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
-        if not row:
-            raise HTTPException(404,"Identity not found")
-        if body.enabled and not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s",(identity_id,)).fetchone():
-            raise HTTPException(409,"Set unified password first")
-        if body.assignment:
-            set_identity_pppoe(conn,identity_id,body.assignment)
-        changed=conn.execute("UPDATE zradius_identity_pppoe SET enabled=%s WHERE identity_id=%s RETURNING identity_id",(body.enabled,identity_id)).fetchone()
-        if body.enabled and not changed:
-            raise HTTPException(422,"PPPoE assignment required")
-        audit(conn,"identity.pppoe",row["username"])
+        _update_identity_pppoe(conn,identity_id,body)
     return {"status":"updated"}
 
 
@@ -4315,23 +4324,26 @@ def identity_hotspot(identity_id:int):
     with db() as conn:
         return conn.execute("SELECT nas_id,rate_limit,session_seconds,idle_seconds,enabled FROM zradius_identity_hotspot WHERE identity_id=%s",(identity_id,)).fetchone()
 
+def _update_identity_hotspot(conn,identity_id,body):
+    row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Identity not found")
+    if body.enabled:
+        if __import__('re').fullmatch(r'hs-[a-f0-9]{20}',row["username"]):
+            raise HTTPException(422,"Reserved voucher username")
+        if not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s",(identity_id,)).fetchone():
+            raise HTTPException(409,"Set unified password first")
+    if body.assignment:
+        set_identity_hotspot(conn,identity_id,body.assignment)
+    changed=conn.execute("UPDATE zradius_identity_hotspot SET enabled=%s WHERE identity_id=%s RETURNING identity_id",(body.enabled,identity_id)).fetchone()
+    if body.enabled and not changed:
+        raise HTTPException(422,"Hotspot assignment required")
+    audit(conn,"identity.hotspot",row["username"])
+
 @app.put("/api/v1/identities/{identity_id}/hotspot",dependencies=[Depends(auth)])
 def update_identity_hotspot(identity_id:int,body:IdentityHotspotUpdate):
     with db() as conn:
-        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
-        if not row:
-            raise HTTPException(404,"Identity not found")
-        if body.enabled:
-            if __import__('re').fullmatch(r'hs-[a-f0-9]{20}',row["username"]):
-                raise HTTPException(422,"Reserved voucher username")
-            if not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s",(identity_id,)).fetchone():
-                raise HTTPException(409,"Set unified password first")
-        if body.assignment:
-            set_identity_hotspot(conn,identity_id,body.assignment)
-        changed=conn.execute("UPDATE zradius_identity_hotspot SET enabled=%s WHERE identity_id=%s RETURNING identity_id",(body.enabled,identity_id)).fetchone()
-        if body.enabled and not changed:
-            raise HTTPException(422,"Hotspot assignment required")
-        audit(conn,"identity.hotspot",row["username"])
+        _update_identity_hotspot(conn,identity_id,body)
     return {"status":"updated"}
 
 
@@ -4344,20 +4356,23 @@ def identity_eap(identity_id:int,service:Literal["dot1x","wpa-enterprise"]):
     with db() as conn:
         return conn.execute("SELECT nas_id,vlan_id,enabled FROM zradius_identity_eap WHERE identity_id=%s AND service_code=%s",(identity_id,service)).fetchone()
 
+def _update_identity_eap(conn,identity_id,service,body):
+    row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Identity not found")
+    if body.enabled and not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s AND nt_password IS NOT NULL",(identity_id,)).fetchone():
+        raise HTTPException(409,"Reset unified password first")
+    if body.assignment:
+        set_identity_eap(conn,identity_id,service,body.assignment)
+    changed=conn.execute("UPDATE zradius_identity_eap SET enabled=%s WHERE identity_id=%s AND service_code=%s RETURNING identity_id",(body.enabled,identity_id,service)).fetchone()
+    if body.enabled and not changed:
+        raise HTTPException(422,"EAP assignment required")
+    audit(conn,"identity.eap."+service,row["username"])
+
 @app.put("/api/v1/identities/{identity_id}/eap/{service}",dependencies=[Depends(auth)])
 def update_identity_eap(identity_id:int,service:Literal["dot1x","wpa-enterprise"],body:IdentityEapUpdate):
     with db() as conn:
-        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
-        if not row:
-            raise HTTPException(404,"Identity not found")
-        if body.enabled and not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s AND nt_password IS NOT NULL",(identity_id,)).fetchone():
-            raise HTTPException(409,"Reset unified password first")
-        if body.assignment:
-            set_identity_eap(conn,identity_id,service,body.assignment)
-        changed=conn.execute("UPDATE zradius_identity_eap SET enabled=%s WHERE identity_id=%s AND service_code=%s RETURNING identity_id",(body.enabled,identity_id,service)).fetchone()
-        if body.enabled and not changed:
-            raise HTTPException(422,"EAP assignment required")
-        audit(conn,"identity.eap."+service,row["username"])
+        _update_identity_eap(conn,identity_id,service,body)
     return {"status":"updated"}
 
 
@@ -4370,29 +4385,32 @@ class IdentityConsoleUpdate(BaseModel):
     enabled:bool
     role:Literal["admin","operator","auditor"]="auditor"
 
+def _update_identity_console(conn,identity_id,body,principal):
+    personal_admin(principal)
+    conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+    account=conn.execute("SELECT id,role,enabled FROM zradius_admin_users WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
+    row=conn.execute("SELECT username,enabled,account_type FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Identity not found")
+    if body.enabled and row["account_type"]=="service":
+        raise HTTPException(409,"Service accounts cannot access Web Console")
+    if body.enabled and not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s AND web_password_hash IS NOT NULL",(identity_id,)).fetchone():
+        raise HTTPException(409,"Reset unified password first")
+    if account:
+        if account["enabled"] and account["role"]=="admin" and (not body.enabled or body.role!="admin"):
+            ensure_other_admin(conn,account["id"])
+        conn.execute("UPDATE zradius_admin_users SET enabled=%s,role=%s WHERE id=%s",(body.enabled,body.role,account["id"]))
+        conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(account["id"],))
+    elif body.enabled:
+        if conn.execute("SELECT 1 FROM zradius_admin_users WHERE username=%s",(row["username"],)).fetchone():
+            raise HTTPException(409,"Existing legacy console account requires migration")
+        conn.execute("INSERT INTO zradius_admin_users(username,password_hash,role,identity_id) VALUES (%s,%s,%s,%s)",(row["username"],hash_password(secrets.token_urlsafe(48)),body.role,identity_id))
+    audit(conn,"identity.console",row["username"])
+
 @app.put("/api/v1/identities/{identity_id}/console")
 def update_identity_console(identity_id:int,body:IdentityConsoleUpdate,principal=Depends(auth)):
-    personal_admin(principal)
     with db() as conn:
-        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
-        account=conn.execute("SELECT id,role,enabled FROM zradius_admin_users WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
-        row=conn.execute("SELECT username,enabled,account_type FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
-        if not row:
-            raise HTTPException(404,"Identity not found")
-        if body.enabled and row["account_type"]=="service":
-            raise HTTPException(409,"Service accounts cannot access Web Console")
-        if body.enabled and not conn.execute("SELECT 1 FROM zradius_identity_credentials WHERE identity_id=%s AND web_password_hash IS NOT NULL",(identity_id,)).fetchone():
-            raise HTTPException(409,"Reset unified password first")
-        if account:
-            if account["enabled"] and account["role"]=="admin" and (not body.enabled or body.role!="admin"):
-                ensure_other_admin(conn,account["id"])
-            conn.execute("UPDATE zradius_admin_users SET enabled=%s,role=%s WHERE id=%s",(body.enabled,body.role,account["id"]))
-            conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(account["id"],))
-        elif body.enabled:
-            if conn.execute("SELECT 1 FROM zradius_admin_users WHERE username=%s",(row["username"],)).fetchone():
-                raise HTTPException(409,"Existing legacy console account requires migration")
-            conn.execute("INSERT INTO zradius_admin_users(username,password_hash,role,identity_id) VALUES (%s,%s,%s,%s)",(row["username"],hash_password(secrets.token_urlsafe(48)),body.role,identity_id))
-        audit(conn,"identity.console",row["username"])
+        _update_identity_console(conn,identity_id,body,principal)
     return {"status":"updated"}
 
 
@@ -4497,3 +4515,40 @@ def revoke_identity_web_sessions(identity_id:int,principal=Depends(auth)):
             WHERE s.user_id=u.id AND u.identity_id=%s""",(identity_id,)).rowcount
         audit(conn,"identity.web.sessions.revoke",str(identity_id))
     return {"revoked":count}
+
+
+class IdentityWorkspaceUpdate(BaseModel):
+    password: PppPassword | None = None
+    services: IdentityServices | None = None
+    pppoe: IdentityPppoeUpdate | None = None
+    hotspot: IdentityHotspotUpdate | None = None
+    dot1x: IdentityEapUpdate | None = None
+    wpa_enterprise: IdentityEapUpdate | None = None
+    console: IdentityConsoleUpdate | None = None
+    model_config = {"extra": "forbid"}
+
+@app.put("/api/v1/identities/{identity_id}/workspace")
+def update_identity_workspace(identity_id:int,body:IdentityWorkspaceUpdate,principal=Depends(auth)):
+    personal_admin(principal)
+    try:
+        with db() as conn:
+            lock_ppp_policy(conn)
+            conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+            if not conn.execute("SELECT id FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone():
+                raise HTTPException(404,"Identity not found")
+            if body.password is not None:
+                _identity_password(conn,identity_id,body.password,principal)
+            if body.console is not None:
+                _update_identity_console(conn,identity_id,body.console,principal)
+            if body.services is not None:
+                _identity_services(conn,identity_id,body.services)
+            if body.pppoe is not None:
+                _update_identity_pppoe(conn,identity_id,body.pppoe)
+            if body.hotspot is not None:
+                _update_identity_hotspot(conn,identity_id,body.hotspot)
+            for service,assignment in (("dot1x",body.dot1x),("wpa-enterprise",body.wpa_enterprise)):
+                if assignment is not None:
+                    _update_identity_eap(conn,identity_id,service,assignment)
+        return {"status":"updated"}
+    except UniqueViolation:
+        raise HTTPException(409,"Existing login or static IP conflict")
