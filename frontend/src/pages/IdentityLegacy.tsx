@@ -11,9 +11,9 @@ export default function IdentityLegacy({request,refresh}:{request:Request;refres
  const a=useAction(()=>{});
  const reset=()=>{setPlan(undefined);setResult(undefined);setPassword('')};
  return <Space direction="vertical" className="full">
- <Alert type="warning" message="Перенос одной независимой записи без объединения совпадающих логинов. Новый единый пользователь будет заблокирован до ручного включения. Старый пароль перестанет действовать; активные сетевые сессии могут сохраниться."/>
+ <Alert type="warning" message="Перенос одной независимой записи без объединения совпадающих логинов. Новый единый пользователь будет заблокирован до ручного включения. Старый пароль перестанет действовать; активные сетевые сессии могут сохраниться. При переносе IAM веб-сессии отзываются; последний активный администратор защищён."/>
  <Fault error={d.error}/>
- <Select value={service} disabled={a.busy} options={[{value:'device',label:'Device AAA'},{value:'l2tp',label:'L2TP VPN'}]} onChange={v=>{reset();setService(String(v));setOffset(0)}}/>
+ <Select value={service} disabled={a.busy} options={[{value:'device',label:'Device AAA'},{value:'l2tp',label:'L2TP VPN'},{value:'console',label:'Web Console / IAM'}]} onChange={v=>{reset();setService(String(v));setOffset(0)}}/>
  <Space wrap><Input value={q} maxLength={200} placeholder="Логин" onChange={e=>setQ(e.target.value)}/><Button onClick={()=>{setOffset(0);setSearch(q.trim())}}>Найти</Button></Space>
  {(d.data??[]).slice(0,100).map(user=><Space key={user.id} wrap><span>{user.username} — {user.enabled?'активен':'отключён'}</span><Button disabled={a.busy} onClick={()=>{reset();const payload={service,user_id:user.id};return a.run(async()=>{const res=await request<Result>('identities/legacy-migrate','POST',{...payload,preview:true});setPlan(payload);setResult(res)})}}>Проверить перенос</Button></Space>)}
  <Space wrap><Button disabled={!offset||d.loading} onClick={()=>setOffset(x=>Math.max(0,x-100))}>Назад</Button><Button disabled={d.loading||(d.data?.length??0)<=100} onClick={()=>setOffset(x=>x+100)}>Далее</Button></Space>

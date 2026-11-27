@@ -3553,26 +3553,25 @@ def identities(limit:int=100,offset:int=0,q:str="",enabled:bool|None=None,accoun
             ORDER BY i.username,i.id LIMIT %s OFFSET %s""",(q,q,q,q,enabled,enabled,account_type,account_type,limit,offset)).fetchall()
 
 class LegacyIdentityMigration(BaseModel):
-    service:Literal["device","l2tp"]
+    service:Literal["device","l2tp","console"]
     user_id:int=Field(gt=0)
     password:SecretStr|None=Field(default=None,min_length=16,max_length=128)
     preview:bool=True
     model_config={"extra":"forbid"}
 
 @app.get("/api/v1/identities/legacy-candidates")
-def legacy_identity_candidates(service:Literal["device","l2tp"],q:str="",limit:int=100,offset:int=0,principal=Depends(auth)):
+def legacy_identity_candidates(service:Literal["device","l2tp","console"],q:str="",limit:int=100,offset:int=0,principal=Depends(auth)):
     personal_admin(principal)
     if not 1<=limit<=101 or offset<0 or len(q)>200:
         raise HTTPException(422,"Invalid search or pagination")
-    table={"device":"zradius_device_users","l2tp":"zradius_l2tp_users"}[service]
+    table={"device":"zradius_device_users","l2tp":"zradius_l2tp_users","console":"zradius_admin_users"}[service]
     with db() as conn:
         return conn.execute("SELECT id,username,enabled FROM "+table+" WHERE identity_id IS NULL AND strpos(lower(username),lower(%s))>0 ORDER BY username,id LIMIT %s OFFSET %s",(q.strip(),limit,offset)).fetchall() if q.strip() else conn.execute("SELECT id,username,enabled FROM "+table+" WHERE identity_id IS NULL ORDER BY username,id LIMIT %s OFFSET %s",(limit,offset)).fetchall()
 
 @app.post("/api/v1/identities/legacy-migrate")
 def migrate_legacy_identity(body:LegacyIdentityMigration,principal=Depends(auth)):
     personal_admin(principal)
-    table={"device":"zradius_device_users","l2tp":"zradius_l2tp_users"}[body.service]
-    other={"device":"zradius_l2tp_users","l2tp":"zradius_device_users"}[body.service]
+    table={"device":"zradius_device_users","l2tp":"zradius_l2tp_users","console":"zradius_admin_users"}[body.service]
     if not body.preview and body.password is None:
         raise HTTPException(422,"New unified password required")
     try:
@@ -3589,9 +3588,15 @@ def migrate_legacy_identity(body:LegacyIdentityMigration,principal=Depends(auth)
                 raise HTTPException(409,"Legacy user changed; reload")
             if not __import__('re').fullmatch(r"[A-Za-z0-9_.-]{1,64}",username) or __import__('re').fullmatch(r"hs-[a-f0-9]{20}",username):
                 raise HTTPException(422,"Username incompatible with unified namespace")
-            for conflict in ("zradius_identities",other,"radcheck","zradius_eap_users","zradius_admin_users","zradius_hotspot_vouchers"):
+            for conflict in ("zradius_identities","zradius_device_users","zradius_l2tp_users","radcheck","zradius_eap_users","zradius_admin_users","zradius_hotspot_vouchers"):
+                if conflict==table:
+                    continue
                 if conn.execute("SELECT 1 FROM "+conflict+" WHERE username=%s LIMIT 1",(username,)).fetchone():
                     raise HTTPException(409,"Conflicting account in "+conflict)
+            if body.service=="console":
+                account=conn.execute("SELECT role,enabled FROM zradius_admin_users WHERE id=%s FOR UPDATE",(row["id"],)).fetchone()
+                if account["enabled"] and account["role"]=="admin":
+                    ensure_other_admin(conn,row["id"])
             result={"preview":body.preview,"username":username,"service":body.service,"legacy_enabled":row["enabled"],"identity_enabled":False}
             if body.preview:
                 return result
@@ -3604,8 +3609,12 @@ def migrate_legacy_identity(body:LegacyIdentityMigration,principal=Depends(auth)
             conn.execute("UPDATE "+table+" SET username=%s WHERE id=%s",(temporary,row["id"]))
             identity=conn.execute("INSERT INTO zradius_identities(username,enabled) VALUES (%s,false) RETURNING id",(username,)).fetchone()
             conn.execute("INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password,web_password_hash) VALUES (%s,%s,%s,%s)",(identity["id"],digest,nt,web))
-            extra=",nt_password=NULL" if body.service=="l2tp" else ""
-            conn.execute("UPDATE "+table+" SET username=%s,identity_id=%s,password_hash=NULL"+extra+" WHERE id=%s",(username,identity["id"],row["id"]))
+            if body.service=="console":
+                conn.execute("UPDATE zradius_admin_users SET username=%s,identity_id=%s,password_hash=%s,mfa_pending=NULL,mfa_pending_until=NULL WHERE id=%s",(username,identity["id"],hash_password(secrets.token_urlsafe(48)),row["id"]))
+                conn.execute("DELETE FROM zradius_admin_sessions WHERE user_id=%s",(row["id"],))
+            else:
+                extra=",nt_password=NULL" if body.service=="l2tp" else ""
+                conn.execute("UPDATE "+table+" SET username=%s,identity_id=%s,password_hash=NULL"+extra+" WHERE id=%s",(username,identity["id"],row["id"]))
             audit(conn,"identity.legacy.migrate."+body.service,username)
             return {**result,"identity_id":identity["id"]}
     except ValueError:
