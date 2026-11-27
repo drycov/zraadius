@@ -2665,16 +2665,88 @@ def put_profile_override(identity_id:int,service:Literal["device-aaa","l2tp","pp
         audit(conn,"identity.profile-override."+body.mode.lower(),identity["username"]+":"+service)
         return read_profile_overrides(conn,identity_id)
 
+RECONCILIATION_SUPPORTED={"pppoe","hotspot","dot1x","wpa-enterprise"}
+
+def reconciliation_snapshot(conn,identity_id):
+    import hashlib,json
+    from profile_reconciliation import build_plan
+    effective=resolve_effective_access_profile(conn,identity_id)
+    overrides={r["service"]:{"mode":r["mode"],"reason":r["reason"]} for r in read_profile_overrides(conn,identity_id)}
+    identity=conn.execute("""SELECT i.enabled,COALESCE(i.account_expires_at<=now(),false) AS expired,
+        c.identity_id IS NOT NULL AS credential_ready,c.nt_password IS NOT NULL AS nt_ready
+        FROM zradius_identities i LEFT JOIN zradius_identity_credentials c ON c.identity_id=i.id WHERE i.id=%s""",(identity_id,)).fetchone()
+    plan={"identity_id":identity_id,"source":effective["source"],
+        "effective_template_id":effective["effective_template_id"],**build_plan(effective,overrides)}
+    for op in plan["operations"]:
+        service=op["service"]
+        ready=identity["nt_ready"] if service in ("dot1x","wpa-enterprise") else identity["credential_ready"]
+        op["apply_supported"]=bool(service in RECONCILIATION_SUPPORTED and not op["override"] and
+            op["action"] in ("CREATE","UPDATE") and op["expected_parameters"] is not None and
+            ready and identity["enabled"] and not identity["expired"])
+    # Include disabled assignments and complete configured values, not only drift.
+    actual={}
+    for service,query in {
+        "pppoe":"SELECT nas_id,rate_limit,pool,interim_seconds,enabled FROM zradius_identity_pppoe WHERE identity_id=%s",
+        "hotspot":"SELECT nas_id,rate_limit,session_seconds,idle_seconds,enabled FROM zradius_identity_hotspot WHERE identity_id=%s",
+        "dot1x":"SELECT nas_id,vlan_id,enabled FROM zradius_identity_eap WHERE identity_id=%s AND service_code='dot1x'",
+        "wpa-enterprise":"SELECT nas_id,vlan_id,enabled FROM zradius_identity_eap WHERE identity_id=%s AND service_code='wpa-enterprise'"
+    }.items():
+        actual[service]=conn.execute(query,(identity_id,)).fetchone()
+    plan["revision"]=hashlib.sha256(json.dumps({"plan":plan,"actual":actual,"identity":identity,"effective":effective,"overrides":overrides},sort_keys=True,separators=(",",":"),default=str).encode()).hexdigest()
+    return plan
+
 @app.get("/api/v1/identities/{identity_id}/profile-reconciliation")
 def get_profile_reconciliation(identity_id:int,principal=Depends(auth)):
     personal_admin(principal)
-    from profile_reconciliation import build_plan
     with db() as conn:
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        effective=resolve_effective_access_profile(conn,identity_id)
-        overrides={r["service"]:{"mode":r["mode"],"reason":r["reason"]} for r in read_profile_overrides(conn,identity_id)}
-        return {"identity_id":identity_id,"source":effective["source"],
-            "effective_template_id":effective["effective_template_id"],**build_plan(effective,overrides)}
+        return reconciliation_snapshot(conn,identity_id)
+
+class ReconciliationApply(BaseModel):
+    revision:str=Field(pattern=r"^[a-f0-9]{64}$")
+    services:list[Literal["pppoe","hotspot","dot1x","wpa-enterprise"]]=Field(min_length=1,max_length=4)
+    confirm:bool=False
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/identities/{identity_id}/profile-reconciliation/apply")
+def apply_profile_reconciliation(identity_id:int,body:ReconciliationApply,principal=Depends(auth)):
+    personal_admin(principal)
+    if not body.confirm or len(set(body.services))!=len(body.services):
+        raise HTTPException(422,"Explicit confirmation and unique services required")
+    from psycopg.errors import SerializationFailure,DeadlockDetected
+    try:
+        with db() as conn:
+            conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+            row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+            if not row:
+                raise HTTPException(404,"Identity not found")
+            # Prevent concurrent edits of the profile inputs during this short operation.
+            conn.execute("LOCK TABLE zradius_access_templates,zradius_identity_groups,zradius_identity_group_members,zradius_profile_overrides IN SHARE MODE")
+            plan=reconciliation_snapshot(conn,identity_id)
+            if plan["revision"]!=body.revision:
+                raise HTTPException(409,"Reconciliation preview changed; recalculate")
+            operations={o["service"]:o for o in plan["operations"]}
+            for service in body.services:
+                if service not in operations or not operations[service]["apply_supported"]:
+                    raise HTTPException(409,"Operation unavailable: "+service)
+            for service in sorted(body.services):
+                params=operations[service]["expected_parameters"]
+                if service=="pppoe":
+                    set_identity_pppoe(conn,identity_id,IdentityPppoeAssignment(**params))
+                    conn.execute("UPDATE zradius_identity_pppoe SET enabled=true WHERE identity_id=%s",(identity_id,))
+                elif service=="hotspot":
+                    if __import__("re").fullmatch(r"hs-[a-f0-9]{20}",row["username"]):
+                        raise HTTPException(422,"Reserved voucher username")
+                    set_identity_hotspot(conn,identity_id,IdentityHotspotAssignment(**params))
+                    conn.execute("UPDATE zradius_identity_hotspot SET enabled=true WHERE identity_id=%s",(identity_id,))
+                else:
+                    set_identity_eap(conn,identity_id,service,IdentityEapAssignment(**params))
+                    conn.execute("UPDATE zradius_identity_eap SET enabled=true WHERE identity_id=%s AND service_code=%s",(identity_id,service))
+                audit(conn,"identity.profile-reconciliation.apply."+service,row["username"])
+            return {"status":"applied","services":sorted(body.services),"runtime_changed":True,"network_disconnected":False}
+    except (SerializationFailure,DeadlockDetected):
+        raise HTTPException(409,"Concurrent configuration change; recalculate preview")
 
 class BulkProfileAssignment(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
