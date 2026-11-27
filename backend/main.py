@@ -2914,6 +2914,74 @@ def policy_compliance_summary(q:str="",account_type:Literal["person","service"]|
     except QueryCanceled:
         raise HTTPException(503,"Compliance aggregation exceeded query timeout")
 
+class CentralizedPolicyRule(BaseModel):
+    service:Literal["device-aaa","l2tp","pppoe","hotspot","dot1x","wpa-enterprise"]|None=None
+    nas_id:int|None=Field(default=None,gt=0)
+    effect:Literal["ALLOW","DENY"]
+    enabled:bool=True
+    reason:str=Field(min_length=1,max_length=500)
+    model_config={"extra":"forbid"}
+
+def validate_centralized_rule(conn,body):
+    reason=body.reason.strip()
+    if not reason or any(ord(ch)<32 or 127<=ord(ch)<=159 for ch in reason):
+        raise HTTPException(422,"A valid policy reason is required")
+    if body.nas_id is not None:
+        if not conn.execute("SELECT id FROM nas WHERE id=%s FOR KEY SHARE",(body.nas_id,)).fetchone():
+            raise HTTPException(404,"NAS not found")
+        if body.service and not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code=%s",(body.nas_id,body.service)).fetchone():
+            raise HTTPException(409,"Selected service is not assigned to NAS")
+    return reason
+
+def lock_policy_identity(conn,identity_id):
+    row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Identity not found")
+    return row["username"]
+
+@app.get("/api/v1/identities/{identity_id}/policy-rules")
+def list_identity_policy_rules(identity_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        if not conn.execute("SELECT id FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone():
+            raise HTTPException(404,"Identity not found")
+        return {"items":conn.execute("SELECT * FROM zradius_policy_rules WHERE identity_id=%s ORDER BY id",(identity_id,)).fetchall(),"runtime_enforced":False}
+
+@app.post("/api/v1/identities/{identity_id}/policy-rules",status_code=201)
+def create_identity_policy_rule(identity_id:int,body:CentralizedPolicyRule,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        username=lock_policy_identity(conn,identity_id)
+        reason=validate_centralized_rule(conn,body)
+        row=conn.execute("""INSERT INTO zradius_policy_rules(identity_id,service,nas_id,effect,enabled,reason)
+            VALUES (%s,%s,%s,%s,%s,%s) RETURNING *""",(identity_id,body.service,body.nas_id,body.effect,body.enabled,reason)).fetchone()
+        audit(conn,"identity.policy-rule.create",username+":"+str(row["id"]))
+        return {"rule":row,"runtime_enforced":False}
+
+@app.put("/api/v1/identities/{identity_id}/policy-rules/{rule_id}")
+def update_identity_policy_rule(identity_id:int,rule_id:int,body:CentralizedPolicyRule,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        username=lock_policy_identity(conn,identity_id)
+        reason=validate_centralized_rule(conn,body)
+        row=conn.execute("""UPDATE zradius_policy_rules SET service=%s,nas_id=%s,effect=%s,enabled=%s,reason=%s,updated_at=now()
+            WHERE id=%s AND identity_id=%s RETURNING *""",(body.service,body.nas_id,body.effect,body.enabled,reason,rule_id,identity_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"Policy rule not found")
+        audit(conn,"identity.policy-rule.update",username+":"+str(rule_id))
+        return {"rule":row,"runtime_enforced":False}
+
+@app.delete("/api/v1/identities/{identity_id}/policy-rules/{rule_id}")
+def delete_identity_policy_rule(identity_id:int,rule_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        username=lock_policy_identity(conn,identity_id)
+        row=conn.execute("DELETE FROM zradius_policy_rules WHERE id=%s AND identity_id=%s RETURNING id",(rule_id,identity_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"Policy rule not found")
+        audit(conn,"identity.policy-rule.delete",username+":"+str(rule_id))
+        return {"status":"deleted","runtime_enforced":False}
+
 class BulkProfileAssignment(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
     template_id:int|None=Field(default=None,gt=0)
