@@ -2636,7 +2636,7 @@ def put_profile_override(identity_id:int,service:Literal["device-aaa","l2tp","pp
         audit(conn,"identity.profile-override."+body.mode.lower(),identity["username"]+":"+service)
         return read_profile_overrides(conn,identity_id)
 
-RECONCILIATION_SUPPORTED={"pppoe","hotspot","dot1x","wpa-enterprise"}
+RECONCILIATION_SUPPORTED={"pppoe","hotspot","dot1x","wpa-enterprise","device-aaa","l2tp","console"}
 
 def reconciliation_assignments(conn,identity_id):
     # Include disabled assignments and complete configured values, not only drift.
@@ -2648,7 +2648,57 @@ def reconciliation_assignments(conn,identity_id):
         "wpa-enterprise":"SELECT nas_id,vlan_id,enabled FROM zradius_identity_eap WHERE identity_id=%s AND service_code='wpa-enterprise'"
     }.items():
         actual[service]=conn.execute(query,(identity_id,)).fetchone()
+    device=conn.execute("SELECT id,enabled FROM zradius_device_users WHERE identity_id=%s",(identity_id,)).fetchone()
+    actual["device-aaa"]={"enabled":device["enabled"],"grants":conn.execute("SELECT nas_id,role,filter_id,profile_id FROM zradius_device_grants WHERE user_id=%s ORDER BY nas_id",(device["id"],)).fetchall()} if device else None
+    actual["l2tp"]=conn.execute("SELECT nas_id,profile_id,group_id,address_space_id,host(static_ip) AS static_ip,description,enabled FROM zradius_l2tp_users WHERE identity_id=%s",(identity_id,)).fetchone()
+    actual["console"]=conn.execute("SELECT role,enabled FROM zradius_admin_users WHERE identity_id=%s",(identity_id,)).fetchone()
     return actual
+
+def apply_existing_service_profile(conn,identity_id,service,params,principal,restore=None):
+    # Existing accounts only: do not create or remove service identities or unrelated grants.
+    current=reconciliation_assignments(conn,identity_id)[service]
+    if current is None:
+        raise HTTPException(409,"Create service assignment explicitly first")
+    if service=="device-aaa":
+        user=conn.execute("SELECT id FROM zradius_device_users WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if restore is not None:
+            previous={g["nas_id"]:g for g in restore["grants"]}
+            now={g["nas_id"]:g for g in current["grants"]}
+            for nas_id in sorted(set(previous)|set(now)):
+                if previous.get(nas_id)==now.get(nas_id):
+                    continue
+                g=previous.get(nas_id)
+                if g is None:
+                    conn.execute("DELETE FROM zradius_device_grants WHERE user_id=%s AND nas_id=%s",(user["id"],nas_id))
+                    continue
+                assignment=IdentityDeviceAssignment(nas_id=nas_id,profile_id=g["profile_id"],role=None if g["profile_id"] else g["role"],filter_id=None if g["profile_id"] else g["filter_id"])
+                role,filter_id,profile_id=resolve_device_grant(conn,assignment)
+                if (role,filter_id,profile_id)!=(g["role"],g["filter_id"],g["profile_id"]):
+                    raise HTTPException(409,"Device reply profile changed")
+                conn.execute("""INSERT INTO zradius_device_grants(user_id,nas_id,role,filter_id,profile_id) VALUES (%s,%s,%s,%s,%s)
+                    ON CONFLICT(user_id,nas_id) DO UPDATE SET role=excluded.role,filter_id=excluded.filter_id,profile_id=excluded.profile_id""",(user["id"],nas_id,role,filter_id,profile_id))
+            enabled=restore["enabled"]
+        else:
+            a=IdentityDeviceAssignment(**params)
+            if not conn.execute("SELECT 1 FROM nas n JOIN zradius_nas_services s ON s.nas_id=n.id WHERE n.id=%s AND n.type='mikrotik' AND s.service_code='device-aaa' FOR UPDATE OF n",(a.nas_id,)).fetchone():
+                raise HTTPException(409,"Incompatible Device AAA NAS")
+            role,filter_id,profile_id=resolve_device_grant(conn,a)
+            conn.execute("""INSERT INTO zradius_device_grants(user_id,nas_id,role,filter_id,profile_id) VALUES (%s,%s,%s,%s,%s)
+                ON CONFLICT(user_id,nas_id) DO UPDATE SET role=excluded.role,filter_id=excluded.filter_id,profile_id=excluded.profile_id""",(user["id"],a.nas_id,role,filter_id,profile_id))
+            enabled=True
+        conn.execute("UPDATE zradius_device_users SET enabled=%s WHERE id=%s",(enabled,user["id"]))
+    elif service=="l2tp":
+        state=restore if restore is not None else {**current,**params,"enabled":True}
+        if restore is None and state["nas_id"]!=current["nas_id"] and (current["static_ip"] or current["address_space_id"] or current["group_id"]):
+            raise HTTPException(409,"Move VPN with static IP, VRF or group explicitly")
+        a=L2tpAssignment(**{k:v for k,v in state.items() if k!="enabled"})
+        address=static_address(a.static_ip)
+        validate_l2tp_assignment(conn,a,address)
+        conn.execute("""UPDATE zradius_l2tp_users SET nas_id=%s,profile_id=%s,group_id=%s,address_space_id=%s,static_ip=%s::inet,description=%s,enabled=%s WHERE identity_id=%s""",
+            (a.nas_id,a.profile_id,a.group_id,a.address_space_id,address,a.description,state["enabled"],identity_id))
+    elif service=="console":
+        state=restore if restore is not None else {"enabled":True,"role":params["role"]}
+        _update_identity_console(conn,identity_id,IdentityConsoleUpdate(**state),principal)
 
 def record_policy_history(conn,identity_id,username,actor,operation,revision,before,after,rollback_of=None):
     from psycopg.types.json import Jsonb
@@ -2663,17 +2713,18 @@ def reconciliation_snapshot(conn,identity_id):
     effective=resolve_effective_access_profile(conn,identity_id)
     overrides={r["service"]:{"mode":r["mode"],"reason":r["reason"]} for r in read_profile_overrides(conn,identity_id)}
     identity=conn.execute("""SELECT i.enabled,COALESCE(i.account_expires_at<=now(),false) AS expired,
-        c.identity_id IS NOT NULL AS credential_ready,c.nt_password IS NOT NULL AS nt_ready
+        c.identity_id IS NOT NULL AS credential_ready,c.nt_password IS NOT NULL AS nt_ready,c.web_password_hash IS NOT NULL AS web_ready
         FROM zradius_identities i LEFT JOIN zradius_identity_credentials c ON c.identity_id=i.id WHERE i.id=%s""",(identity_id,)).fetchone()
     plan={"identity_id":identity_id,"source":effective["source"],
         "effective_template_id":effective["effective_template_id"],**build_plan(effective,overrides)}
+    actual=reconciliation_assignments(conn,identity_id)
     for op in plan["operations"]:
         service=op["service"]
-        ready=identity["nt_ready"] if service in ("dot1x","wpa-enterprise") else identity["credential_ready"]
+        ready=identity["nt_ready"] if service in ("dot1x","wpa-enterprise","l2tp") else identity["web_ready"] if service=="console" else identity["credential_ready"]
         op["apply_supported"]=bool(service in RECONCILIATION_SUPPORTED and not op["override"] and
             op["action"] in ("CREATE","UPDATE") and op["expected_parameters"] is not None and
-            ready and identity["enabled"] and not identity["expired"])
-    actual=reconciliation_assignments(conn,identity_id)
+            ready and identity["enabled"] and not identity["expired"] and
+            (service not in ("device-aaa","l2tp","console") or actual[service] is not None))
     plan["revision"]=hashlib.sha256(json.dumps({"plan":plan,"actual":actual,"identity":identity,"effective":effective,"overrides":overrides},sort_keys=True,separators=(",",":"),default=str).encode()).hexdigest()
     return plan
 
@@ -2686,7 +2737,7 @@ def get_profile_reconciliation(identity_id:int,principal=Depends(auth)):
 
 class ReconciliationApply(BaseModel):
     revision:str=Field(pattern=r"^[a-f0-9]{64}$")
-    services:list[Literal["pppoe","hotspot","dot1x","wpa-enterprise"]]=Field(min_length=1,max_length=4)
+    services:list[Literal["pppoe","hotspot","dot1x","wpa-enterprise","device-aaa","l2tp","console"]]=Field(min_length=1,max_length=7)
     confirm:bool=False
     model_config={"extra":"forbid"}
 
@@ -2700,6 +2751,7 @@ def apply_profile_reconciliation(identity_id:int,body:ReconciliationApply,princi
         with db() as conn:
             conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+            lock_ppp_policy(conn)
             row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
             if not row:
                 raise HTTPException(404,"Identity not found")
@@ -2715,7 +2767,9 @@ def apply_profile_reconciliation(identity_id:int,body:ReconciliationApply,princi
             before={s:v for s,v in reconciliation_assignments(conn,identity_id).items() if s in body.services}
             for service in sorted(body.services):
                 params=operations[service]["expected_parameters"]
-                if service=="pppoe":
+                if service in ("device-aaa","l2tp","console"):
+                    apply_existing_service_profile(conn,identity_id,service,params,principal)
+                elif service=="pppoe":
                     set_identity_pppoe(conn,identity_id,IdentityPppoeAssignment(**params))
                     conn.execute("UPDATE zradius_identity_pppoe SET enabled=true WHERE identity_id=%s",(identity_id,))
                 elif service=="hotspot":
@@ -2760,6 +2814,7 @@ def rollback_policy_history(identity_id:int,history_id:int,body:PolicyRollback,p
         with db() as conn:
             conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+            lock_ppp_policy(conn)
             identity=conn.execute("SELECT username,enabled,COALESCE(account_expires_at<=now(),false) AS expired FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
             if not identity:
                 raise HTTPException(404,"Identity not found")
@@ -2787,7 +2842,11 @@ def rollback_policy_history(identity_id:int,history_id:int,body:PolicyRollback,p
                 state=before[service]
                 if state and state["enabled"] and (not credentials or (service in ("dot1x","wpa-enterprise") and not credentials["nt_ready"])):
                     raise HTTPException(409,"Required credentials unavailable")
-                if service=="pppoe":
+                if service in ("device-aaa","l2tp","console"):
+                    if state is None:
+                        raise HTTPException(409,"Unsupported empty legacy service snapshot")
+                    apply_existing_service_profile(conn,identity_id,service,{},principal,restore=state)
+                elif service=="pppoe":
                     if state is None:
                         conn.execute("DELETE FROM zradius_identity_pppoe WHERE identity_id=%s",(identity_id,))
                     else:
