@@ -2569,6 +2569,44 @@ def assign_identity_access_profile(identity_id:int,body:ProfileAssignment,princi
             result["assigned_template_id"]=body.template_id
         return result
 
+class BulkProfileAssignment(BaseModel):
+    identity_ids:list[int]=Field(min_length=1,max_length=100)
+    template_id:int|None=Field(default=None,gt=0)
+    preview:bool=True
+    model_config={"extra":"forbid"}
+
+@app.put("/api/v1/identities/bulk-access-profile")
+def bulk_assign_access_profile(body:BulkProfileAssignment,principal=Depends(auth)):
+    personal_admin(principal)
+    ids=sorted(set(body.identity_ids))
+    if len(ids)!=len(body.identity_ids) or any(i<=0 for i in ids):
+        raise HTTPException(422,"Positive unique identity IDs required")
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        rows=conn.execute("SELECT id,username,account_type,access_template_id FROM zradius_identities WHERE id=ANY(%s) ORDER BY id FOR UPDATE",(ids,)).fetchall()
+        if len(rows)!=len(ids):
+            raise HTTPException(404,"One or more identities not found")
+        template=None
+        if body.template_id is not None:
+            template=validate_profile_reference(conn,body.template_id,rows[0]["account_type"])
+            if any(r["account_type"]!=template["account_type"] for r in rows):
+                raise HTTPException(409,"Selected identities have incompatible account types")
+        items=[]
+        for row in rows:
+            comparison=profile_comparison(conn,row,template)
+            items.append({"identity_id":row["id"],"username":row["username"],
+                "previous_template_id":row["access_template_id"],
+                "missing_services":comparison["missing_services"],"extra_services":comparison["extra_services"],
+                "parameter_drift_count":sum(p["status"]!="match" for p in comparison["parameter_comparison"])})
+        changed=[r for r in rows if r["access_template_id"]!=body.template_id]
+        if not body.preview:
+            for row in changed:
+                conn.execute("UPDATE zradius_identities SET access_template_id=%s,updated_at=now() WHERE id=%s",(body.template_id,row["id"]))
+                audit(conn,"identity.access-profile.bulk-assign",row["username"])
+        return {"preview":body.preview,"template_id":body.template_id,"selected":len(rows),
+            "changed":len(changed),"items":items,"runtime_changed":False}
+
 class IdentityCreate(BaseModel):
     access_template_id:int|None=Field(default=None,gt=0)
     account_type:Literal["person","service"]="person"
