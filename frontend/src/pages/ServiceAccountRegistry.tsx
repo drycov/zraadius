@@ -36,7 +36,7 @@ function LifecycleEditor({request,initial,refresh}:{request:Request;initial:Life
  const invalidDays=days!==''&&(!/^[0-9]+$/.test(days)||Number(days)<1||Number(days)>3650);
  const invalidDate=expires!==''&&!Number.isFinite(Date.parse(expires+'Z'));
  return <Space direction="vertical" className="full">
- <Alert type="info" message="Сроки являются диагностическими. Истечение срока пока не блокирует FreeRADIUS и не завершает активные сессии."/>
+ <Alert type="info" message="После обновления FreeRADIUS истёкший срок блокирует новые запросы Unified Identity. Активные сессии автоматически не завершаются."/>
  <Space wrap>{status(initial.lifecycle_status)}{status(initial.rotation_status)}</Space>
  <span>Ответственный: {initial.account_owner||'—'}</span>
  <span>Назначение: {initial.account_purpose||'—'}</span>
@@ -57,7 +57,7 @@ export default function ServiceAccountRegistry({request,refresh}:{request:Reques
  const d=useData<{items:Lifecycle[];more:boolean}>(request,'identities/service-registry?limit=100&offset='+offset);
  const rows=d.data?.items??[];
  return <Space direction="vertical" className="full">
- <Alert type="info" message="Реестр сроков действия и ротации. Фильтр применяется к текущей странице. Состояние Expired не означает отключение сетевого доступа."/>
+ <Alert type="info" message="Реестр сроков действия и ротации. Фильтр применяется к текущей странице. После обновления FreeRADIUS истёкший срок ограничивает новые подключения; флаг доступа и активные сессии не изменяются автоматически."/>
  <Fault error={d.error}/>
  <Space wrap><Select value={filter} onChange={v=>setFilter(String(v))} options={[{value:'all',label:'Все на странице'},{value:'expired',label:'Просроченные УЗ'},{value:'expiring',label:'Истекают'},{value:'overdue',label:'Просрочена ротация'},{value:'due_soon',label:'Скоро ротация'}]}/><Button onClick={d.refresh}>Обновить</Button></Space>
  <Table<Lifecycle> rowKey="id" loading={d.loading} dataSource={rows.filter(r=>filter==='all'||r.lifecycle_status===filter||r.rotation_status===filter)} pagination={false} columns={[
