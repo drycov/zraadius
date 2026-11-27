@@ -324,13 +324,24 @@ def delete_nas(nas_id: int):
 
 @app.get("/api/v1/dictionaries", dependencies=[Depends(auth)])
 def dictionaries():
-    return [
-        {"name":"Mikrotik-Rate-Limit","vendor":14988,"type":"string","list":"reply"},
-        {"name":"Framed-Pool","vendor":0,"type":"string","list":"reply"},
-        {"name":"Acct-Interim-Interval","vendor":0,"type":"integer","list":"reply"},
-        {"name":"Idle-Timeout","vendor":0,"type":"integer","list":"reply"},
-        {"name":"Simultaneous-Use","vendor":0,"type":"integer","list":"control"}
-    ]
+    from radius_attributes import catalog
+    return catalog()
+
+class RadiusAttributeValidation(BaseModel):
+    name:str=Field(min_length=1,max_length=64)
+    attribute_list:Literal["check","control","reply"]
+    operator:str=Field(min_length=1,max_length=2)
+    value:str=Field(min_length=1,max_length=253)
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/dictionaries/validate")
+def validate_radius_attribute(body:RadiusAttributeValidation,principal=Depends(auth)):
+    personal_admin(principal)
+    from radius_attributes import validate
+    try:
+        return validate(body.name,body.attribute_list,body.operator,body.value)
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
 
 @app.get("/api/v1/dashboard", dependencies=[Depends(auth)])
 def dashboard():
@@ -4979,3 +4990,71 @@ def update_identity_workspace(identity_id:int,body:IdentityWorkspaceUpdate,princ
         return {"status":"updated"}
     except UniqueViolation:
         raise HTTPException(409,"Existing login or static IP conflict")
+
+class PolicyAttributeEntry(RadiusAttributeValidation):
+    service:Literal["device-aaa","l2tp","pppoe","hotspot","dot1x","wpa-enterprise"]
+    nas_id:int|None=Field(default=None,gt=0)
+    priority:int=Field(default=100,ge=0,le=1000)
+    enabled:bool=True
+
+class PolicyAttributesReplace(BaseModel):
+    entries:list[PolicyAttributeEntry]=Field(max_length=100)
+    expected_revision:int=Field(gt=0)
+    confirm:bool=False
+    model_config={"extra":"forbid"}
+
+@app.get("/api/v1/identities/policy-catalog/{policy_id}/attributes")
+def get_policy_attributes(policy_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        p=conn.execute("SELECT revision FROM zradius_policies WHERE id=%s",(policy_id,)).fetchone()
+        if not p:
+            raise HTTPException(404,"Policy not found")
+        return {"revision":p["revision"],"items":conn.execute("SELECT * FROM zradius_policy_attributes WHERE policy_id=%s ORDER BY id",(policy_id,)).fetchall(),"runtime_enforced":False}
+
+@app.put("/api/v1/identities/policy-catalog/{policy_id}/attributes")
+def replace_policy_attributes(policy_id:int,body:PolicyAttributesReplace,principal=Depends(auth)):
+    personal_admin(principal)
+    if not body.confirm:
+        raise HTTPException(422,"Confirmation required")
+    from radius_attributes import validate
+    with db() as conn:
+        lock_reusable_policy(conn,policy_id,body.expected_revision)
+        keys=set(); values=[]
+        for e in body.entries:
+            key=(e.service,e.nas_id,e.name,e.attribute_list)
+            if key in keys:
+                raise HTTPException(422,"Duplicate attribute scope")
+            keys.add(key)
+            try:
+                v=validate(e.name,e.attribute_list,e.operator,e.value)
+            except ValueError as exc:
+                raise HTTPException(422,str(exc))
+            if e.nas_id is not None and not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code=%s",(e.nas_id,e.service)).fetchone():
+                raise HTTPException(409,"Service is not assigned to NAS")
+            values.append((policy_id,e.service,e.nas_id,e.name,e.attribute_list,e.operator,v["value"],e.priority,e.enabled))
+        conn.execute("DELETE FROM zradius_policy_attributes WHERE policy_id=%s",(policy_id,))
+        for v in values:
+            conn.execute("INSERT INTO zradius_policy_attributes(policy_id,service,nas_id,name,attribute_list,operator,value,priority,enabled) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",v)
+        p=conn.execute("UPDATE zradius_policies SET revision=revision+1,updated_at=now() WHERE id=%s RETURNING revision",(policy_id,)).fetchone()
+        audit(conn,"policy.attributes.replace",str(policy_id))
+        return {"revision":p["revision"],"runtime_enforced":False}
+
+@app.get("/api/v1/identities/{identity_id}/effective-attributes")
+def effective_policy_attributes(identity_id:int,service:Literal["device-aaa","l2tp","pppoe","hotspot","dot1x","wpa-enterprise"],nas_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    from attribute_resolution import resolve
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        if not conn.execute("SELECT 1 FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone():
+            raise HTTPException(404,"Identity not found")
+        if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code=%s",(nas_id,service)).fetchone():
+            raise HTTPException(409,"Service is not assigned to NAS")
+        rows=conn.execute("""SELECT e.*,CASE WHEN a.identity_id IS NOT NULL THEN 'identity' ELSE 'group' END AS source
+            FROM zradius_policy_attributes e JOIN zradius_policies p ON p.id=e.policy_id AND p.enabled
+            JOIN zradius_policy_assignments a ON a.policy_id=p.id
+            WHERE e.service=%s AND (e.nas_id IS NULL OR e.nas_id=%s)
+            AND (a.identity_id=%s OR EXISTS(SELECT 1 FROM zradius_identity_group_members m WHERE m.identity_id=%s AND m.group_id=a.group_id))
+            ORDER BY e.id,a.id""",(service,nas_id,identity_id,identity_id)).fetchall()
+        return resolve(rows)
