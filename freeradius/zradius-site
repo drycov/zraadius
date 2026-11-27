@@ -24,7 +24,7 @@ server zradius {
     reject
    }
    update control {
-    Tmp-String-0 := "%{sql:SELECT CASE WHEN u.identity_id IS NULL THEN u.password_hash ELSE (SELECT c.password_hash FROM zradius_identity_credentials c WHERE c.identity_id=u.identity_id) END FROM zradius_device_users u JOIN zradius_device_effective_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND ((u.identity_id IS NULL AND NOT EXISTS(SELECT 1 FROM zradius_identities i WHERE i.username=u.username)) OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))}"
+    Tmp-String-0 := "%{sql:SELECT CASE WHEN u.identity_id IS NULL THEN u.password_hash ELSE (SELECT c.password_hash FROM zradius_identity_credentials c WHERE c.identity_id=u.identity_id) END FROM zradius_device_users u JOIN zradius_device_effective_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND ((u.identity_id IS NULL AND NOT EXISTS(SELECT 1 FROM zradius_identities i WHERE i.username=u.username)) OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled AND (i.account_expires_at IS NULL OR i.account_expires_at>now())))}"
    }
    if (!&control:Tmp-String-0 || &control:Tmp-String-0 !~ /^[A-Za-z0-9+\/]{107}=$/) {
     reject
@@ -39,7 +39,7 @@ server zradius {
     reject
    }
    update control {
-    Tmp-String-0 := "%{sql:SELECT c.password_hash FROM zradius_identities i JOIN zradius_identity_credentials c ON c.identity_id=i.id JOIN zradius_identity_hotspot h ON h.identity_id=i.id JOIN nas n ON n.id=h.nas_id JOIN zradius_nas_services ns ON ns.nas_id=n.id AND ns.service_code='hotspot' WHERE i.username='%{User-Name}' AND i.enabled AND h.enabled AND n.type='mikrotik' AND n.nasname='%{Packet-Src-IP-Address}'}"
+    Tmp-String-0 := "%{sql:SELECT c.password_hash FROM zradius_identities i JOIN zradius_identity_credentials c ON c.identity_id=i.id JOIN zradius_identity_hotspot h ON h.identity_id=i.id JOIN nas n ON n.id=h.nas_id JOIN zradius_nas_services ns ON ns.nas_id=n.id AND ns.service_code='hotspot' WHERE i.username='%{User-Name}' AND i.enabled AND (i.account_expires_at IS NULL OR i.account_expires_at>now()) AND h.enabled AND n.type='mikrotik' AND n.nasname='%{Packet-Src-IP-Address}'}"
    }
    if (&control:Tmp-String-0 !~ /^[A-Za-z0-9+\/]{107}=$/) {
     reject
@@ -94,7 +94,7 @@ server zradius {
    # Only PAP or MS-CHAPv2; no subscriber fallback.
    if (&User-Password && !&MS-CHAP-Challenge && !&MS-CHAP2-Response && !&MS-CHAP-Response) {
     update control {
-     Tmp-String-0 := "%{sql:SELECT CASE WHEN u.identity_id IS NULL THEN u.password_hash ELSE (SELECT c.password_hash FROM zradius_identity_credentials c WHERE c.identity_id=u.identity_id) END FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND ((u.identity_id IS NULL AND NOT EXISTS(SELECT 1 FROM zradius_identities i WHERE i.username=u.username)) OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))}"
+     Tmp-String-0 := "%{sql:SELECT CASE WHEN u.identity_id IS NULL THEN u.password_hash ELSE (SELECT c.password_hash FROM zradius_identity_credentials c WHERE c.identity_id=u.identity_id) END FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND ((u.identity_id IS NULL AND NOT EXISTS(SELECT 1 FROM zradius_identities i WHERE i.username=u.username)) OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled AND (i.account_expires_at IS NULL OR i.account_expires_at>now())))}"
     }
     if (&control:Tmp-String-0 !~ /^[A-Za-z0-9+\/]{107}=$/) {
      reject
@@ -106,7 +106,7 @@ server zradius {
    }
    elsif (!&User-Password && &MS-CHAP-Challenge && &MS-CHAP2-Response && !&MS-CHAP-Response) {
     update control {
-     Tmp-String-0 := "%{sql:SELECT CASE WHEN u.identity_id IS NULL THEN u.nt_password ELSE (SELECT c.nt_password FROM zradius_identity_credentials c WHERE c.identity_id=u.identity_id) END FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND ((u.identity_id IS NULL AND NOT EXISTS(SELECT 1 FROM zradius_identities i WHERE i.username=u.username)) OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))}"
+     Tmp-String-0 := "%{sql:SELECT CASE WHEN u.identity_id IS NULL THEN u.nt_password ELSE (SELECT c.nt_password FROM zradius_identity_credentials c WHERE c.identity_id=u.identity_id) END FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND ((u.identity_id IS NULL AND NOT EXISTS(SELECT 1 FROM zradius_identities i WHERE i.username=u.username)) OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled AND (i.account_expires_at IS NULL OR i.account_expires_at>now())))}"
     }
     if (&control:Tmp-String-0 !~ /^[0-9a-f]{32}$/) {
      reject
@@ -150,7 +150,7 @@ server zradius {
    if (&control:Tmp-String-3 == "1") {
     if (&User-Password && !&CHAP-Password && !&MS-CHAP-Challenge && !&MS-CHAP2-Response && !&MS-CHAP-Response) {
      update control {
-      Tmp-String-0 := "%{sql:SELECT c.password_hash FROM zradius_identities i JOIN zradius_identity_credentials c ON c.identity_id=i.id JOIN zradius_identity_pppoe p ON p.identity_id=i.id JOIN nas n ON n.id=p.nas_id JOIN zradius_nas_services ns ON ns.nas_id=n.id AND ns.service_code='pppoe' WHERE i.username='%{User-Name}' AND i.enabled AND p.enabled AND n.type='mikrotik' AND n.nasname='%{Packet-Src-IP-Address}'}"
+      Tmp-String-0 := "%{sql:SELECT c.password_hash FROM zradius_identities i JOIN zradius_identity_credentials c ON c.identity_id=i.id JOIN zradius_identity_pppoe p ON p.identity_id=i.id JOIN nas n ON n.id=p.nas_id JOIN zradius_nas_services ns ON ns.nas_id=n.id AND ns.service_code='pppoe' WHERE i.username='%{User-Name}' AND i.enabled AND (i.account_expires_at IS NULL OR i.account_expires_at>now()) AND p.enabled AND n.type='mikrotik' AND n.nasname='%{Packet-Src-IP-Address}'}"
      }
      if (&control:Tmp-String-0 !~ /^[A-Za-z0-9+\/]{107}=$/) {
       reject
@@ -162,7 +162,7 @@ server zradius {
     }
     elsif (!&User-Password && !&CHAP-Password && &MS-CHAP-Challenge && &MS-CHAP2-Response && !&MS-CHAP-Response) {
      update control {
-      Tmp-String-0 := "%{sql:SELECT c.nt_password FROM zradius_identities i JOIN zradius_identity_credentials c ON c.identity_id=i.id JOIN zradius_identity_pppoe p ON p.identity_id=i.id JOIN nas n ON n.id=p.nas_id JOIN zradius_nas_services ns ON ns.nas_id=n.id AND ns.service_code='pppoe' WHERE i.username='%{User-Name}' AND i.enabled AND p.enabled AND n.type='mikrotik' AND n.nasname='%{Packet-Src-IP-Address}'}"
+      Tmp-String-0 := "%{sql:SELECT c.nt_password FROM zradius_identities i JOIN zradius_identity_credentials c ON c.identity_id=i.id JOIN zradius_identity_pppoe p ON p.identity_id=i.id JOIN nas n ON n.id=p.nas_id JOIN zradius_nas_services ns ON ns.nas_id=n.id AND ns.service_code='pppoe' WHERE i.username='%{User-Name}' AND i.enabled AND (i.account_expires_at IS NULL OR i.account_expires_at>now()) AND p.enabled AND n.type='mikrotik' AND n.nasname='%{Packet-Src-IP-Address}'}"
      }
      if (&control:Tmp-String-0 !~ /^[0-9a-f]{32}$/) {
       reject
@@ -256,7 +256,7 @@ server zradius {
  post-auth {
   if (&Mikrotik-Realm == "device-aaa") {
    update control {
-    Tmp-String-0 := "%{sql:SELECT g.role || ':' || COALESCE(g.filter_id,'') FROM zradius_device_users u JOIN zradius_device_effective_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND ((u.identity_id IS NULL AND NOT EXISTS(SELECT 1 FROM zradius_identities i WHERE i.username=u.username)) OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))}"
+    Tmp-String-0 := "%{sql:SELECT g.role || ':' || COALESCE(g.filter_id,'') FROM zradius_device_users u JOIN zradius_device_effective_grants g ON g.user_id=u.id JOIN nas n ON n.id=g.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='device-aaa' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND ((u.identity_id IS NULL AND NOT EXISTS(SELECT 1 FROM zradius_identities i WHERE i.username=u.username)) OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled AND (i.account_expires_at IS NULL OR i.account_expires_at>now())))}"
    }
    if (&control:Tmp-String-0 =~ /^([A-Za-z0-9_.-]{1,64}):([A-Za-z0-9_.-]{0,64})$/) {
     update reply {
@@ -283,7 +283,7 @@ server zradius {
     reject
    }
    update control {
-    Tmp-String-0 := "%{sql:SELECT h.rate_limit || ':' || h.session_seconds || ':' || h.idle_seconds FROM zradius_identities i JOIN zradius_identity_credentials c ON c.identity_id=i.id JOIN zradius_identity_hotspot h ON h.identity_id=i.id JOIN nas n ON n.id=h.nas_id JOIN zradius_nas_services ns ON ns.nas_id=n.id AND ns.service_code='hotspot' WHERE i.username='%{User-Name}' AND i.enabled AND h.enabled AND n.type='mikrotik' AND n.nasname='%{Packet-Src-IP-Address}'}"
+    Tmp-String-0 := "%{sql:SELECT h.rate_limit || ':' || h.session_seconds || ':' || h.idle_seconds FROM zradius_identities i JOIN zradius_identity_credentials c ON c.identity_id=i.id JOIN zradius_identity_hotspot h ON h.identity_id=i.id JOIN nas n ON n.id=h.nas_id JOIN zradius_nas_services ns ON ns.nas_id=n.id AND ns.service_code='hotspot' WHERE i.username='%{User-Name}' AND i.enabled AND (i.account_expires_at IS NULL OR i.account_expires_at>now()) AND h.enabled AND n.type='mikrotik' AND n.nasname='%{Packet-Src-IP-Address}'}"
    }
    if (&control:Tmp-String-0 =~ /^([1-9][0-9]{0,5}M\/[1-9][0-9]{0,5}M):([0-9]{2,5}):([0-9]{2,5})$/) {
     update reply {
@@ -318,7 +318,7 @@ server zradius {
   }
   elsif (&Mikrotik-Realm == "l2tp") {
    update control {
-    Tmp-String-0 := "%{sql:SELECT p.name || ':' || COALESCE(host(u.static_ip),'') || ':' || COALESCE(p.pool,'') || ':' || p.interim_seconds FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND ((u.identity_id IS NULL AND NOT EXISTS(SELECT 1 FROM zradius_identities i WHERE i.username=u.username)) OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled))}"
+    Tmp-String-0 := "%{sql:SELECT p.name || ':' || COALESCE(host(u.static_ip),'') || ':' || COALESCE(p.pool,'') || ':' || p.interim_seconds FROM zradius_l2tp_users u JOIN zradius_l2tp_effective_profiles p ON p.user_id=u.id JOIN nas n ON n.id=u.nas_id JOIN zradius_nas_services s ON s.nas_id=n.id AND s.service_code='l2tp' WHERE n.nasname='%{Packet-Src-IP-Address}' AND n.type='mikrotik' AND u.username='%{User-Name}' AND u.enabled AND ((u.identity_id IS NULL AND NOT EXISTS(SELECT 1 FROM zradius_identities i WHERE i.username=u.username)) OR EXISTS(SELECT 1 FROM zradius_identities i WHERE i.id=u.identity_id AND i.enabled AND (i.account_expires_at IS NULL OR i.account_expires_at>now())))}"
    }
    if (&control:Tmp-String-0 =~ /^([A-Za-z0-9_.-]{1,64}):([0-9.]{0,15}):([A-Za-z0-9_.-]{0,64}):([0-9]{2,5})$/) {
     update reply {
@@ -349,7 +349,7 @@ server zradius {
   }
   elsif (&Mikrotik-Realm == "pppoe" && &control:Tmp-String-3 == "1") {
    update control {
-    Tmp-String-0 := "%{sql:SELECT p.rate_limit || ':' || p.pool || ':' || p.interim_seconds FROM zradius_identities i JOIN zradius_identity_credentials c ON c.identity_id=i.id JOIN zradius_identity_pppoe p ON p.identity_id=i.id JOIN nas n ON n.id=p.nas_id JOIN zradius_nas_services ns ON ns.nas_id=n.id AND ns.service_code='pppoe' WHERE i.username='%{User-Name}' AND i.enabled AND p.enabled AND n.type='mikrotik' AND n.nasname='%{Packet-Src-IP-Address}'}"
+    Tmp-String-0 := "%{sql:SELECT p.rate_limit || ':' || p.pool || ':' || p.interim_seconds FROM zradius_identities i JOIN zradius_identity_credentials c ON c.identity_id=i.id JOIN zradius_identity_pppoe p ON p.identity_id=i.id JOIN nas n ON n.id=p.nas_id JOIN zradius_nas_services ns ON ns.nas_id=n.id AND ns.service_code='pppoe' WHERE i.username='%{User-Name}' AND i.enabled AND (i.account_expires_at IS NULL OR i.account_expires_at>now()) AND p.enabled AND n.type='mikrotik' AND n.nasname='%{Packet-Src-IP-Address}'}"
    }
    if (&control:Tmp-String-0 =~ /^([1-9][0-9]{0,5}M\/[1-9][0-9]{0,5}M):([A-Za-z0-9_.-]{1,64}):([0-9]{2,5})$/) {
     update reply {
