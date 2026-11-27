@@ -5,6 +5,7 @@ import IdentityAudit from './IdentityAudit';
 import IdentityLegacy from './IdentityLegacy';
 import IdentityBulkState from './IdentityBulkState';
 import IdentityBulk from './IdentityBulk';
+import BulkAccessProfiles from './BulkAccessProfiles';
 import IdentitySessions from './IdentitySessions';
 import IdentityEap,{EapFields} from './IdentityEap';
 import IdentityHotspot,{HotspotFields} from './IdentityHotspot';
@@ -42,6 +43,7 @@ export default function UnifiedUsers({request}:{request:Request}){
  {id:'service-registry',label:'Сервисные УЗ',content:<ServiceAccountRegistry request={request} refresh={d.refresh}/>},
  {id:'templates',label:'Шаблоны доступа',content:<AccessTemplates request={request} refresh={templates.refresh}/>},
  {id:'bulk',label:'Массовое назначение',content:<IdentityBulk request={request} refresh={d.refresh}/>},
+ {id:'bulk-profiles',label:'Массовые профили',content:<BulkAccessProfiles request={request} refresh={d.refresh}/>},
  {id:'bulk-state',label:'Массовая блокировка',content:<IdentityBulkState request={request} refresh={d.refresh}/>},
  {id:'legacy',label:'Миграция Legacy',content:<IdentityLegacy request={request} refresh={d.refresh}/>},
  {id:'directory',label:'Active Directory',content:<IdentityDirectory request={request}/>},
