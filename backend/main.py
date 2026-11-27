@@ -2845,6 +2845,45 @@ def rollback_policy_history(identity_id:int,history_id:int,body:PolicyRollback,p
     except (SerializationFailure,DeadlockDetected):
         raise HTTPException(409,"Concurrent configuration change; reload history")
 
+@app.get("/api/v1/identities/policy-compliance")
+def policy_compliance(limit:int=50,after_id:int=0,q:str="",account_type:Literal["person","service"]|None=None,group_id:int|None=None,principal=Depends(auth)):
+    personal_admin(principal)
+    from profile_reconciliation import build_plan
+    q=q.strip()
+    if not 1<=limit<=100 or after_id<0 or len(q)>200 or (group_id is not None and group_id<=0):
+        raise HTTPException(422,"Invalid compliance filters")
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        rows=conn.execute("""SELECT i.id,i.username,i.account_type,i.enabled,
+            COALESCE(i.account_expires_at<=now(),false) AS expired
+            FROM zradius_identities i WHERE i.id>%s
+            AND (%s='' OR strpos(lower(i.username),lower(%s))>0)
+            AND (%s::text IS NULL OR i.account_type=%s)
+            AND (%s::bigint IS NULL OR EXISTS(SELECT 1 FROM zradius_identity_group_members m WHERE m.identity_id=i.id AND m.group_id=%s))
+            ORDER BY i.id LIMIT %s""",(after_id,q,q,account_type,account_type,group_id,group_id,limit+1)).fetchall()
+        items=[]
+        for row in rows[:limit]:
+            effective=resolve_effective_access_profile(conn,row["id"])
+            overrides={r["service"]:{"mode":r["mode"],"reason":r["reason"]} for r in read_profile_overrides(conn,row["id"])}
+            plan=build_plan(effective,overrides)
+            operations=plan["operations"]
+            drift=[o for o in operations if o.get("proposed_action",o["action"])!="KEEP"]
+            comparison=effective["comparison"]
+            measured=[o for o in operations if o["service"] in set(comparison["actual_services"])|set(comparison["expected_services"])]
+            score=None if plan["status"]=="blocked" or not measured else round(100*sum(o.get("proposed_action",o["action"])=="KEEP" for o in measured)/len(measured),1)
+            items.append({**row,"source":effective["source"],"template_id":effective["effective_template_id"],
+                "template_name":comparison["template"]["name"] if comparison["template"] else None,
+                "status":plan["status"],"score":score,"drift_services":[o["service"] for o in drift],
+                "protected_services":sorted(overrides),"protected_drift_count":sum(bool(o.get("override")) for o in drift),
+                "missing_services":comparison["missing_services"],"extra_services":comparison["extra_services"],
+                "parameter_drift_count":sum(p["status"]!="match" for p in comparison["parameter_comparison"])})
+        summary={s:sum(r["status"]==s for r in items) for s in ("in_sync","review_required","protected","blocked")}
+        summary.update({"accounts":len(items),"expired":sum(r["expired"] for r in items),
+            "disabled":sum(not r["enabled"] for r in items),"unassigned":sum(r["source"]=="none" for r in items),
+            "conflicts":sum(r["source"]=="conflict" for r in items),"with_overrides":sum(bool(r["protected_services"]) for r in items)})
+        return {"items":items,"page_summary":summary,"next_after_id":items[-1]["id"] if len(rows)>limit else None,
+            "scope":"page_only","score_scope":"direct_service_flags_and_configured_parameters","runtime_changed":False}
+
 class BulkProfileAssignment(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
     template_id:int|None=Field(default=None,gt=0)
