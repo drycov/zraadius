@@ -3,10 +3,10 @@ import {useEffect,useId,useState,type ReactNode} from 'react';
 type Item={key:string;label:string;icon?:ReactNode};
 type Section={key:string;label:string;icon:ReactNode;routes:string[]};
 const sections:Section[]=[
- {key:'vpn',label:'PPP / VPN',icon:<NavIcon kind="shield"/>,routes:['ppp']},
- {key:'subscribers',label:'Абоненты и доступ',icon:<NavIcon kind="users"/>,routes:['users','groups','hotspot','ipoe']},
+ {key:'identity',label:'Учётные записи и доступ',icon:<NavIcon kind="users"/>,routes:['users','groups','policies']},
+ {key:'vpn',label:'Сервисные настройки',icon:<NavIcon kind="shield"/>,routes:['ppp','hotspot','ipoe']},
  {key:'network',label:'Сетевая инфраструктура',icon:<NavIcon kind="network"/>,routes:['nas','ipam','device']},
- {key:'radius',label:'RADIUS / AAA',icon:<NavIcon kind="shield"/>,routes:['services','policies','dictionary','proxy','pki']},
+ {key:'radius',label:'RADIUS / AAA',icon:<NavIcon kind="shield"/>,routes:['services','dictionary','proxy','pki']},
  {key:'monitoring',label:'Мониторинг и аудит',icon:<NavIcon kind="activity"/>,routes:['accounting','audit']},
  {key:'admin',label:'Администрирование',icon:<NavIcon kind="settings"/>,routes:['iam','account']},
 ];
