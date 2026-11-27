@@ -2775,6 +2775,76 @@ def get_policy_history(identity_id:int,limit:int=50,offset:int=0,principal=Depen
             (identity_id,limit+1,offset)).fetchall()
         return {"items":rows[:limit],"more":len(rows)>limit}
 
+class PolicyRollback(BaseModel):
+    confirm:bool=False
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/identities/{identity_id}/policy-history/{history_id}/rollback")
+def rollback_policy_history(identity_id:int,history_id:int,body:PolicyRollback,principal=Depends(auth)):
+    personal_admin(principal)
+    if not body.confirm:
+        raise HTTPException(422,"Explicit rollback confirmation required")
+    from psycopg.errors import SerializationFailure,DeadlockDetected
+    try:
+        with db() as conn:
+            conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+            identity=conn.execute("SELECT username,enabled,COALESCE(account_expires_at<=now(),false) AS expired FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+            if not identity:
+                raise HTTPException(404,"Identity not found")
+            if not identity["enabled"] or identity["expired"]:
+                raise HTTPException(409,"Identity disabled or expired")
+            conn.execute("LOCK TABLE zradius_profile_overrides IN SHARE MODE")
+            history=conn.execute("SELECT id,username,operation,revision,before_state,after_state FROM zradius_policy_history WHERE id=%s AND identity_id=%s",(history_id,identity_id)).fetchone()
+            if not history or history["username"]!=identity["username"]:
+                raise HTTPException(404,"Policy transaction not found")
+            if history["operation"]!="apply" or conn.execute("SELECT 1 FROM zradius_policy_history WHERE rollback_of=%s",(history_id,)).fetchone():
+                raise HTTPException(409,"Transaction cannot be rolled back")
+            before,after=history["before_state"],history["after_state"]
+            services=set(before)
+            if not services or services!=set(after) or not services<=RECONCILIATION_SUPPORTED:
+                raise HTTPException(409,"Unsupported history snapshot")
+            if conn.execute("SELECT 1 FROM zradius_policy_history h WHERE h.identity_id=%s AND h.id>%s AND h.after_state ?| %s::text[] LIMIT 1",(identity_id,history_id,sorted(services))).fetchone():
+                raise HTTPException(409,"Later transaction affects these services")
+            if any(r["service"] in services for r in read_profile_overrides(conn,identity_id)):
+                raise HTTPException(409,"Service protected by individual override")
+            current={s:v for s,v in reconciliation_assignments(conn,identity_id).items() if s in services}
+            if current!=after:
+                raise HTTPException(409,"Current assignments differ from recorded after state")
+            credentials=conn.execute("SELECT identity_id,nt_password IS NOT NULL AS nt_ready FROM zradius_identity_credentials WHERE identity_id=%s",(identity_id,)).fetchone()
+            for service in sorted(services):
+                state=before[service]
+                if state and state["enabled"] and (not credentials or (service in ("dot1x","wpa-enterprise") and not credentials["nt_ready"])):
+                    raise HTTPException(409,"Required credentials unavailable")
+                if service=="pppoe":
+                    if state is None:
+                        conn.execute("DELETE FROM zradius_identity_pppoe WHERE identity_id=%s",(identity_id,))
+                    else:
+                        set_identity_pppoe(conn,identity_id,IdentityPppoeAssignment(**{k:v for k,v in state.items() if k!="enabled"}))
+                        conn.execute("UPDATE zradius_identity_pppoe SET enabled=%s WHERE identity_id=%s",(state["enabled"],identity_id))
+                elif service=="hotspot":
+                    if state is None:
+                        conn.execute("DELETE FROM zradius_identity_hotspot WHERE identity_id=%s",(identity_id,))
+                    else:
+                        if state["enabled"] and __import__("re").fullmatch(r"hs-[a-f0-9]{20}",identity["username"]):
+                            raise HTTPException(422,"Reserved voucher username")
+                        set_identity_hotspot(conn,identity_id,IdentityHotspotAssignment(**{k:v for k,v in state.items() if k!="enabled"}))
+                        conn.execute("UPDATE zradius_identity_hotspot SET enabled=%s WHERE identity_id=%s",(state["enabled"],identity_id))
+                else:
+                    if state is None:
+                        conn.execute("DELETE FROM zradius_identity_eap WHERE identity_id=%s AND service_code=%s",(identity_id,service))
+                    else:
+                        set_identity_eap(conn,identity_id,service,IdentityEapAssignment(**{k:v for k,v in state.items() if k!="enabled"}))
+                        conn.execute("UPDATE zradius_identity_eap SET enabled=%s WHERE identity_id=%s AND service_code=%s",(state["enabled"],identity_id,service))
+                audit(conn,"identity.profile-reconciliation.rollback."+service,identity["username"])
+            restored={s:v for s,v in reconciliation_assignments(conn,identity_id).items() if s in services}
+            if restored!=before:
+                raise HTTPException(409,"Restored state differs from original snapshot")
+            rollback_id=record_policy_history(conn,identity_id,identity["username"],principal["username"],"rollback",history["revision"],current,restored,history_id)
+            return {"status":"rolled_back","history_id":rollback_id,"rollback_of":history_id,"services":sorted(services),"network_disconnected":False}
+    except (SerializationFailure,DeadlockDetected):
+        raise HTTPException(409,"Concurrent configuration change; reload history")
+
 class BulkProfileAssignment(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
     template_id:int|None=Field(default=None,gt=0)
