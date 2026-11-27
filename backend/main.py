@@ -2667,6 +2667,25 @@ def put_profile_override(identity_id:int,service:Literal["device-aaa","l2tp","pp
 
 RECONCILIATION_SUPPORTED={"pppoe","hotspot","dot1x","wpa-enterprise"}
 
+def reconciliation_assignments(conn,identity_id):
+    # Include disabled assignments and complete configured values, not only drift.
+    actual={}
+    for service,query in {
+        "pppoe":"SELECT nas_id,rate_limit,pool,interim_seconds,enabled FROM zradius_identity_pppoe WHERE identity_id=%s",
+        "hotspot":"SELECT nas_id,rate_limit,session_seconds,idle_seconds,enabled FROM zradius_identity_hotspot WHERE identity_id=%s",
+        "dot1x":"SELECT nas_id,vlan_id,enabled FROM zradius_identity_eap WHERE identity_id=%s AND service_code='dot1x'",
+        "wpa-enterprise":"SELECT nas_id,vlan_id,enabled FROM zradius_identity_eap WHERE identity_id=%s AND service_code='wpa-enterprise'"
+    }.items():
+        actual[service]=conn.execute(query,(identity_id,)).fetchone()
+    return actual
+
+def record_policy_history(conn,identity_id,username,actor,operation,revision,before,after,rollback_of=None):
+    from psycopg.types.json import Jsonb
+    return conn.execute("""INSERT INTO zradius_policy_history
+        (identity_id,username,actor,operation,revision,before_state,after_state,rollback_of)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (identity_id,username,actor,operation,revision,Jsonb(before),Jsonb(after),rollback_of)).fetchone()["id"]
+
 def reconciliation_snapshot(conn,identity_id):
     import hashlib,json
     from profile_reconciliation import build_plan
@@ -2683,15 +2702,7 @@ def reconciliation_snapshot(conn,identity_id):
         op["apply_supported"]=bool(service in RECONCILIATION_SUPPORTED and not op["override"] and
             op["action"] in ("CREATE","UPDATE") and op["expected_parameters"] is not None and
             ready and identity["enabled"] and not identity["expired"])
-    # Include disabled assignments and complete configured values, not only drift.
-    actual={}
-    for service,query in {
-        "pppoe":"SELECT nas_id,rate_limit,pool,interim_seconds,enabled FROM zradius_identity_pppoe WHERE identity_id=%s",
-        "hotspot":"SELECT nas_id,rate_limit,session_seconds,idle_seconds,enabled FROM zradius_identity_hotspot WHERE identity_id=%s",
-        "dot1x":"SELECT nas_id,vlan_id,enabled FROM zradius_identity_eap WHERE identity_id=%s AND service_code='dot1x'",
-        "wpa-enterprise":"SELECT nas_id,vlan_id,enabled FROM zradius_identity_eap WHERE identity_id=%s AND service_code='wpa-enterprise'"
-    }.items():
-        actual[service]=conn.execute(query,(identity_id,)).fetchone()
+    actual=reconciliation_assignments(conn,identity_id)
     plan["revision"]=hashlib.sha256(json.dumps({"plan":plan,"actual":actual,"identity":identity,"effective":effective,"overrides":overrides},sort_keys=True,separators=(",",":"),default=str).encode()).hexdigest()
     return plan
 
@@ -2730,6 +2741,7 @@ def apply_profile_reconciliation(identity_id:int,body:ReconciliationApply,princi
             for service in body.services:
                 if service not in operations or not operations[service]["apply_supported"]:
                     raise HTTPException(409,"Operation unavailable: "+service)
+            before={s:v for s,v in reconciliation_assignments(conn,identity_id).items() if s in body.services}
             for service in sorted(body.services):
                 params=operations[service]["expected_parameters"]
                 if service=="pppoe":
@@ -2744,9 +2756,24 @@ def apply_profile_reconciliation(identity_id:int,body:ReconciliationApply,princi
                     set_identity_eap(conn,identity_id,service,IdentityEapAssignment(**params))
                     conn.execute("UPDATE zradius_identity_eap SET enabled=true WHERE identity_id=%s AND service_code=%s",(identity_id,service))
                 audit(conn,"identity.profile-reconciliation.apply."+service,row["username"])
-            return {"status":"applied","services":sorted(body.services),"runtime_changed":True,"network_disconnected":False}
+            after={s:v for s,v in reconciliation_assignments(conn,identity_id).items() if s in body.services}
+            history_id=record_policy_history(conn,identity_id,row["username"],principal["username"],"apply",body.revision,before,after)
+            return {"status":"applied","history_id":history_id,"services":sorted(body.services),"runtime_changed":True,"network_disconnected":False}
     except (SerializationFailure,DeadlockDetected):
         raise HTTPException(409,"Concurrent configuration change; recalculate preview")
+
+@app.get("/api/v1/identities/{identity_id}/policy-history")
+def get_policy_history(identity_id:int,limit:int=50,offset:int=0,principal=Depends(auth)):
+    personal_admin(principal)
+    if not 1<=limit<=100 or offset<0:
+        raise HTTPException(422,"Invalid pagination")
+    with db() as conn:
+        rows=conn.execute("""SELECT h.id,h.identity_id,h.username,h.actor,h.operation,h.revision,
+            h.before_state,h.after_state,h.rollback_of,h.created_at,
+            EXISTS(SELECT 1 FROM zradius_policy_history r WHERE r.rollback_of=h.id) AS rolled_back
+            FROM zradius_policy_history h WHERE h.identity_id=%s ORDER BY h.id DESC LIMIT %s OFFSET %s""",
+            (identity_id,limit+1,offset)).fetchall()
+        return {"items":rows[:limit],"more":len(rows)>limit}
 
 class BulkProfileAssignment(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
