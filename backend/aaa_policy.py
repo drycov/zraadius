@@ -1,11 +1,13 @@
 """Explain configured unified AAA eligibility, not a RADIUS authentication result."""
 SERVICES=("device-aaa","l2tp","pppoe","hotspot","dot1x","wpa-enterprise")
 
-def explain_service(service, identity_enabled, assigned, enabled, credential_ready, targets, requested_nas=None):
+def explain_service(service, identity_enabled, assigned, enabled, credential_ready, targets, requested_nas=None, expired=False):
     candidates=[t for t in targets if requested_nas is None or t["nas_id"]==requested_nas]
     reasons=[]
     if not identity_enabled:
         reasons.append("identity_disabled")
+    if expired:
+        reasons.append("identity_expired")
     if not assigned:
         reasons.append("service_not_assigned")
     elif not enabled:
@@ -21,7 +23,7 @@ def explain_service(service, identity_enabled, assigned, enabled, credential_rea
             "reasons":reasons,"targets":candidates}
 
 def inspect_identity(conn, identity_id, nas_id=None):
-    identity=conn.execute("""SELECT i.id,i.username,i.enabled,
+    identity=conn.execute("""SELECT i.id,i.username,i.enabled,COALESCE(i.account_expires_at<=now(),false) AS expired,
         COALESCE(c.password_hash ~ '^[A-Za-z0-9+/]{107}=$',false) AS pap_ready,
         COALESCE(c.nt_password ~ '^[0-9a-f]{32}$',false) AS mschap_ready
         FROM zradius_identities i LEFT JOIN zradius_identity_credentials c ON c.identity_id=i.id
@@ -56,7 +58,7 @@ def inspect_identity(conn, identity_id, nas_id=None):
             credential=identity["pap_ready"] or identity["mschap_ready"]
         services.append(explain_service(service,identity["enabled"],assignment is not None,
             bool(assignment and assignment["enabled"]),credential,
-            [t for t in targets if t["service"]==service],nas_id))
+            [t for t in targets if t["service"]==service],nas_id,expired=identity["expired"]))
     groups=conn.execute("""SELECT g.id,g.name FROM zradius_identity_groups g JOIN zradius_identity_group_members m ON m.group_id=g.id
         WHERE m.identity_id=%s ORDER BY g.name""",(identity_id,)).fetchall()
     return {"identity":identity,"requested_nas_id":nas_id,"services":services,"groups":groups,
