@@ -3255,6 +3255,46 @@ def identity_password(identity_id:int,body:PppPassword,principal=Depends(auth)):
         audit(conn,"identity.password",row["username"])
     return {"status":"updated"}
 
+class ServiceCredentialRotation(BaseModel):
+    password:SecretStr=Field(min_length=24,max_length=128)
+    expected_updated_at:datetime|None=None
+    confirm:bool=False
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/identities/{identity_id}/rotate-credential")
+def rotate_service_credential(identity_id:int,body:ServiceCredentialRotation,principal=Depends(auth)):
+    personal_admin(principal)
+    if not body.confirm:
+        raise HTTPException(422,"Explicit credential rotation confirmation required")
+    if body.expected_updated_at is not None and body.expected_updated_at.utcoffset() is None:
+        raise HTTPException(422,"Credential timestamp requires timezone")
+    password=body.password.get_secret_value()
+    try:
+        nt,digest=ppp_credentials(password)
+        web_hash=hash_password(password)
+    except ValueError:
+        raise HTTPException(422,"Invalid password")
+    with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s AND account_type='service' FOR UPDATE",(identity_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Service identity not found")
+        if conn.execute("SELECT 1 FROM zradius_admin_users WHERE identity_id=%s",(identity_id,)).fetchone():
+            raise HTTPException(409,"Management identity requires separate credential procedure")
+        current=conn.execute("SELECT updated_at,nt_password FROM zradius_identity_credentials WHERE identity_id=%s FOR UPDATE",(identity_id,)).fetchone()
+        if (current["updated_at"] if current else None)!=body.expected_updated_at:
+            raise HTTPException(409,"Credentials changed; refresh before rotating")
+        if current and current["nt_password"] and secrets.compare_digest(current["nt_password"],nt):
+            raise HTTPException(422,"Choose a different password")
+        updated=conn.execute("""INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password,web_password_hash)
+            VALUES (%s,%s,%s,%s) ON CONFLICT(identity_id) DO UPDATE SET
+            password_hash=excluded.password_hash,nt_password=excluded.nt_password,
+            web_password_hash=excluded.web_password_hash,updated_at=now()
+            RETURNING updated_at""",(identity_id,digest,nt,web_hash)).fetchone()
+        conn.execute("UPDATE zradius_identities SET updated_at=now() WHERE id=%s",(identity_id,))
+        audit(conn,"identity.credential.rotate",row["username"])
+        return {"status":"rotated","credential_updated_at":updated["updated_at"],"network_disconnected":False}
+
 class IdentityServices(BaseModel):
     device:bool=False
     l2tp:bool=False
