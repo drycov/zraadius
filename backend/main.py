@@ -2697,7 +2697,7 @@ def apply_existing_service_profile(conn,identity_id,service,params,principal,res
         conn.execute("""UPDATE zradius_l2tp_users SET nas_id=%s,profile_id=%s,group_id=%s,address_space_id=%s,static_ip=%s::inet,description=%s,enabled=%s WHERE identity_id=%s""",
             (a.nas_id,a.profile_id,a.group_id,a.address_space_id,address,a.description,state["enabled"],identity_id))
     elif service=="console":
-        state=restore if restore is not None else {"enabled":True,"role":params["role"]}
+        state=restore if restore is not None else {"enabled":True,"role":params}
         _update_identity_console(conn,identity_id,IdentityConsoleUpdate(**state),principal)
 
 def record_policy_history(conn,identity_id,username,actor,operation,revision,before,after,rollback_of=None):
