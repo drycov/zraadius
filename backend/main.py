@@ -4155,6 +4155,61 @@ def create_identity_group(body:DeviceRoleCreate):
         audit(conn,"identity.group.create",str(row["id"]))
         return row
 
+@app.get("/api/v1/identities/groups/{group_id}/members")
+def unified_group_members(group_id:int,limit:int=100,after_id:int=0,q:str="",principal=Depends(auth)):
+    personal_admin(principal)
+    q=q.strip()
+    if not 1<=limit<=200 or after_id<0 or len(q)>200:
+        raise HTTPException(422,"Invalid member filters")
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        if not conn.execute("SELECT 1 FROM zradius_identity_groups WHERE id=%s",(group_id,)).fetchone():
+            raise HTTPException(404,"Identity group not found")
+        rows=conn.execute("""SELECT i.id,i.username,i.full_name,i.department,i.account_type,i.enabled
+            FROM zradius_identity_group_members m JOIN zradius_identities i ON i.id=m.identity_id
+            WHERE m.group_id=%s AND i.id>%s AND (%s='' OR strpos(lower(i.username),lower(%s))>0
+            OR strpos(lower(i.full_name),lower(%s))>0)
+            ORDER BY i.id LIMIT %s""",(group_id,after_id,q,q,q,limit+1)).fetchall()
+        return {"items":rows[:limit],"next_after_id":rows[limit-1]["id"] if len(rows)>limit else None}
+
+class GroupMembershipPatch(BaseModel):
+    add:list[int]=Field(default_factory=list,max_length=100)
+    remove:list[int]=Field(default_factory=list,max_length=100)
+    confirm:bool=False
+    model_config={"extra":"forbid"}
+
+@app.patch("/api/v1/identities/groups/{group_id}/members")
+def patch_unified_group_members(group_id:int,body:GroupMembershipPatch,principal=Depends(auth)):
+    personal_admin(principal)
+    add,remove=set(body.add),set(body.remove)
+    ids=sorted(add|remove)
+    if not ids or len(ids)>100 or any(i<=0 for i in ids) or add&remove or len(add)!=len(body.add) or len(remove)!=len(body.remove):
+        raise HTTPException(422,"Provide 1-100 distinct positive IDs without overlap")
+    if not body.confirm:
+        raise HTTPException(422,"Membership change confirmation required")
+    with db() as conn:
+        # Match the existing identity-first membership lock order.
+        rows=conn.execute("SELECT id,username FROM zradius_identities WHERE id=ANY(%s::bigint[]) ORDER BY id FOR UPDATE",(ids,)).fetchall()
+        if len(rows)!=len(ids):
+            raise HTTPException(404,"Identity not found")
+        if not conn.execute("SELECT id FROM zradius_identity_groups WHERE id=%s FOR KEY SHARE",(group_id,)).fetchone():
+            raise HTTPException(404,"Identity group not found")
+        changed_add=[]
+        changed_remove=[]
+        for row in rows:
+            identity_id=row["id"]
+            if identity_id in add:
+                changed=conn.execute("INSERT INTO zradius_identity_group_members(group_id,identity_id) VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING identity_id",(group_id,identity_id)).fetchone()
+                if changed:
+                    changed_add.append(identity_id)
+                    audit(conn,"identity.group.member.add",str(group_id)+":"+row["username"])
+            else:
+                changed=conn.execute("DELETE FROM zradius_identity_group_members WHERE group_id=%s AND identity_id=%s RETURNING identity_id",(group_id,identity_id)).fetchone()
+                if changed:
+                    changed_remove.append(identity_id)
+                    audit(conn,"identity.group.member.remove",str(group_id)+":"+row["username"])
+        return {"added":changed_add,"removed":changed_remove,"unchanged":len(ids)-len(changed_add)-len(changed_remove),"sessions_disconnected":False}
+
 @app.put("/api/v1/identities/groups/{group_id}/bindings",dependencies=[Depends(auth)])
 def identity_group_bindings(group_id:int,body:IdentityGroupBindings):
     ids=sorted(set(body.device_group_ids))
