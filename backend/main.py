@@ -2571,6 +2571,13 @@ def resolve_effective_access_profile(conn,identity_id):
         WHERE m.identity_id=%s ORDER BY g.id""",(identity["account_type"],identity_id)).fetchall()
     valid={r["template_id"] for r in groups if r["enabled"] and r["account_type"]==identity["account_type"]}
     invalid=[r for r in groups if not r["enabled"] or r["account_type"]!=identity["account_type"]]
+    policy_profiles=conn.execute("""SELECT DISTINCT p.id AS policy_id,p.name AS policy_name,t.id AS template_id,t.name AS template_name,t.enabled,t.account_type
+        FROM zradius_policies p JOIN zradius_policy_assignments a ON a.policy_id=p.id
+        JOIN zradius_access_templates t ON t.id=CASE WHEN %s='person' THEN p.person_template_id ELSE p.service_template_id END
+        WHERE p.enabled AND (a.identity_id=%s OR EXISTS(SELECT 1 FROM zradius_identity_group_members m
+            WHERE m.identity_id=%s AND m.group_id=a.group_id)) ORDER BY p.id""",(identity["account_type"],identity_id,identity_id)).fetchall()
+    valid.update(r["template_id"] for r in policy_profiles if r["enabled"] and r["account_type"]==identity["account_type"])
+    invalid.extend(r for r in policy_profiles if not r["enabled"] or r["account_type"]!=identity["account_type"])
     target=identity["access_template_id"]
     source="direct" if target is not None else "none"
     if target is None:
@@ -2585,7 +2592,7 @@ def resolve_effective_access_profile(conn,identity_id):
     if target is not None and (not template or not template["enabled"] or template["account_type"]!=identity["account_type"]):
         source="invalid_direct" if source=="direct" else "invalid_group"
         template=None
-    return {"source":source,"effective_template_id":template["id"] if template else None,"group_candidates":groups,
+    return {"source":source,"effective_template_id":template["id"] if template else None,"group_candidates":groups,"policy_candidates":policy_profiles,
         "comparison":profile_comparison(conn,identity,template),"runtime_changed":False}
 
 @app.get("/api/v1/identities/{identity_id}/effective-access-profile")
@@ -2964,7 +2971,7 @@ def update_reusable_policy(policy_id:int,body:ReusablePolicyUpdate,principal=Dep
             raise HTTPException(422,"Policy change confirmation required")
         name=policy_name(body.name)
         description=body.description.strip()
-        if body.enabled and not conn.execute("SELECT 1 FROM zradius_policy_entries WHERE policy_id=%s AND enabled LIMIT 1",(policy_id,)).fetchone():
+        if body.enabled and not (old["person_template_id"] or old["service_template_id"]) and not conn.execute("SELECT 1 FROM zradius_policy_entries WHERE policy_id=%s AND enabled LIMIT 1",(policy_id,)).fetchone():
             raise HTTPException(409,"An enabled policy requires an enabled entry")
         if (old["name"],old["description"],old["enabled"])==(name,description,body.enabled):
             return {"policy":old,"runtime_enforced":False}
@@ -2988,6 +2995,75 @@ def delete_reusable_policy(policy_id:int,expected_revision:int,confirm:bool=Fals
         audit(conn,"policy.catalog.delete",str(policy_id))
         return {"status":"deleted","runtime_enforced":False}
 
+class PolicyProfilesUpdate(BaseModel):
+    person_template_id:int|None=Field(default=None,gt=0)
+    service_template_id:int|None=Field(default=None,gt=0)
+    expected_revision:int=Field(gt=0)
+    confirm:bool=False
+    model_config={"extra":"forbid"}
+
+@app.put("/api/v1/identities/policy-catalog/{policy_id}/profiles")
+def update_policy_profiles(policy_id:int,body:PolicyProfilesUpdate,principal=Depends(auth)):
+    personal_admin(principal)
+    if not body.confirm:
+        raise HTTPException(422,"Confirmation required")
+    with db() as conn:
+        old=lock_reusable_policy(conn,policy_id,body.expected_revision)
+        for kind,tid in (("person",body.person_template_id),("service",body.service_template_id)):
+            if tid is not None:
+                validate_profile_reference(conn,tid,kind)
+        row=conn.execute("""UPDATE zradius_policies SET person_template_id=%s,service_template_id=%s,
+            revision=revision+1,updated_at=now() WHERE id=%s RETURNING *""",
+            (body.person_template_id,body.service_template_id,policy_id)).fetchone()
+        audit(conn,"policy.profiles.update",str(policy_id)+":revision:"+str(row["revision"]))
+        return {"policy":row,"runtime_changed":False}
+
+class DirectRuleMigration(BaseModel):
+    name:str=Field(min_length=1,max_length=128)
+    rule_ids:list[int]=Field(min_length=1,max_length=100)
+    preview:bool=True
+    expected_digest:str|None=None
+    confirm:bool=False
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/identities/policy-catalog/migrate-direct")
+def migrate_direct_policy_rules(body:DirectRuleMigration,principal=Depends(auth)):
+    personal_admin(principal)
+    import hashlib,json
+    ids=sorted(set(body.rule_ids))
+    if len(ids)!=len(body.rule_ids) or any(i<=0 for i in ids):
+        raise HTTPException(422,"Distinct positive rule IDs required")
+    name=policy_name(body.name)
+    with db() as conn:
+        # Freeze selected rule rows; all rules must have the same subject.
+        rows=conn.execute("SELECT * FROM zradius_policy_rules WHERE id=ANY(%s::bigint[]) ORDER BY id FOR UPDATE",(ids,)).fetchall()
+        if len(rows)!=len(ids):
+            raise HTTPException(404,"Direct rule not found")
+        subjects={(r["identity_id"],r["group_id"]) for r in rows}
+        if len(subjects)!=1:
+            raise HTTPException(422,"Select rules belonging to one subject")
+        identity_id,group_id=next(iter(subjects))
+        digest=hashlib.sha256(json.dumps({"name":name,"rows":rows},sort_keys=True,default=str).encode()).hexdigest()
+        if body.preview:
+            return {"preview":True,"digest":digest,"rules":rows,"identity_id":identity_id,"group_id":group_id,"runtime_changed":False}
+        if not body.confirm or body.expected_digest!=digest:
+            raise HTTPException(409,"Confirmed current preview required")
+        p=conn.execute("INSERT INTO zradius_policies(name,description,enabled) VALUES (%s,%s,%s) RETURNING *",
+            (name,"Migrated direct rules",any(r["enabled"] for r in rows))).fetchone()
+        for r in rows:
+            conn.execute("""INSERT INTO zradius_policy_entries(policy_id,service,nas_id,effect,enabled,reason)
+                VALUES (%s,%s,%s,%s,%s,%s)""",(p["id"],r["service"],r["nas_id"],r["effect"],r["enabled"],r["reason"]))
+        conn.execute("INSERT INTO zradius_policy_assignments(policy_id,identity_id,group_id) VALUES (%s,%s,%s)",(p["id"],identity_id,group_id))
+        projected=conn.execute("""SELECT service,nas_id,effect,enabled,reason FROM zradius_effective_policy_rules
+            WHERE policy_id=%s""",(p["id"],)).fetchall()
+        def signature(items):
+            return sorted([json.dumps({k:r[k] for k in ("service","nas_id","effect","enabled","reason")},sort_keys=True) for r in items])
+        if signature(projected)!=signature(rows):
+            raise HTTPException(409,"Migration equivalence check failed")
+        conn.execute("DELETE FROM zradius_policy_rules WHERE id=ANY(%s::bigint[])",(ids,))
+        audit(conn,"policy.direct.migrate",str(p["id"])+":"+",".join(map(str,ids)))
+        return {"preview":False,"policy":p,"migrated_ids":ids,"equivalent":True,"sessions_disconnected":False}
+
 class PolicyEntriesReplace(BaseModel):
     entries:list[CentralizedPolicyRule]=Field(max_length=100)
     expected_revision:int=Field(gt=0)
@@ -3004,7 +3080,7 @@ def replace_reusable_policy_entries(policy_id:int,body:PolicyEntriesReplace,prin
         keys=[(e.service,e.nas_id,e.effect) for e in body.entries]
         if len(set(keys))!=len(keys):
             raise HTTPException(422,"Duplicate policy entries")
-        if old["enabled"] and not any(e.enabled for e in body.entries):
+        if old["enabled"] and not (old["person_template_id"] or old["service_template_id"]) and not any(e.enabled for e in body.entries):
             raise HTTPException(409,"Enabled policy requires an enabled entry")
         values=[(policy_id,e.service,e.nas_id,e.effect,e.enabled,validate_centralized_rule(conn,e)) for e in body.entries]
         conn.execute("DELETE FROM zradius_policy_entries WHERE policy_id=%s",(policy_id,))
