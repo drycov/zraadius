@@ -15,7 +15,7 @@ zradius_device_roles zradius_ipoe_bindings zradius_ip_pools zradius_ip_allocatio
 zradius_radius_pool_exports zradius_radius_pool_addresses zradius_radius_pool_groups
 radippool zradius_radius_pool_active zradius_hotspot_vouchers zradius_device_users
 zradius_device_grants zradius_eap_users zradius_eap_grants zradius_pki_certificates
-zradius_pki_grants zradius_proxy_realms zradius_proxy_grants zradius_admin_users zradius_admin_sessions zradius_login_limits zradius_service_accounts zradius_service_tokens zradius_device_role_catalog zradius_device_user_groups zradius_device_user_members zradius_device_group_grants zradius_nas_groups zradius_nas_group_members zradius_nas_group_networks zradius_device_nas_group_grants zradius_device_reply_profiles zradius_ppp_profiles zradius_l2tp_users zradius_vpn_groups zradius_vpn_address_spaces zradius_vpn_pools zradius_identities zradius_identity_credentials zradius_identity_groups zradius_identity_group_members zradius_identity_group_device_bindings zradius_identity_group_vpn_templates zradius_identity_pppoe zradius_identity_hotspot zradius_identity_eap zradius_directory_profiles zradius_directory_identities zradius_directory_groups zradius_directory_group_members zradius_directory_group_mappings zradius_access_templates""".split()
+zradius_pki_grants zradius_proxy_realms zradius_proxy_grants zradius_admin_users zradius_admin_sessions zradius_login_limits zradius_service_accounts zradius_service_tokens zradius_device_role_catalog zradius_device_user_groups zradius_device_user_members zradius_device_group_grants zradius_nas_groups zradius_nas_group_members zradius_nas_group_networks zradius_device_nas_group_grants zradius_device_reply_profiles zradius_ppp_profiles zradius_l2tp_users zradius_vpn_groups zradius_vpn_address_spaces zradius_vpn_pools zradius_identities zradius_identity_credentials zradius_identity_groups zradius_identity_group_members zradius_identity_group_device_bindings zradius_identity_group_vpn_templates zradius_identity_pppoe zradius_identity_hotspot zradius_identity_eap zradius_directory_profiles zradius_directory_identities zradius_directory_groups zradius_directory_group_members zradius_directory_group_mappings zradius_access_templates zradius_profile_overrides""".split()
 api_read="alembic_version radacct radpostauth nasreload zradius_services zradius_device_auth_log zradius_device_effective_grants zradius_nas_group_effective_members zradius_l2tp_effective_profiles".split()
 runtime_read="""radcheck radreply radgroupcheck radgroupreply radusergroup nas zradius_nas_services
 zradius_ipoe_bindings zradius_hotspot_vouchers zradius_device_users zradius_device_grants
@@ -51,6 +51,8 @@ def main():
             conn.execute(sql.SQL("GRANT CONNECT ON DATABASE radius TO {}").format(sql.Identifier(role)))
         grant(conn,"zradius_api","SELECT, INSERT, UPDATE, DELETE",api_write)
         grant(conn,"zradius_api","SELECT",api_read)
+        grant(conn,"zradius_api","SELECT, INSERT",["zradius_policy_history"])
+        conn.execute("GRANT USAGE, SELECT ON SEQUENCE public.zradius_policy_history_id_seq TO zradius_api")
         grant(conn,"zradius_runtime","SELECT",[t for t in runtime_read if t!="zradius_identity_credentials"])
         conn.execute("GRANT SELECT (identity_id,password_hash,nt_password) ON public.zradius_identity_credentials TO zradius_runtime")
         grant(conn,"zradius_runtime","SELECT, INSERT, UPDATE",runtime_write)
