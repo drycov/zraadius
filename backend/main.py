@@ -2569,6 +2569,64 @@ def assign_identity_access_profile(identity_id:int,body:ProfileAssignment,princi
             result["assigned_template_id"]=body.template_id
         return result
 
+class GroupAccessProfiles(BaseModel):
+    person_template_id:int|None=Field(default=None,gt=0)
+    service_template_id:int|None=Field(default=None,gt=0)
+    model_config={"extra":"forbid"}
+
+@app.get("/api/v1/identities/groups/{group_id}/access-profiles")
+def get_group_access_profiles(group_id:int,principal=Depends(auth)):
+    with db() as conn:
+        row=conn.execute("SELECT id,person_template_id,service_template_id FROM zradius_identity_groups WHERE id=%s",(group_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Group not found")
+        return row
+
+@app.put("/api/v1/identities/groups/{group_id}/access-profiles")
+def update_group_access_profiles(group_id:int,body:GroupAccessProfiles,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        row=conn.execute("SELECT id,name FROM zradius_identity_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Group not found")
+        for kind,template_id in (("person",body.person_template_id),("service",body.service_template_id)):
+            if template_id is not None:
+                validate_profile_reference(conn,template_id,kind)
+        result=conn.execute("UPDATE zradius_identity_groups SET person_template_id=%s,service_template_id=%s WHERE id=%s RETURNING id,person_template_id,service_template_id",(body.person_template_id,body.service_template_id,group_id)).fetchone()
+        audit(conn,"identity.group.access-profiles",row["name"])
+        return result
+
+@app.get("/api/v1/identities/{identity_id}/effective-access-profile")
+def effective_access_profile(identity_id:int,principal=Depends(auth)):
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        identity=conn.execute("SELECT id,account_type,access_template_id FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone()
+        if not identity:
+            raise HTTPException(404,"Identity not found")
+        groups=conn.execute("""SELECT g.id AS group_id,g.name AS group_name,t.id AS template_id,t.name AS template_name,t.enabled,t.account_type
+            FROM zradius_identity_group_members m JOIN zradius_identity_groups g ON g.id=m.group_id
+            JOIN zradius_access_templates t ON t.id=CASE WHEN %s='person' THEN g.person_template_id ELSE g.service_template_id END
+            WHERE m.identity_id=%s ORDER BY g.id""",(identity["account_type"],identity_id)).fetchall()
+        valid={r["template_id"] for r in groups if r["enabled"] and r["account_type"]==identity["account_type"]}
+        invalid=[r for r in groups if not r["enabled"] or r["account_type"]!=identity["account_type"]]
+        target=identity["access_template_id"]
+        source="direct" if target is not None else "none"
+        if target is None:
+            if invalid:
+                source="invalid_group"
+            elif len(valid)>1:
+                source="conflict"
+            elif len(valid)==1:
+                target=next(iter(valid))
+                source="group"
+        template=conn.execute("SELECT id,name,account_type,services,enabled,parameters FROM zradius_access_templates WHERE id=%s",(target,)).fetchone() if target is not None else None
+        if target is not None and (not template or not template["enabled"] or template["account_type"]!=identity["account_type"]):
+            source="invalid_direct" if source=="direct" else "invalid_group"
+            template=None
+        return {"source":source,"effective_template_id":template["id"] if template else None,"group_candidates":groups,
+            "comparison":profile_comparison(conn,identity,template),"runtime_changed":False}
+
 class BulkProfileAssignment(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
     template_id:int|None=Field(default=None,gt=0)
