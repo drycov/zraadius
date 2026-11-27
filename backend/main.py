@@ -2988,6 +2988,74 @@ def delete_reusable_policy(policy_id:int,expected_revision:int,confirm:bool=Fals
         audit(conn,"policy.catalog.delete",str(policy_id))
         return {"status":"deleted","runtime_enforced":False}
 
+class PolicyEntriesReplace(BaseModel):
+    entries:list[CentralizedPolicyRule]=Field(max_length=100)
+    expected_revision:int=Field(gt=0)
+    confirm:bool=False
+    model_config={"extra":"forbid"}
+
+@app.put("/api/v1/identities/policy-catalog/{policy_id}/entries")
+def replace_reusable_policy_entries(policy_id:int,body:PolicyEntriesReplace,principal=Depends(auth)):
+    personal_admin(principal)
+    if not body.confirm:
+        raise HTTPException(422,"Confirmation required")
+    with db() as conn:
+        old=lock_reusable_policy(conn,policy_id,body.expected_revision)
+        keys=[(e.service,e.nas_id,e.effect) for e in body.entries]
+        if len(set(keys))!=len(keys):
+            raise HTTPException(422,"Duplicate policy entries")
+        if old["enabled"] and not any(e.enabled for e in body.entries):
+            raise HTTPException(409,"Enabled policy requires an enabled entry")
+        values=[(policy_id,e.service,e.nas_id,e.effect,e.enabled,validate_centralized_rule(conn,e)) for e in body.entries]
+        conn.execute("DELETE FROM zradius_policy_entries WHERE policy_id=%s",(policy_id,))
+        for value in values:
+            conn.execute("INSERT INTO zradius_policy_entries(policy_id,service,nas_id,effect,enabled,reason) VALUES (%s,%s,%s,%s,%s,%s)",value)
+        row=conn.execute("UPDATE zradius_policies SET revision=revision+1,updated_at=now() WHERE id=%s RETURNING *",(policy_id,)).fetchone()
+        audit(conn,"policy.entries.replace",str(policy_id)+":revision:"+str(row["revision"]))
+        return {"policy":row,"runtime_enforced":False}
+
+class PolicyAssignmentChange(BaseModel):
+    subject:Literal["identity","group"]
+    subject_id:int=Field(gt=0)
+    assigned:bool
+    expected_revision:int=Field(gt=0)
+    confirm:bool=False
+    model_config={"extra":"forbid"}
+
+@app.get("/api/v1/identities/policy-catalog/{policy_id}/assignments")
+def reusable_policy_assignments(policy_id:int,limit:int=100,after_id:int=0,principal=Depends(auth)):
+    personal_admin(principal)
+    if not 1<=limit<=200 or after_id<0:
+        raise HTTPException(422,"Invalid pagination")
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        if not conn.execute("SELECT 1 FROM zradius_policies WHERE id=%s",(policy_id,)).fetchone():
+            raise HTTPException(404,"Policy not found")
+        rows=conn.execute("""SELECT a.*,COALESCE(i.username,g.name) AS subject_name,
+            CASE WHEN a.identity_id IS NOT NULL THEN 'identity' ELSE 'group' END AS subject
+            FROM zradius_policy_assignments a LEFT JOIN zradius_identities i ON i.id=a.identity_id
+            LEFT JOIN zradius_identity_groups g ON g.id=a.group_id
+            WHERE a.policy_id=%s AND a.id>%s ORDER BY a.id LIMIT %s""",(policy_id,after_id,limit+1)).fetchall()
+        return {"items":rows[:limit],"next_after_id":rows[limit-1]["id"] if len(rows)>limit else None}
+
+@app.put("/api/v1/identities/policy-catalog/{policy_id}/assignments")
+def change_reusable_policy_assignment(policy_id:int,body:PolicyAssignmentChange,principal=Depends(auth)):
+    personal_admin(principal)
+    if not body.confirm:
+        raise HTTPException(422,"Confirmation required")
+    with db() as conn:
+        old=lock_reusable_policy(conn,policy_id,body.expected_revision)
+        policy_subject(conn,body.subject,body.subject_id)
+        column="identity_id" if body.subject=="identity" else "group_id"
+        if body.assigned:
+            changed=conn.execute(f"INSERT INTO zradius_policy_assignments(policy_id,{column}) VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING id",(policy_id,body.subject_id)).fetchone()
+        else:
+            changed=conn.execute(f"DELETE FROM zradius_policy_assignments WHERE policy_id=%s AND {column}=%s RETURNING id",(policy_id,body.subject_id)).fetchone()
+        if changed:
+            old=conn.execute("UPDATE zradius_policies SET revision=revision+1,updated_at=now() WHERE id=%s RETURNING *",(policy_id,)).fetchone()
+            audit(conn,"policy.assignment."+("add" if body.assigned else "remove"),f"{policy_id}:{body.subject}:{body.subject_id}")
+        return {"policy":old,"changed":bool(changed),"runtime_enforced":False}
+
 def policy_subject(conn,subject,subject_id,lock=False):
     table,column=("zradius_identities","username") if subject=="identity" else ("zradius_identity_groups","name")
     row=conn.execute(f"SELECT {column} AS name FROM {table} WHERE id=%s"+(" FOR UPDATE" if lock else ""),(subject_id,)).fetchone()
