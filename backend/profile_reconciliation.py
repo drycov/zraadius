@@ -5,7 +5,8 @@ SERVICE_FIELDS={
     "console":"console_role",
 }
 
-def build_plan(effective):
+def build_plan(effective, overrides=None):
+    overrides=overrides or {}
     comparison=effective["comparison"]
     template=comparison["template"]
     if effective["source"] not in ("direct","group") or not template:
@@ -14,7 +15,7 @@ def build_plan(effective):
     actual=set(comparison["actual_services"])
     parameters=template.get("parameters") or {}
     operations=[]
-    for service in sorted(expected|actual):
+    for service in sorted(expected|actual|set(overrides)):
         differences=[r for r in comparison.get("parameter_comparison",[]) if r["service"]==service and r["status"]!="match"]
         configured=parameters.get(SERVICE_FIELDS[service])
         if service not in expected:
@@ -25,8 +26,12 @@ def build_plan(effective):
             action,reason="UPDATE","individual_parameters_require_review"
         else:
             action,reason="KEEP","no_detected_difference"
-        operations.append({"service":service,"action":action,"reason":reason,
+        override=overrides.get(service)
+        proposed_action=action
+        if override:
+            action,reason="KEEP","protected_by_override"
+        operations.append({"override":override,"proposed_action":proposed_action,"service":service,"action":action,"reason":reason,
             "expected_parameters":configured,"differences":differences,
             "requires_review":action!="KEEP","apply_supported":False})
-    return {"status":"review_required" if any(o["requires_review"] for o in operations) else "in_sync",
+    return {"status":"review_required" if any(o["requires_review"] for o in operations) else "protected" if any(o["override"] and o["proposed_action"]!="KEEP" for o in operations) else "in_sync",
         "reason":None,"operations":operations,"runtime_changed":False}
