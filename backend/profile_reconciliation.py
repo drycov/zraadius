@@ -18,7 +18,9 @@ def build_plan(effective, overrides=None):
     for service in sorted(expected|actual|set(overrides)):
         differences=[r for r in comparison.get("parameter_comparison",[]) if r["service"]==service and r["status"]!="match"]
         configured=parameters.get(SERVICE_FIELDS[service])
-        if service not in expected:
+        if service not in expected and service not in actual:
+            action,reason="KEEP","no_detected_difference"
+        elif service not in expected:
             action,reason="DISABLE","individual_assignment_requires_review"
         elif service not in actual:
             action,reason="CREATE","missing_service_parameters" if configured is None else "missing_or_disabled_assignment"
