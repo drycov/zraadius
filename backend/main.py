@@ -2485,6 +2485,47 @@ class ProfileAssignment(BaseModel):
     preview:bool=True
     model_config={"extra":"forbid"}
 
+def profile_parameter_comparison(conn,identity_id,template):
+    if not template:
+        return []
+    params=template["parameters"] or {}
+    queries={
+        "device":("device-aaa","SELECT g.nas_id,g.role,g.filter_id,g.profile_id FROM zradius_device_grants g JOIN zradius_device_users u ON u.id=g.user_id WHERE u.identity_id=%s AND u.enabled ORDER BY g.nas_id"),
+        "l2tp":("l2tp","SELECT nas_id,profile_id FROM zradius_l2tp_users WHERE identity_id=%s AND enabled"),
+        "pppoe":("pppoe","SELECT nas_id,rate_limit,pool,interim_seconds FROM zradius_identity_pppoe WHERE identity_id=%s AND enabled"),
+        "hotspot":("hotspot","SELECT nas_id,rate_limit,session_seconds,idle_seconds FROM zradius_identity_hotspot WHERE identity_id=%s AND enabled"),
+        "dot1x":("dot1x","SELECT nas_id,vlan_id FROM zradius_identity_eap WHERE identity_id=%s AND enabled AND service_code='dot1x'"),
+        "wpa_enterprise":("wpa-enterprise","SELECT nas_id,vlan_id FROM zradius_identity_eap WHERE identity_id=%s AND enabled AND service_code='wpa-enterprise'")
+    }
+    result=[]
+    for key,(service,query) in queries.items():
+        expected=params.get(key)
+        if not isinstance(expected,dict):
+            continue
+        rows=conn.execute(query,(identity_id,)).fetchall()
+        # Compare a single direct assignment at the intended NAS, not attributes
+        # assembled from unrelated grants. Other grants remain visible separately.
+        candidates=[r for r in rows if r["nas_id"]==expected.get("nas_id")]
+        actual=candidates[0] if len(candidates)==1 else None
+        for field,value in expected.items():
+            if value is None:
+                continue
+            observed=actual.get(field) if actual else None
+            if field=="nas_id" and not candidates:
+                observed=[r["nas_id"] for r in rows]
+            result.append({"service":service,"parameter":field,"expected":value,"actual":observed,
+                "status":"match" if actual is not None and observed==value else "missing" if not rows else "different"})
+        extra=sorted({r["nas_id"] for r in rows if r["nas_id"]!=expected.get("nas_id")})
+        if extra:
+            result.append({"service":service,"parameter":"additional_direct_nas","expected":[],"actual":extra,"status":"different"})
+    if params.get("console_role") is not None:
+        row=conn.execute("SELECT role FROM zradius_admin_users WHERE identity_id=%s AND enabled",(identity_id,)).fetchone()
+        value=params["console_role"]
+        actual=row["role"] if row else None
+        result.append({"service":"console","parameter":"role","expected":value,"actual":actual,
+            "status":"match" if actual==value else "different" if row else "missing"})
+    return result
+
 def profile_comparison(conn,identity,template):
     identity_id=identity["id"]
     rows=conn.execute("""SELECT 'device-aaa' AS service,enabled FROM zradius_device_users WHERE identity_id=%s
@@ -2499,7 +2540,8 @@ def profile_comparison(conn,identity,template):
         "template":template,"actual_services":sorted(actual),"expected_services":sorted(expected),
         "missing_services":sorted(expected-actual) if template else [],
         "extra_services":sorted(actual-expected) if template else [],
-        "comparison_scope":"enabled_service_flags","runtime_changed":False}
+        "parameter_comparison":profile_parameter_comparison(conn,identity_id,template),
+        "comparison_scope":"enabled_service_flags_and_direct_parameters","runtime_changed":False}
 
 @app.get("/api/v1/identities/{identity_id}/access-profile")
 def get_identity_access_profile(identity_id:int,principal=Depends(auth)):
