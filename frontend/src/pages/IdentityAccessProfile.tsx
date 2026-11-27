@@ -11,6 +11,9 @@ export default function IdentityAccessProfile({request,id,kind,onSaved}:{request
  const [selection,setSelection]=useState<string>();
  const [preview,setPreview]=useState<Comparison>();
  const a=useAction(()=>{d.refresh();setPreview(undefined);setSelection(undefined)});
+ const [previewBusy,setPreviewBusy]=useState(false);
+ const [previewError,setPreviewError]=useState('');
+ const busy=a.busy||previewBusy;
  const current=d.data;
  const selected=selection??String(current?.assigned_template_id??'none');
  const target=selected==='none'?null:Number(selected);
@@ -20,11 +23,11 @@ export default function IdentityAccessProfile({request,id,kind,onSaved}:{request
  const comparison=preview??current;
  return <Space direction="vertical" className="full">
  <Alert type="info" message="Привязка профиля не изменяет сетевые права. Сравнение показывает включённые услуги, а не результат RADIUS-авторизации."/>
- <Fault error={d.error||templates.error}/>
+ <Fault error={d.error||templates.error||previewError}/>
  <span>Текущий профиль: {current?.template?.name??'Не назначен'}</span>
- <Select value={selected} options={options} disabled={a.busy||d.loading||templates.loading} onChange={v=>{setSelection(String(v));setPreview(undefined)}}/>
- <Space wrap><Button disabled={a.busy||!current||!valid} onClick={()=>a.run(async()=>{setPreview(await request<Comparison>(path,'PUT',{template_id:target,preview:true}))})}>Предпросмотр</Button><Button onClick={()=>{setPreview(undefined);setSelection(undefined);d.refresh();templates.refresh()}} disabled={a.busy}>Обновить</Button></Space>
+ <Select value={selected} options={options} disabled={busy||d.loading||templates.loading} onChange={v=>{setSelection(String(v));setPreview(undefined);setPreviewError('')}}/>
+ <Space wrap><Button disabled={busy||!current||!valid} onClick={async()=>{setPreviewBusy(true);setPreview(undefined);setPreviewError('');try{setPreview(await request<Comparison>(path,'PUT',{template_id:target,preview:true}))}catch(e){setPreviewError(e instanceof Error?e.message:'Ошибка предпросмотра')}finally{setPreviewBusy(false)}}}>Предпросмотр</Button><Button onClick={()=>{setPreview(undefined);setSelection(undefined);setPreviewError('');d.refresh();templates.refresh()}} disabled={busy}>Обновить</Button></Space>
  {comparison&&<Table<{service:string;expected:boolean;actual:boolean}> rowKey="service" pagination={false} dataSource={serviceCodes.map(service=>({service,expected:comparison.expected_services.includes(service),actual:comparison.actual_services.includes(service)}))} columns={[{title:'Услуга',dataIndex:'service'},{title:'Профиль',render:(_,r)=>comparison.template?(r.expected?'Да':'Нет'):'—'},{title:'Фактически',render:(_,r)=>r.actual?'Да':'Нет'},{title:'Сравнение',render:(_,r)=>!comparison.template?'—':<Tag color={r.expected===r.actual?'green':'orange'}>{r.expected===r.actual?'Совпадает':r.expected?'Отсутствует':'Дополнительная'}</Tag>}]}/>}
- {preview&&<><Alert type="warning" message="Сохранится только связь с профилем. Существующие назначения останутся без изменений."/><Button type="primary" disabled={a.busy||!valid} onClick={()=>a.run(async()=>{const result=await request<Comparison>(path,'PUT',{template_id:target,preview:false});onSaved(result.assigned_template_id)})}>Подтвердить привязку</Button></>}
+ {preview&&<><Alert type="warning" message="Сохранится только связь с профилем. Существующие назначения останутся без изменений."/><Button type="primary" disabled={busy||!valid} onClick={()=>a.run(async()=>{const result=await request<Comparison>(path,'PUT',{template_id:target,preview:false});onSaved(result.assigned_template_id)})}>Подтвердить привязку</Button></>}
  </Space>
 }
