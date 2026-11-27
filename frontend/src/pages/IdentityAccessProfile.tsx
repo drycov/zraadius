@@ -3,7 +3,10 @@ import {Alert,Button,Select,Space,Table,Tag} from '../ui';
 import {useData,useAction,Fault} from '../hooks';
 import {serviceCodes,type AccessTemplate} from './AccessTemplates';
 import type {Request} from '../api';
-type Comparison={assigned_template_id:number|null;template:Pick<AccessTemplate,'id'|'name'|'enabled'|'account_type'>|null;actual_services:string[];expected_services:string[];missing_services:string[];extra_services:string[];runtime_changed:boolean};
+type ParameterComparison={service:string;parameter:string;expected:unknown;actual:unknown;status:'match'|'different'|'missing'};
+const parameterLabels:Record<string,string>={nas_id:'NAS',role:'Роль',filter_id:'Filter-Id',profile_id:'Профиль',rate_limit:'Rate Limit',pool:'IP Pool',interim_seconds:'Interim Interval',session_seconds:'Session Timeout',idle_seconds:'Idle Timeout',vlan_id:'VLAN ID',additional_direct_nas:'Дополнительные NAS'};
+const formatValue=(v:unknown)=>v===null||v===undefined?'—':Array.isArray(v)?(v.length?v.join(', '):'Нет'):String(v);
+type Comparison={assigned_template_id:number|null;template:Pick<AccessTemplate,'id'|'name'|'enabled'|'account_type'>|null;actual_services:string[];expected_services:string[];missing_services:string[];extra_services:string[];runtime_changed:boolean;parameter_comparison?:ParameterComparison[]};
 export default function IdentityAccessProfile({request,id,kind,onSaved}:{request:Request;id:number;kind:'person'|'service';onSaved:(id:number|null)=>void}){
  const path='identities/'+id+'/access-profile';
  const d=useData<Comparison>(request,path);
@@ -28,6 +31,10 @@ export default function IdentityAccessProfile({request,id,kind,onSaved}:{request
  <Select value={selected} options={options} disabled={busy||d.loading||templates.loading} onChange={v=>{setSelection(String(v));setPreview(undefined);setPreviewError('')}}/>
  <Space wrap><Button disabled={busy||!current||!valid} onClick={async()=>{setPreviewBusy(true);setPreview(undefined);setPreviewError('');try{setPreview(await request<Comparison>(path,'PUT',{template_id:target,preview:true}))}catch(e){setPreviewError(e instanceof Error?e.message:'Ошибка предпросмотра')}finally{setPreviewBusy(false)}}}>Предпросмотр</Button><Button onClick={()=>{setPreview(undefined);setSelection(undefined);setPreviewError('');d.refresh();templates.refresh()}} disabled={busy}>Обновить</Button></Space>
  {comparison&&<Table<{service:string;expected:boolean;actual:boolean}> rowKey="service" pagination={false} dataSource={serviceCodes.map(service=>({service,expected:comparison.expected_services.includes(service),actual:comparison.actual_services.includes(service)}))} columns={[{title:'Услуга',dataIndex:'service'},{title:'Профиль',render:(_,r)=>comparison.template?(r.expected?'Да':'Нет'):'—'},{title:'Фактически',render:(_,r)=>r.actual?'Да':'Нет'},{title:'Сравнение',render:(_,r)=>!comparison.template?'—':<Tag color={r.expected===r.actual?'green':'orange'}>{r.expected===r.actual?'Совпадает':r.expected?'Отсутствует':'Дополнительная'}</Tag>}]}/>}
+ {comparison?.template&&<><strong>Сравнение параметров прямых назначений</strong><Alert type="info" message="Сравниваются явно заданные параметры включённых прямых назначений. Наследуемые групповые разрешения и результат авторизации не проверяются."/>
+ <Space wrap><Tag color="green">Совпадают: {(comparison.parameter_comparison??[]).filter(r=>r.status==='match').length}</Tag><Tag color="orange">Расхождения: {(comparison.parameter_comparison??[]).filter(r=>r.status!=='match').length}</Tag></Space>
+ <Table<ParameterComparison> rowKey={r=>r.service+'-'+r.parameter} pagination={false} dataSource={comparison.parameter_comparison??[]} columns={[{title:'Сервис',dataIndex:'service'},{title:'Параметр',render:(_,r)=>parameterLabels[r.parameter]??r.parameter},{title:'Профиль',render:(_,r)=>formatValue(r.expected)},{title:'Фактически',render:(_,r)=>formatValue(r.actual)},{title:'Статус',render:(_,r)=><Tag color={r.status==='match'?'green':r.status==='missing'?'red':'orange'}>{r.status==='match'?'Совпадает':r.status==='missing'?'Отсутствует':'Отличается'}</Tag>}]}/>
+ </>}
  {preview&&<><Alert type="warning" message="Сохранится только связь с профилем. Существующие назначения останутся без изменений."/><Button type="primary" disabled={busy||!valid} onClick={()=>a.run(async()=>{const result=await request<Comparison>(path,'PUT',{template_id:target,preview:false});onSaved(result.assigned_template_id)})}>Подтвердить привязку</Button></>}
  </Space>
 }
