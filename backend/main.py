@@ -3131,12 +3131,12 @@ def unified_policy_registry(limit:int=100,after_id:int=0,subject:Literal["identi
         return {"items":rows[:limit],"next_after_id":rows[limit-1]["id"] if len(rows)>limit else None,"runtime_enforced":False}
 
 def collect_identity_policy_rules(conn,identity_id):
-    return conn.execute("""SELECT r.*,CASE WHEN r.identity_id IS NOT NULL THEN 'identity' ELSE 'group' END AS source,
-        g.name AS group_name FROM zradius_policy_rules r
+    return conn.execute("""SELECT DISTINCT ON (r.id) r.*,CASE WHEN r.identity_id IS NOT NULL THEN 'identity' ELSE 'group' END AS source,
+        g.name AS group_name FROM zradius_effective_policy_rules r
         LEFT JOIN zradius_identity_groups g ON g.id=r.group_id
         WHERE r.identity_id=%s OR EXISTS(SELECT 1 FROM zradius_identity_group_members m
             WHERE m.identity_id=%s AND m.group_id=r.group_id)
-        ORDER BY r.id""",(identity_id,identity_id)).fetchall()
+        ORDER BY r.id,r.identity_id NULLS LAST,r.group_id NULLS LAST""",(identity_id,identity_id)).fetchall()
 
 @app.get("/api/v1/identities/{identity_id}/policy-rule-candidates")
 def identity_policy_rule_candidates(identity_id:int,principal=Depends(auth)):
