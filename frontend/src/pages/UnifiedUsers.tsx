@@ -14,6 +14,7 @@ import {ApplyVpnTemplate} from './IdentityVpnTemplate';
 import IdentityPolicies from './IdentityPolicies';
 import IdentityAaaPolicy from './IdentityAaaPolicy';
 import IdentityPolicySimulator from './IdentityPolicySimulator';
+import CentralizedPolicyRules from './CentralizedPolicyRules';
 import IdentityAccessProfile from './IdentityAccessProfile';
 import IdentityReconciliation from './IdentityReconciliation';
 import IdentityPolicyHistory from './IdentityPolicyHistory';
@@ -64,6 +65,7 @@ export default function UnifiedUsers({request}:{request:Request}){
  {id:'reconciliation',label:'Согласование профиля',content:<IdentityReconciliation key={editing.id} request={request} id={editing.id}/>},
  {id:'policy-history',label:'История политик',content:<IdentityPolicyHistory key={editing.id} request={request} id={editing.id}/>},
  {id:'aaa-policy',label:'AAA Policy Engine',content:<IdentityAaaPolicy key={editing.id} request={request} id={editing.id}/>},
+ {id:'centralized-policy',label:'Правила доступа',content:<CentralizedPolicyRules key={editing.id} request={request} id={editing.id}/>},
  {id:'policy-simulator',label:'Симулятор AAA',content:<IdentityPolicySimulator key={editing.id} request={request} id={editing.id}/>},
  {id:'policies',label:'AAA / VPN',content:<><IdentityPolicies request={request} id={editing.id} device={!!editing.device_id} vpn={!!editing.l2tp_id}/>{!editing.l2tp_id&&<ApplyVpnTemplate request={request} id={editing.id} refresh={()=>{setEditing(undefined);d.refresh()}}/>}</>},
  {id:'pppoe',label:'PPPoE',content:<IdentityPppoe request={request} id={editing.id} refresh={d.refresh}/>},
