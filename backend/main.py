@@ -2597,43 +2597,84 @@ def update_group_access_profiles(group_id:int,body:GroupAccessProfiles,principal
         audit(conn,"identity.group.access-profiles",row["name"])
         return result
 
+def resolve_effective_access_profile(conn,identity_id):
+    identity=conn.execute("SELECT id,account_type,access_template_id FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone()
+    if not identity:
+        raise HTTPException(404,"Identity not found")
+    groups=conn.execute("""SELECT g.id AS group_id,g.name AS group_name,t.id AS template_id,t.name AS template_name,t.enabled,t.account_type
+        FROM zradius_identity_group_members m JOIN zradius_identity_groups g ON g.id=m.group_id
+        JOIN zradius_access_templates t ON t.id=CASE WHEN %s='person' THEN g.person_template_id ELSE g.service_template_id END
+        WHERE m.identity_id=%s ORDER BY g.id""",(identity["account_type"],identity_id)).fetchall()
+    valid={r["template_id"] for r in groups if r["enabled"] and r["account_type"]==identity["account_type"]}
+    invalid=[r for r in groups if not r["enabled"] or r["account_type"]!=identity["account_type"]]
+    target=identity["access_template_id"]
+    source="direct" if target is not None else "none"
+    if target is None:
+        if invalid:
+            source="invalid_group"
+        elif len(valid)>1:
+            source="conflict"
+        elif len(valid)==1:
+            target=next(iter(valid))
+            source="group"
+    template=conn.execute("SELECT id,name,account_type,services,enabled,parameters FROM zradius_access_templates WHERE id=%s",(target,)).fetchone() if target is not None else None
+    if target is not None and (not template or not template["enabled"] or template["account_type"]!=identity["account_type"]):
+        source="invalid_direct" if source=="direct" else "invalid_group"
+        template=None
+    return {"source":source,"effective_template_id":template["id"] if template else None,"group_candidates":groups,
+        "comparison":profile_comparison(conn,identity,template),"runtime_changed":False}
+
 @app.get("/api/v1/identities/{identity_id}/effective-access-profile")
 def effective_access_profile(identity_id:int,principal=Depends(auth)):
     with db() as conn:
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        identity=conn.execute("SELECT id,account_type,access_template_id FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone()
+        return resolve_effective_access_profile(conn,identity_id)
+
+class ProfileOverride(BaseModel):
+    mode:Literal["INHERIT","OVERRIDE","LOCKED","EXCLUDED"]
+    reason:str=Field(default="",max_length=500)
+    model_config={"extra":"forbid"}
+
+def read_profile_overrides(conn,identity_id):
+    return conn.execute("SELECT service,mode,reason,updated_at FROM zradius_profile_overrides WHERE identity_id=%s ORDER BY service",(identity_id,)).fetchall()
+
+@app.get("/api/v1/identities/{identity_id}/profile-overrides")
+def get_profile_overrides(identity_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        if not conn.execute("SELECT id FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone():
+            raise HTTPException(404,"Identity not found")
+        return read_profile_overrides(conn,identity_id)
+
+@app.put("/api/v1/identities/{identity_id}/profile-overrides/{service}")
+def put_profile_override(identity_id:int,service:Literal["device-aaa","l2tp","pppoe","hotspot","dot1x","wpa-enterprise","console"],body:ProfileOverride,principal=Depends(auth)):
+    personal_admin(principal)
+    reason=body.reason.strip()
+    if not reason or any(ord(ch)<32 or 127<=ord(ch)<=159 for ch in reason):
+        raise HTTPException(422,"A valid reason is required, including for reset")
+    with db() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+        identity=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
         if not identity:
             raise HTTPException(404,"Identity not found")
-        groups=conn.execute("""SELECT g.id AS group_id,g.name AS group_name,t.id AS template_id,t.name AS template_name,t.enabled,t.account_type
-            FROM zradius_identity_group_members m JOIN zradius_identity_groups g ON g.id=m.group_id
-            JOIN zradius_access_templates t ON t.id=CASE WHEN %s='person' THEN g.person_template_id ELSE g.service_template_id END
-            WHERE m.identity_id=%s ORDER BY g.id""",(identity["account_type"],identity_id)).fetchall()
-        valid={r["template_id"] for r in groups if r["enabled"] and r["account_type"]==identity["account_type"]}
-        invalid=[r for r in groups if not r["enabled"] or r["account_type"]!=identity["account_type"]]
-        target=identity["access_template_id"]
-        source="direct" if target is not None else "none"
-        if target is None:
-            if invalid:
-                source="invalid_group"
-            elif len(valid)>1:
-                source="conflict"
-            elif len(valid)==1:
-                target=next(iter(valid))
-                source="group"
-        template=conn.execute("SELECT id,name,account_type,services,enabled,parameters FROM zradius_access_templates WHERE id=%s",(target,)).fetchone() if target is not None else None
-        if target is not None and (not template or not template["enabled"] or template["account_type"]!=identity["account_type"]):
-            source="invalid_direct" if source=="direct" else "invalid_group"
-            template=None
-        return {"source":source,"effective_template_id":template["id"] if template else None,"group_candidates":groups,
-            "comparison":profile_comparison(conn,identity,template),"runtime_changed":False}
+        if body.mode=="INHERIT":
+            conn.execute("DELETE FROM zradius_profile_overrides WHERE identity_id=%s AND service=%s",(identity_id,service))
+        else:
+            conn.execute("""INSERT INTO zradius_profile_overrides(identity_id,service,mode,reason)
+                VALUES (%s,%s,%s,%s) ON CONFLICT(identity_id,service) DO UPDATE SET mode=excluded.mode,reason=excluded.reason,updated_at=now()""",(identity_id,service,body.mode,reason))
+        audit(conn,"identity.profile-override."+body.mode.lower(),identity["username"]+":"+service)
+        return read_profile_overrides(conn,identity_id)
 
 @app.get("/api/v1/identities/{identity_id}/profile-reconciliation")
 def get_profile_reconciliation(identity_id:int,principal=Depends(auth)):
     personal_admin(principal)
     from profile_reconciliation import build_plan
-    effective=effective_access_profile(identity_id,principal)
-    return {"identity_id":identity_id,"source":effective["source"],
-        "effective_template_id":effective["effective_template_id"],**build_plan(effective)}
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        effective=resolve_effective_access_profile(conn,identity_id)
+        overrides={r["service"]:{"mode":r["mode"],"reason":r["reason"]} for r in read_profile_overrides(conn,identity_id)}
+        return {"identity_id":identity_id,"source":effective["source"],
+            "effective_template_id":effective["effective_template_id"],**build_plan(effective,overrides)}
 
 class BulkProfileAssignment(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
