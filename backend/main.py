@@ -124,16 +124,7 @@ def users(limit: int = 100, offset: int = 0):
 
 @app.post("/api/v1/users", status_code=201, dependencies=[Depends(auth)])
 def create_user(user: User):
-    with db() as conn:
-        reserve_legacy_login(conn,user.username)
-        if conn.execute("SELECT 1 FROM radcheck WHERE username=%s",(user.username,)).fetchone():
-            raise HTTPException(409,"User exists")
-        password = user.password.get_secret_value()
-        if len(password.encode()) > 253:
-            raise HTTPException(422,"Password exceeds 253 bytes")
-        conn.execute("INSERT INTO radcheck(username,attribute,op,value) VALUES (%s,'Cleartext-Password',':=',%s)",(user.username,password))
-        audit(conn,"user.create",user.username)
-    return {"username":user.username}
+    raise HTTPException(409,"Create accounts via POST /api/v1/identities")
 
 @app.get("/api/v1/groups", dependencies=[Depends(auth)])
 def groups():
@@ -934,14 +925,7 @@ def device_users():
 
 @app.post("/api/v1/device-aaa/users",status_code=201,dependencies=[Depends(auth)])
 def create_device_user(body:DeviceUserCreate):
-    _,password,digest=device_credentials()
-    with db() as conn:
-        reserve_legacy_login(conn,body.username)
-        row=conn.execute("INSERT INTO zradius_device_users(username,password_hash) VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING id,username,enabled",(body.username,digest)).fetchone()
-        if not row:
-            raise HTTPException(409,"Device user exists")
-        audit(conn,"device.user.create",body.username)
-    return {**row,"password":password}
+    raise HTTPException(409,"Create accounts via POST /api/v1/identities")
 
 @app.put("/api/v1/device-aaa/users/{user_id}/state",dependencies=[Depends(auth)])
 def device_user_state(user_id:int,body:UserState):
@@ -1017,6 +1001,8 @@ def upsert_eap_user(username:str,body:EapUser):
         raise HTTPException(422,"Invalid identity or NT hash")
     with db() as conn:
         reserve_legacy_login(conn,username)
+        if not conn.execute("SELECT 1 FROM zradius_eap_users WHERE username=%s FOR UPDATE",(username,)).fetchone():
+            raise HTTPException(409,"Create accounts via POST /api/v1/identities")
         conn.execute("""INSERT INTO zradius_eap_users(username,nt_password,vlan_id) VALUES (%s,%s,%s)
             ON CONFLICT(username) DO UPDATE SET nt_password=excluded.nt_password,vlan_id=excluded.vlan_id""",(username,digest,body.vlan_id))
         audit(conn,"eap.user.upsert",username)
@@ -1244,19 +1230,7 @@ def management_users():
 
 @app.post("/api/v1/iam/users",status_code=201,dependencies=[Depends(auth)])
 def management_create(body:ManagementUser):
-    try:
-        digest=hash_password(body.password.get_secret_value())
-    except ValueError as exc:
-        raise HTTPException(422,str(exc))
-    with db() as conn:
-        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
-        if conn.execute("SELECT 1 FROM zradius_identities WHERE username=%s",(body.username,)).fetchone():
-            raise HTTPException(409,"Use unified identity editor")
-        row=conn.execute("INSERT INTO zradius_admin_users(username,password_hash,role) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id,username,role,enabled",(body.username,digest,body.role)).fetchone()
-        if not row:
-            raise HTTPException(409,"Management user exists")
-        audit(conn,"iam.user.create",body.username)
-    return row
+    raise HTTPException(409,"Create accounts via POST /api/v1/identities")
 
 @app.put("/api/v1/iam/users/{user_id}/state",dependencies=[Depends(auth)])
 def management_state(user_id:int,body:UserState):
@@ -1813,23 +1787,7 @@ def l2tp_users(limit:int=100,offset:int=0):
 
 @app.post("/api/v1/ppp/l2tp/users",status_code=201,dependencies=[Depends(auth)])
 def create_l2tp_user(body:L2tpUserCreate):
-    try:
-        nt,digest=ppp_credentials(body.password.get_secret_value())
-        address=static_address(body.static_ip)
-    except ValueError:
-        raise HTTPException(422,"Invalid password encoding/length or static IPv4")
-    try:
-        with db() as conn:
-            lock_ppp_policy(conn)
-            reserve_legacy_login(conn,body.username)
-            validate_l2tp_assignment(conn,body,address)
-            row=conn.execute("""INSERT INTO zradius_l2tp_users(username,nt_password,password_hash,nas_id,profile_id,group_id,address_space_id,static_ip,description)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s::inet,%s) RETURNING id,username,enabled""",
-                (body.username,nt,digest,body.nas_id,body.profile_id,body.group_id,body.address_space_id,address,body.description)).fetchone()
-            audit(conn,"ppp.l2tp.create",body.username)
-            return row
-    except UniqueViolation:
-        raise HTTPException(409,"L2TP username or static IP in NAS/address space already assigned")
+    raise HTTPException(409,"Create accounts via POST /api/v1/identities")
 
 @app.put("/api/v1/ppp/l2tp/users/{user_id}/state",dependencies=[Depends(auth)])
 def l2tp_user_state(user_id:int,body:UserState):
@@ -2164,7 +2122,9 @@ def plan_ppp_import(conn,body):
         if r["kind"]!="secret" or r["issues"]:
             continue
         name=r["name"]
-        if name in seen_users or conn.execute("SELECT 1 FROM zradius_l2tp_users WHERE username=%s",(name,)).fetchone():
+        if not __import__("re").fullmatch(r"[A-Za-z0-9_.-]{1,64}",name) or __import__("re").fullmatch(r"hs-[a-f0-9]{20}",name):
+            r["issues"].append("Username incompatible with unified namespace")
+        if name in seen_users or any(conn.execute("SELECT 1 FROM "+table+" WHERE username=%s LIMIT 1",(name,)).fetchone() for table in ("zradius_identities","zradius_l2tp_users","zradius_device_users","radcheck","zradius_eap_users","zradius_admin_users","zradius_hotspot_vouchers")):
             r["issues"].append("Duplicate or existing username")
         seen_users.add(name)
         profile=profiles.get(r["profile"])
@@ -2219,10 +2179,11 @@ def apply_ppp_import(body:PppImportRequest):
                 profile=conn.execute("SELECT id FROM zradius_ppp_profiles WHERE name=%s",(r["profile"],)).fetchone()
                 assignment=L2tpAssignment(nas_id=body.nas_id,address_space_id=body.address_space_id,profile_id=profile["id"],static_ip=r["static_ip"],description=r["comment"])
                 validate_l2tp_assignment(conn,assignment,r["static_ip"])
-                # Random unknown credential, never returned. Explicit password reset required before use.
-                nt,digest=ppp_credentials(secrets.token_urlsafe(48))
-                conn.execute("""INSERT INTO zradius_l2tp_users(username,nt_password,password_hash,nas_id,profile_id,address_space_id,static_ip,description,enabled)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s::inet,%s,false)""",(r["name"],nt,digest,body.nas_id,profile["id"],body.address_space_id,r["static_ip"],r["comment"]))
+                # Disabled identity without credentials; explicit password setup required before use.
+                conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",(r["name"],))
+                identity=conn.execute("INSERT INTO zradius_identities(username,enabled) VALUES (%s,false) RETURNING id",(r["name"],)).fetchone()
+                conn.execute("""INSERT INTO zradius_l2tp_users(username,nas_id,profile_id,address_space_id,static_ip,description,enabled,identity_id)
+                    VALUES (%s,%s,%s,%s,%s::inet,%s,false,%s)""",(r["name"],body.nas_id,profile["id"],body.address_space_id,r["static_ip"],r["comment"],identity["id"]))
                 created_users+=1
             audit(conn,"ppp.import.apply",f"{created_profiles}:{created_users}")
             return {"profiles":created_profiles,"users_disabled":created_users}

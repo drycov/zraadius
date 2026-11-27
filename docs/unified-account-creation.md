@@ -1,0 +1,3 @@
+# Unified account creation
+
+Interactive creation uses POST /api/v1/identities. Former standalone POST routes for PPPoE, Device AAA, L2TP and IAM now return 409 after authorization. Existing legacy maintenance remains available. EAP legacy PUT updates existing records only. PPP import creates disabled central identities and linked disabled L2TP assignments without credentials; set a unified password before activation. Directory import, bootstrap administrator and expiring hotspot vouchers retain their dedicated workflows. Existing records are not automatically merged. Deploy backend and frontend together. API clients must migrate to the central endpoint.
