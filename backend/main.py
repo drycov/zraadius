@@ -2627,6 +2627,14 @@ def effective_access_profile(identity_id:int,principal=Depends(auth)):
         return {"source":source,"effective_template_id":template["id"] if template else None,"group_candidates":groups,
             "comparison":profile_comparison(conn,identity,template),"runtime_changed":False}
 
+@app.get("/api/v1/identities/{identity_id}/profile-reconciliation")
+def get_profile_reconciliation(identity_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    from profile_reconciliation import build_plan
+    effective=effective_access_profile(identity_id,principal)
+    return {"identity_id":identity_id,"source":effective["source"],
+        "effective_template_id":effective["effective_template_id"],**build_plan(effective)}
+
 class BulkProfileAssignment(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
     template_id:int|None=Field(default=None,gt=0)
