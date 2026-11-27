@@ -5063,3 +5063,59 @@ def effective_policy_attributes(identity_id:int,service:Literal["device-aaa","l2
         result=resolve(rows)
         result['runtime_preview']=resolve([r for r in rows if r['runtime_apply']])
         return result
+
+class LegacyPppoeMigration(BaseModel):
+    username:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    nas_id:int=Field(gt=0)
+    password:SecretStr|None=Field(default=None,min_length=16,max_length=128)
+    preview:bool=True
+    confirm_scope_change:bool=False
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/identities/legacy-pppoe-migrate")
+def migrate_legacy_pppoe(body:LegacyPppoeMigration,principal=Depends(auth)):
+    personal_admin(principal)
+    from legacy_radius import assess
+    if __import__("re").fullmatch(r"hs-[a-f0-9]{20}",body.username):
+        raise HTTPException(422,"Reserved voucher username")
+    if not body.preview and (body.password is None or not body.confirm_scope_change):
+        raise HTTPException(422,"New password and explicit NAS/authentication scope confirmation required")
+    try:
+        with db() as conn:
+            # Recheck all inputs in a serializable transaction. Legacy writers
+            # and the namespace trigger also coordinate on the login lock.
+            conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            lock_ppp_policy(conn)
+            conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+            lock_user(conn,body.username)
+            checks=conn.execute("SELECT attribute,op,CASE WHEN attribute='Auth-Type' THEN value ELSE NULL END AS value FROM radcheck WHERE username=%s ORDER BY id FOR UPDATE",(body.username,)).fetchall()
+            replies=conn.execute("SELECT attribute,op,CASE WHEN attribute IN ('Mikrotik-Rate-Limit','Framed-Pool','Acct-Interim-Interval') THEN value ELSE NULL END AS value FROM radreply WHERE username=%s ORDER BY id FOR UPDATE",(body.username,)).fetchall()
+            groups=conn.execute("SELECT groupname,priority FROM radusergroup WHERE username=%s FOR UPDATE",(body.username,)).fetchall()
+            disabled=bool(conn.execute("SELECT 1 FROM zradius_disabled_users WHERE username=%s FOR UPDATE",(body.username,)).fetchone())
+            plan=assess(checks,replies,groups,disabled)
+            if not plan["attributes_compatible"]:
+                raise HTTPException(409,{"blockers":plan["blockers"]})
+            for table in ("zradius_identities","zradius_device_users","zradius_l2tp_users","zradius_eap_users","zradius_admin_users","zradius_hotspot_vouchers"):
+                if conn.execute("SELECT 1 FROM "+table+" WHERE username=%s LIMIT 1",(body.username,)).fetchone():
+                    raise HTTPException(409,"Conflicting account in "+table)
+            nas=conn.execute("SELECT id,shortname FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(body.nas_id,)).fetchone()
+            if not nas or not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='pppoe'",(body.nas_id,)).fetchone():
+                raise HTTPException(409,"Registered MikroTik PPPoE NAS required")
+            assignment=IdentityPppoeAssignment(nas_id=body.nas_id,**plan["proposed_parameters"])
+            result={"username":body.username,"preview":body.preview,"identity_enabled":False,"legacy_enabled":not disabled,"assignment":assignment.model_dump(),"nas":nas["shortname"],"scope_change":"Single NAS; PAP or MS-CHAPv2; legacy CHAP not supported; existing sessions are not terminated"}
+            if body.preview:
+                return result
+            nt,digest=ppp_credentials(body.password.get_secret_value())
+            web=hash_password(body.password.get_secret_value())
+            for table in ("radcheck","radreply","radusergroup","zradius_disabled_users"):
+                conn.execute("DELETE FROM "+table+" WHERE username=%s",(body.username,))
+            identity=conn.execute("INSERT INTO zradius_identities(username,enabled) VALUES (%s,false) RETURNING id",(body.username,)).fetchone()
+            conn.execute("INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password,web_password_hash) VALUES (%s,%s,%s,%s)",(identity["id"],digest,nt,web))
+            set_identity_pppoe(conn,identity["id"],assignment)
+            conn.execute("UPDATE zradius_identity_pppoe SET enabled=%s WHERE identity_id=%s",(not disabled,identity["id"]))
+            audit(conn,"identity.legacy.migrate.pppoe",body.username)
+            return {**result,"identity_id":identity["id"]}
+    except ValueError:
+        raise HTTPException(422,"Invalid unified password or assignment")
+    except (UniqueViolation,psycopg.errors.SerializationFailure):
+        raise HTTPException(409,"Concurrent changes; repeat preview")
