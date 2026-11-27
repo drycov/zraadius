@@ -2982,6 +2982,75 @@ def delete_identity_policy_rule(identity_id:int,rule_id:int,principal=Depends(au
         audit(conn,"identity.policy-rule.delete",username+":"+str(rule_id))
         return {"status":"deleted","runtime_enforced":False}
 
+def lock_policy_group(conn,group_id):
+    row=conn.execute("SELECT name FROM zradius_identity_groups WHERE id=%s FOR UPDATE",(group_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Identity group not found")
+    return row["name"]
+
+@app.get("/api/v1/identities/groups/{group_id}/policy-rules")
+def list_group_policy_rules(group_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        if not conn.execute("SELECT id FROM zradius_identity_groups WHERE id=%s",(group_id,)).fetchone():
+            raise HTTPException(404,"Identity group not found")
+        return {"items":conn.execute("SELECT * FROM zradius_policy_rules WHERE group_id=%s ORDER BY id",(group_id,)).fetchall(),"runtime_enforced":False}
+
+@app.post("/api/v1/identities/groups/{group_id}/policy-rules",status_code=201)
+def create_group_policy_rule(group_id:int,body:CentralizedPolicyRule,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        name=lock_policy_group(conn,group_id)
+        reason=validate_centralized_rule(conn,body)
+        row=conn.execute("""INSERT INTO zradius_policy_rules(group_id,service,nas_id,effect,enabled,reason)
+            VALUES (%s,%s,%s,%s,%s,%s) RETURNING *""",(group_id,body.service,body.nas_id,body.effect,body.enabled,reason)).fetchone()
+        audit(conn,"identity.group.policy-rule.create",name+":"+str(row["id"]))
+        return {"rule":row,"runtime_enforced":False}
+
+@app.put("/api/v1/identities/groups/{group_id}/policy-rules/{rule_id}")
+def update_group_policy_rule(group_id:int,rule_id:int,body:CentralizedPolicyRule,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        name=lock_policy_group(conn,group_id)
+        reason=validate_centralized_rule(conn,body)
+        row=conn.execute("""UPDATE zradius_policy_rules SET service=%s,nas_id=%s,effect=%s,enabled=%s,reason=%s,updated_at=now()
+            WHERE id=%s AND group_id=%s RETURNING *""",(body.service,body.nas_id,body.effect,body.enabled,reason,rule_id,group_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"Group policy rule not found")
+        audit(conn,"identity.group.policy-rule.update",name+":"+str(rule_id))
+        return {"rule":row,"runtime_enforced":False}
+
+@app.delete("/api/v1/identities/groups/{group_id}/policy-rules/{rule_id}")
+def delete_group_policy_rule(group_id:int,rule_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        name=lock_policy_group(conn,group_id)
+        row=conn.execute("DELETE FROM zradius_policy_rules WHERE id=%s AND group_id=%s RETURNING id",(rule_id,group_id)).fetchone()
+        if not row:
+            raise HTTPException(404,"Group policy rule not found")
+        audit(conn,"identity.group.policy-rule.delete",name+":"+str(rule_id))
+        return {"status":"deleted","runtime_enforced":False}
+
+def collect_identity_policy_rules(conn,identity_id):
+    return conn.execute("""SELECT r.*,CASE WHEN r.identity_id IS NOT NULL THEN 'identity' ELSE 'group' END AS source,
+        g.name AS group_name FROM zradius_policy_rules r
+        LEFT JOIN zradius_identity_groups g ON g.id=r.group_id
+        WHERE r.identity_id=%s OR EXISTS(SELECT 1 FROM zradius_identity_group_members m
+            WHERE m.identity_id=%s AND m.group_id=r.group_id)
+        ORDER BY r.id""",(identity_id,identity_id)).fetchall()
+
+@app.get("/api/v1/identities/{identity_id}/policy-rule-candidates")
+def identity_policy_rule_candidates(identity_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        if not conn.execute("SELECT id FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone():
+            raise HTTPException(404,"Identity not found")
+        rows=collect_identity_policy_rules(conn,identity_id)
+        return {"identity_id":identity_id,"items":rows,"active_count":sum(r["enabled"] for r in rows),
+            "resolution":"not_evaluated","runtime_enforced":False}
+
 class BulkProfileAssignment(BaseModel):
     identity_ids:list[int]=Field(min_length=1,max_length=100)
     template_id:int|None=Field(default=None,gt=0)
