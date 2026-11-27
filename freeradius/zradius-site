@@ -357,6 +357,22 @@ server zradius {
      Framed-Pool := "%{2}"
      Acct-Interim-Interval := "%{3}"
     }
+    update control {
+     Tmp-String-0 := "%{sql:SELECT COALESCE(max(seconds) FILTER (WHERE name='Idle-Timeout'),0)::text || ':' || COALESCE(max(seconds) FILTER (WHERE name='Session-Timeout'),0)::text FROM zradius_pppoe_runtime_timeouts WHERE username='%{User-Name}' AND nasname='%{Packet-Src-IP-Address}'}"
+    }
+    if (&control:Tmp-String-0 !~ /^[0-9]{1,6}:[0-9]{1,6}$/) {
+     reject
+    }
+    if (&control:Tmp-String-0 =~ /^([1-9][0-9]{0,5}):[0-9]{1,6}$/) {
+     update reply {
+      Idle-Timeout := "%{1}"
+     }
+    }
+    if (&control:Tmp-String-0 =~ /^[0-9]{1,6}:([1-9][0-9]{0,5})$/) {
+     update reply {
+      Session-Timeout := "%{1}"
+     }
+    }
    }
    else {
     reject

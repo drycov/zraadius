@@ -4996,6 +4996,7 @@ class PolicyAttributeEntry(RadiusAttributeValidation):
     nas_id:int|None=Field(default=None,gt=0)
     priority:int=Field(default=100,ge=0,le=1000)
     enabled:bool=True
+    runtime_apply:bool=False
 
 class PolicyAttributesReplace(BaseModel):
     entries:list[PolicyAttributeEntry]=Field(max_length=100)
@@ -5033,10 +5034,12 @@ def replace_policy_attributes(policy_id:int,body:PolicyAttributesReplace,princip
                 raise HTTPException(422,str(exc))
             if e.nas_id is not None and not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code=%s",(e.nas_id,e.service)).fetchone():
                 raise HTTPException(409,"Service is not assigned to NAS")
-            values.append((policy_id,e.service,e.nas_id,e.name,e.attribute_list,e.operator,v["value"],e.priority,e.enabled))
+            if e.runtime_apply and (e.service!="pppoe" or e.name not in ("Idle-Timeout","Session-Timeout") or e.attribute_list!="reply" or e.operator!=":="):
+                raise HTTPException(422,"Runtime supports only PPPoE reply timeouts")
+            values.append((policy_id,e.service,e.nas_id,e.name,e.attribute_list,e.operator,v["value"],e.priority,e.enabled,e.runtime_apply))
         conn.execute("DELETE FROM zradius_policy_attributes WHERE policy_id=%s",(policy_id,))
         for v in values:
-            conn.execute("INSERT INTO zradius_policy_attributes(policy_id,service,nas_id,name,attribute_list,operator,value,priority,enabled) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",v)
+            conn.execute("INSERT INTO zradius_policy_attributes(policy_id,service,nas_id,name,attribute_list,operator,value,priority,enabled,runtime_apply) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",v)
         p=conn.execute("UPDATE zradius_policies SET revision=revision+1,updated_at=now() WHERE id=%s RETURNING revision",(policy_id,)).fetchone()
         audit(conn,"policy.attributes.replace",str(policy_id))
         return {"revision":p["revision"],"runtime_enforced":False}
@@ -5057,4 +5060,6 @@ def effective_policy_attributes(identity_id:int,service:Literal["device-aaa","l2
             WHERE e.service=%s AND (e.nas_id IS NULL OR e.nas_id=%s)
             AND (a.identity_id=%s OR EXISTS(SELECT 1 FROM zradius_identity_group_members m WHERE m.identity_id=%s AND m.group_id=a.group_id))
             ORDER BY e.id,a.id""",(service,nas_id,identity_id,identity_id)).fetchall()
-        return resolve(rows)
+        result=resolve(rows)
+        result['runtime_preview']=resolve([r for r in rows if r['runtime_apply']])
+        return result
