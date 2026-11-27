@@ -5,7 +5,7 @@ import type {Request,Nas} from '../api';
 type Target={nas_id:number;shortname:string;source:string;eligible:boolean};
 type Service={service:string;assigned:boolean;enabled:boolean;credential_ready:boolean;status:'configured'|'blocked';reasons:string[];targets:Target[]};
 type Policy={identity:{username:string;enabled:boolean;pap_ready:boolean;mschap_ready:boolean};services:Service[];groups:{id:number;name:string}[];runtime_verified:boolean};
-const reasons:Record<string,string>={identity_disabled:'Учётная запись заблокирована',service_not_assigned:'Сервис не назначен',service_disabled:'Сервис отключён',credential_missing:'Нет подходящих реквизитов',no_effective_nas:'Нет эффективного NAS',nas_or_policy_ineligible:'NAS или политика не соответствует'};
+const reasons:Record<string,string>={identity_disabled:'Учётная запись заблокирована',identity_expired:'Срок действия истёк',service_not_assigned:'Сервис не назначен',service_disabled:'Сервис отключён',credential_missing:'Нет подходящих реквизитов',no_effective_nas:'Нет эффективного NAS',nas_or_policy_ineligible:'NAS или политика не соответствует'};
 export default function IdentityAaaPolicy({request,id}:{request:Request;id:number}){
  const [nas,setNas]=useState('all');
  const n=useData<Nas[]>(request,'nas');
