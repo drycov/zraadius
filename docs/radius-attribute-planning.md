@@ -1,0 +1,5 @@
+# Unified attribute policies
+
+Persistent typed attributes extend reusable policies, not the access-rule runtime. Effective preview resolves direct identity before group, specific NAS before wildcard, higher numeric priority before lower; equal-rank different values are conflicts. Preview is not authorization. No RADIUS runtime access is granted to the new table. Legacy PPPoE remains assessment-only; arbitrary check and group semantics require verified runtime support. Run isolated CI before enabling any runtime integration.
+
+Runtime: opt-in PPPoE reply Idle-Timeout and Session-Timeout only, with explicit SQL view permissions, ranking and rejection on equal-rank conflict. Other attributes remain planning-only. Legacy PPPoE migration accepts a strict subset of direct attributes, requires an explicitly selected registered NAS and confirmation of narrowed NAS scope and PAP/MS-CHAPv2 authentication. CHAP is not supported. The identity starts disabled; Accounting is untouched. No automatic group conversion or migration of arbitrary attributes.

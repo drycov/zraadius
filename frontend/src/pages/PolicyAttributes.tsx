@@ -1,0 +1,18 @@
+import {useState} from 'react';
+import {Alert,Button,Card,Checkbox,Input,Select,Space} from '../ui';
+import {useData,Fault,useAction} from '../hooks';
+import type {Request,Nas} from '../api';
+type Attr={name:string;list:string;operators:Record<string,string[]>};
+type Entry={name:string;attribute_list:string;operator:string;value:string;service:string;nas_id:number|null;priority:number;enabled:boolean;runtime_apply?:boolean};
+export default function PolicyAttributes({request,policyId,revision,refresh}:{request:Request;policyId:number;revision:number;refresh:()=>void}){
+ const path='identities/policy-catalog/'+policyId+'/attributes';
+ const d=useData<{revision:number;items:Entry[]}>(request,path),c=useData<Attr[]>(request,'dictionaries'),n=useData<Nas[]>(request,'nas');
+ const [draft,setDraft]=useState<Entry[]|null>(null),[confirm,setConfirm]=useState(false);
+ const a=useAction(refresh);
+ const rows=draft??d.data?.items??[];
+ const patch=(i:number,p:Partial<Entry>)=>{setConfirm(false);setDraft(rows.map((r,j)=>i===j?{...r,...p}:r))};
+ return <Card title="RADIUS атрибуты"><Space direction="vertical" className="full"><Fault error={d.error||c.error||n.error}/><Alert type="warning" message="Runtime доступен только для PPPoE Idle-Timeout / Session-Timeout при явном включении. Остальные атрибуты — планирование."/>
+ {rows.map((r,i)=><Space key={i} wrap><Select value={r.name} options={(c.data??[]).map(x=>({value:x.name,label:x.name}))} onChange={v=>{const x=c.data?.find(x=>x.name===v);if(x)patch(i,{name:x.name,attribute_list:x.list,operator:x.operators[x.list][0],value:'',runtime_apply:false})}}/><Select value={r.operator} options={(c.data?.find(x=>x.name===r.name)?.operators[r.attribute_list]??[]).map(x=>({value:x,label:x}))} onChange={v=>patch(i,{operator:String(v)})}/><Input value={r.value} maxLength={253} onChange={e=>patch(i,{value:e.target.value})}/><Select value={r.service} options={['device-aaa','l2tp','pppoe','hotspot','dot1x','wpa-enterprise'].map(x=>({value:x,label:x}))} onChange={v=>patch(i,{service:String(v),nas_id:null,runtime_apply:false})}/><Select value={String(r.nas_id??'all')} options={[{value:'all',label:'Все NAS'},...(n.data??[]).filter(x=>x.services?.includes(r.service)).map(x=>({value:String(x.id),label:x.shortname}))]} onChange={v=>patch(i,{nas_id:v==='all'?null:Number(v)})}/><Input value={String(r.priority)} onChange={e=>patch(i,{priority:Number(e.target.value)})}/><Checkbox checked={r.enabled} onChange={e=>patch(i,{enabled:e.target.checked})}>Активно</Checkbox>{r.service==='pppoe'&&['Idle-Timeout','Session-Timeout'].includes(r.name)&&<Checkbox checked={!!r.runtime_apply} onChange={e=>patch(i,{runtime_apply:e.target.checked})}>Runtime</Checkbox>}<Button danger disabled={a.busy} onClick={()=>{setDraft(rows.filter((_,j)=>j!==i));setConfirm(false)}}>Удалить</Button></Space>)}
+ <Button disabled={!d.data||!c.data||a.busy||rows.length>=100} onClick={()=>{setDraft([...rows,{name:'Idle-Timeout',attribute_list:'reply',operator:':=',value:'3600',service:'pppoe',nas_id:null,priority:100,enabled:true}]);setConfirm(false)}}>Добавить атрибут</Button>
+ <Checkbox checked={confirm} onChange={setConfirm}>Подтверждаю замену набора атрибутов</Checkbox><Button type="primary" loading={a.busy} disabled={!confirm||!draft||d.data?.revision!==revision||a.busy} onClick={()=>a.run(()=>request(path,'PUT',{expected_revision:revision,confirm:true,entries:rows.map(r=>({name:r.name,attribute_list:r.attribute_list,operator:r.operator,value:r.value,service:r.service,nas_id:r.nas_id,priority:r.priority,enabled:r.enabled,runtime_apply:!!r.runtime_apply}))}))}>Сохранить атрибуты</Button></Space></Card>
+}

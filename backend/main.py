@@ -143,6 +143,7 @@ def create_group(group: Group):
 @app.put("/api/v1/users/{username}/groups/{group}", dependencies=[Depends(auth)])
 def assign_group(username: str, group: str):
     with db() as conn:
+        lock_user(conn,username)
         if not conn.execute("SELECT 1 FROM radcheck WHERE username=%s",(username,)).fetchone() or not conn.execute("SELECT 1 FROM zradius_groups WHERE name=%s",(group,)).fetchone():
             raise HTTPException(404,"User or group not found")
         conn.execute("INSERT INTO radusergroup(username,groupname) VALUES (%s,%s) ON CONFLICT DO NOTHING",(username,group))
@@ -324,13 +325,24 @@ def delete_nas(nas_id: int):
 
 @app.get("/api/v1/dictionaries", dependencies=[Depends(auth)])
 def dictionaries():
-    return [
-        {"name":"Mikrotik-Rate-Limit","vendor":14988,"type":"string","list":"reply"},
-        {"name":"Framed-Pool","vendor":0,"type":"string","list":"reply"},
-        {"name":"Acct-Interim-Interval","vendor":0,"type":"integer","list":"reply"},
-        {"name":"Idle-Timeout","vendor":0,"type":"integer","list":"reply"},
-        {"name":"Simultaneous-Use","vendor":0,"type":"integer","list":"control"}
-    ]
+    from radius_attributes import catalog
+    return catalog()
+
+class RadiusAttributeValidation(BaseModel):
+    name:str=Field(min_length=1,max_length=64)
+    attribute_list:Literal["check","control","reply"]
+    operator:str=Field(min_length=1,max_length=2)
+    value:str=Field(min_length=1,max_length=253)
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/dictionaries/validate")
+def validate_radius_attribute(body:RadiusAttributeValidation,principal=Depends(auth)):
+    personal_admin(principal)
+    from radius_attributes import validate
+    try:
+        return validate(body.name,body.attribute_list,body.operator,body.value)
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
 
 @app.get("/api/v1/dashboard", dependencies=[Depends(auth)])
 def dashboard():
@@ -5038,3 +5050,132 @@ def update_identity_workspace(identity_id:int,body:IdentityWorkspaceUpdate,princ
         return {"status":"updated"}
     except UniqueViolation:
         raise HTTPException(409,"Existing login or static IP conflict")
+
+class PolicyAttributeEntry(RadiusAttributeValidation):
+    service:Literal["device-aaa","l2tp","pppoe","hotspot","dot1x","wpa-enterprise"]
+    nas_id:int|None=Field(default=None,gt=0)
+    priority:int=Field(default=100,ge=0,le=1000)
+    enabled:bool=True
+    runtime_apply:bool=False
+
+class PolicyAttributesReplace(BaseModel):
+    entries:list[PolicyAttributeEntry]=Field(max_length=100)
+    expected_revision:int=Field(gt=0)
+    confirm:bool=False
+    model_config={"extra":"forbid"}
+
+@app.get("/api/v1/identities/policy-catalog/{policy_id}/attributes")
+def get_policy_attributes(policy_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        p=conn.execute("SELECT revision FROM zradius_policies WHERE id=%s",(policy_id,)).fetchone()
+        if not p:
+            raise HTTPException(404,"Policy not found")
+        return {"revision":p["revision"],"items":conn.execute("SELECT * FROM zradius_policy_attributes WHERE policy_id=%s ORDER BY id",(policy_id,)).fetchall(),"runtime_enforced":False}
+
+@app.put("/api/v1/identities/policy-catalog/{policy_id}/attributes")
+def replace_policy_attributes(policy_id:int,body:PolicyAttributesReplace,principal=Depends(auth)):
+    personal_admin(principal)
+    if not body.confirm:
+        raise HTTPException(422,"Confirmation required")
+    from radius_attributes import validate
+    with db() as conn:
+        lock_reusable_policy(conn,policy_id,body.expected_revision)
+        keys=set(); values=[]
+        for e in body.entries:
+            key=(e.service,e.nas_id,e.name,e.attribute_list)
+            if key in keys:
+                raise HTTPException(422,"Duplicate attribute scope")
+            keys.add(key)
+            try:
+                v=validate(e.name,e.attribute_list,e.operator,e.value)
+            except ValueError as exc:
+                raise HTTPException(422,str(exc))
+            if e.nas_id is not None and not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code=%s",(e.nas_id,e.service)).fetchone():
+                raise HTTPException(409,"Service is not assigned to NAS")
+            if e.runtime_apply and (e.service!="pppoe" or e.name not in ("Idle-Timeout","Session-Timeout") or e.attribute_list!="reply" or e.operator!=":="):
+                raise HTTPException(422,"Runtime supports only PPPoE reply timeouts")
+            values.append((policy_id,e.service,e.nas_id,e.name,e.attribute_list,e.operator,v["value"],e.priority,e.enabled,e.runtime_apply))
+        conn.execute("DELETE FROM zradius_policy_attributes WHERE policy_id=%s",(policy_id,))
+        for v in values:
+            conn.execute("INSERT INTO zradius_policy_attributes(policy_id,service,nas_id,name,attribute_list,operator,value,priority,enabled,runtime_apply) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",v)
+        p=conn.execute("UPDATE zradius_policies SET revision=revision+1,updated_at=now() WHERE id=%s RETURNING revision",(policy_id,)).fetchone()
+        audit(conn,"policy.attributes.replace",str(policy_id))
+        return {"revision":p["revision"],"runtime_enforced":False}
+
+@app.get("/api/v1/identities/{identity_id}/effective-attributes")
+def effective_policy_attributes(identity_id:int,service:Literal["device-aaa","l2tp","pppoe","hotspot","dot1x","wpa-enterprise"],nas_id:int,principal=Depends(auth)):
+    personal_admin(principal)
+    from attribute_resolution import resolve
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        if not conn.execute("SELECT 1 FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone():
+            raise HTTPException(404,"Identity not found")
+        if not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code=%s",(nas_id,service)).fetchone():
+            raise HTTPException(409,"Service is not assigned to NAS")
+        rows=conn.execute("""SELECT e.*,CASE WHEN a.identity_id IS NOT NULL THEN 'identity' ELSE 'group' END AS source
+            FROM zradius_policy_attributes e JOIN zradius_policies p ON p.id=e.policy_id AND p.enabled
+            JOIN zradius_policy_assignments a ON a.policy_id=p.id
+            WHERE e.service=%s AND (e.nas_id IS NULL OR e.nas_id=%s)
+            AND (a.identity_id=%s OR EXISTS(SELECT 1 FROM zradius_identity_group_members m WHERE m.identity_id=%s AND m.group_id=a.group_id))
+            ORDER BY e.id,a.id""",(service,nas_id,identity_id,identity_id)).fetchall()
+        result=resolve(rows)
+        result['runtime_preview']=resolve([r for r in rows if r['runtime_apply']])
+        return result
+
+class LegacyPppoeMigration(BaseModel):
+    username:str=Field(min_length=1,max_length=64,pattern=r"^[A-Za-z0-9_.-]+$")
+    nas_id:int=Field(gt=0)
+    password:SecretStr|None=Field(default=None,min_length=16,max_length=128)
+    preview:bool=True
+    confirm_scope_change:bool=False
+    model_config={"extra":"forbid"}
+
+@app.post("/api/v1/identities/legacy-pppoe-migrate")
+def migrate_legacy_pppoe(body:LegacyPppoeMigration,principal=Depends(auth)):
+    personal_admin(principal)
+    from legacy_radius import assess
+    if __import__("re").fullmatch(r"hs-[a-f0-9]{20}",body.username):
+        raise HTTPException(422,"Reserved voucher username")
+    if not body.preview and (body.password is None or not body.confirm_scope_change):
+        raise HTTPException(422,"New password and explicit NAS/authentication scope confirmation required")
+    try:
+        with db() as conn:
+            # Recheck all inputs in a serializable transaction. Legacy writers
+            # and the namespace trigger also coordinate on the login lock.
+            conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            lock_ppp_policy(conn)
+            conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+            lock_user(conn,body.username)
+            checks=conn.execute("SELECT attribute,op,CASE WHEN attribute='Auth-Type' THEN value ELSE NULL END AS value FROM radcheck WHERE username=%s ORDER BY id FOR UPDATE",(body.username,)).fetchall()
+            replies=conn.execute("SELECT attribute,op,CASE WHEN attribute IN ('Mikrotik-Rate-Limit','Framed-Pool','Acct-Interim-Interval') THEN value ELSE NULL END AS value FROM radreply WHERE username=%s ORDER BY id FOR UPDATE",(body.username,)).fetchall()
+            groups=conn.execute("SELECT groupname,priority FROM radusergroup WHERE username=%s FOR UPDATE",(body.username,)).fetchall()
+            disabled=bool(conn.execute("SELECT 1 FROM zradius_disabled_users WHERE username=%s FOR UPDATE",(body.username,)).fetchone())
+            plan=assess(checks,replies,groups,disabled)
+            if not plan["attributes_compatible"]:
+                raise HTTPException(409,{"blockers":plan["blockers"]})
+            for table in ("zradius_identities","zradius_device_users","zradius_l2tp_users","zradius_eap_users","zradius_admin_users","zradius_hotspot_vouchers"):
+                if conn.execute("SELECT 1 FROM "+table+" WHERE username=%s LIMIT 1",(body.username,)).fetchone():
+                    raise HTTPException(409,"Conflicting account in "+table)
+            nas=conn.execute("SELECT id,shortname FROM nas WHERE id=%s AND type='mikrotik' FOR UPDATE",(body.nas_id,)).fetchone()
+            if not nas or not conn.execute("SELECT 1 FROM zradius_nas_services WHERE nas_id=%s AND service_code='pppoe'",(body.nas_id,)).fetchone():
+                raise HTTPException(409,"Registered MikroTik PPPoE NAS required")
+            assignment=IdentityPppoeAssignment(nas_id=body.nas_id,**plan["proposed_parameters"])
+            result={"username":body.username,"preview":body.preview,"identity_enabled":False,"legacy_enabled":not disabled,"assignment":assignment.model_dump(),"nas":nas["shortname"],"scope_change":"Single NAS; PAP or MS-CHAPv2; legacy CHAP not supported; existing sessions are not terminated"}
+            if body.preview:
+                return result
+            nt,digest=ppp_credentials(body.password.get_secret_value())
+            web=hash_password(body.password.get_secret_value())
+            for table in ("radcheck","radreply","radusergroup","zradius_disabled_users"):
+                conn.execute("DELETE FROM "+table+" WHERE username=%s",(body.username,))
+            identity=conn.execute("INSERT INTO zradius_identities(username,enabled) VALUES (%s,false) RETURNING id",(body.username,)).fetchone()
+            conn.execute("INSERT INTO zradius_identity_credentials(identity_id,password_hash,nt_password,web_password_hash) VALUES (%s,%s,%s,%s)",(identity["id"],digest,nt,web))
+            set_identity_pppoe(conn,identity["id"],assignment)
+            conn.execute("UPDATE zradius_identity_pppoe SET enabled=%s WHERE identity_id=%s",(not disabled,identity["id"]))
+            audit(conn,"identity.legacy.migrate.pppoe",body.username)
+            return {**result,"identity_id":identity["id"]}
+    except ValueError:
+        raise HTTPException(422,"Invalid unified password or assignment")
+    except (UniqueViolation,psycopg.errors.SerializationFailure):
+        raise HTTPException(409,"Concurrent changes; repeat preview")
