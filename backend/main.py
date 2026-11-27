@@ -2514,21 +2514,24 @@ def get_identity_access_profile(identity_id:int,principal=Depends(auth)):
         t=conn.execute("SELECT id,name,account_type,services,enabled,parameters FROM zradius_access_templates WHERE id=%s",(row["access_template_id"],)).fetchone() if row["access_template_id"] else None
         return profile_comparison(conn,row,t)
 
+def _assign_identity_access_profile(conn,identity_id,body,principal):
+    personal_admin(principal)
+    row=conn.execute("SELECT id,username,account_type,access_template_id FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Identity not found")
+    template=validate_profile_reference(conn,body.template_id,row["account_type"]) if body.template_id else None
+    result=profile_comparison(conn,row,template)
+    result["preview"]=body.preview
+    if not body.preview:
+        conn.execute("UPDATE zradius_identities SET access_template_id=%s,updated_at=now() WHERE id=%s",(body.template_id,identity_id))
+        audit(conn,"identity.access-profile.assign",row["username"])
+        result["assigned_template_id"]=body.template_id
+    return result
+
 @app.put("/api/v1/identities/{identity_id}/access-profile")
 def assign_identity_access_profile(identity_id:int,body:ProfileAssignment,principal=Depends(auth)):
-    personal_admin(principal)
     with db() as conn:
-        row=conn.execute("SELECT id,username,account_type,access_template_id FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
-        if not row:
-            raise HTTPException(404,"Identity not found")
-        template=validate_profile_reference(conn,body.template_id,row["account_type"]) if body.template_id else None
-        result=profile_comparison(conn,row,template)
-        result["preview"]=body.preview
-        if not body.preview:
-            conn.execute("UPDATE zradius_identities SET access_template_id=%s,updated_at=now() WHERE id=%s",(body.template_id,identity_id))
-            audit(conn,"identity.access-profile.assign",row["username"])
-            result["assigned_template_id"]=body.template_id
-        return result
+        return _assign_identity_access_profile(conn,identity_id,body,principal)
 
 class GroupAccessProfiles(BaseModel):
     person_template_id:int|None=Field(default=None,gt=0)
@@ -3673,19 +3676,22 @@ class IdentityMetadata(BaseModel):
     department:str=Field(max_length=200)
     model_config={"extra":"forbid"}
 
-@app.put("/api/v1/identities/{identity_id}/metadata",dependencies=[Depends(auth)])
-def identity_metadata(identity_id:int,body:IdentityMetadata):
+def _identity_metadata(conn,identity_id,body):
     full_name,department=body.full_name.strip(),body.department.strip()
     if any(ord(ch)<32 or 127<=ord(ch)<=159 for ch in full_name+department):
         raise HTTPException(422,"Control characters are not allowed")
+    row=conn.execute("SELECT id,username,full_name,department FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Identity not found")
+    if (row["full_name"],row["department"])!=(full_name,department):
+        row=conn.execute("UPDATE zradius_identities SET full_name=%s,department=%s,updated_at=now() WHERE id=%s RETURNING id,username,full_name,department",(full_name,department,identity_id)).fetchone()
+        audit(conn,"identity.metadata",row["username"])
+    return row
+
+@app.put("/api/v1/identities/{identity_id}/metadata",dependencies=[Depends(auth)])
+def identity_metadata(identity_id:int,body:IdentityMetadata):
     with db() as conn:
-        row=conn.execute("SELECT id,username,full_name,department FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
-        if not row:
-            raise HTTPException(404,"Identity not found")
-        if (row["full_name"],row["department"])!=(full_name,department):
-            row=conn.execute("UPDATE zradius_identities SET full_name=%s,department=%s,updated_at=now() WHERE id=%s RETURNING id,username,full_name,department",(full_name,department,identity_id)).fetchone()
-            audit(conn,"identity.metadata",row["username"])
-        return row
+        return _identity_metadata(conn,identity_id,body)
 
 class IdentityProfile(BaseModel):
     account_type:Literal["person","service"]
@@ -3693,28 +3699,31 @@ class IdentityProfile(BaseModel):
     account_purpose:str=Field(default="",max_length=500)
     model_config={"extra":"forbid"}
 
-@app.put("/api/v1/identities/{identity_id}/profile")
-def update_identity_profile(identity_id:int,body:IdentityProfile,principal=Depends(auth)):
+def _update_identity_profile(conn,identity_id,body,principal):
     personal_admin(principal)
     owner,purpose=body.account_owner.strip(),body.account_purpose.strip()
     if body.account_type=="service" and (not owner or not purpose):
         raise HTTPException(422,"Service account requires owner and purpose")
     if any(ord(ch)<32 or 127<=ord(ch)<=159 for ch in owner+purpose):
         raise HTTPException(422,"Control characters are not allowed")
+    conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
+    row=conn.execute("SELECT id,username,account_expires_at,rotation_interval_days,account_type,access_template_id FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Identity not found")
+    if row["access_template_id"] is not None and row["account_type"]!=body.account_type:
+        raise HTTPException(409,"Detach access profile before changing account type")
+    if body.account_type=="person" and (row["account_expires_at"] is not None or row["rotation_interval_days"] is not None):
+        raise HTTPException(409,"Clear service lifecycle settings before converting account type")
+    if body.account_type=="service" and (conn.execute("SELECT 1 FROM zradius_admin_users WHERE identity_id=%s",(identity_id,)).fetchone() or conn.execute("SELECT 1 FROM zradius_directory_identities WHERE identity_id=%s",(identity_id,)).fetchone()):
+        raise HTTPException(409,"Console or directory identity cannot be converted to service account")
+    result=conn.execute("UPDATE zradius_identities SET account_type=%s,account_owner=%s,account_purpose=%s,updated_at=now() WHERE id=%s RETURNING id,account_type,account_owner,account_purpose",(body.account_type,owner,purpose,identity_id)).fetchone()
+    audit(conn,"identity.profile",row["username"])
+    return result
+
+@app.put("/api/v1/identities/{identity_id}/profile")
+def update_identity_profile(identity_id:int,body:IdentityProfile,principal=Depends(auth)):
     with db() as conn:
-        conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
-        row=conn.execute("SELECT id,username,account_expires_at,rotation_interval_days,account_type,access_template_id FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
-        if not row:
-            raise HTTPException(404,"Identity not found")
-        if row["access_template_id"] is not None and row["account_type"]!=body.account_type:
-            raise HTTPException(409,"Detach access profile before changing account type")
-        if body.account_type=="person" and (row["account_expires_at"] is not None or row["rotation_interval_days"] is not None):
-            raise HTTPException(409,"Clear service lifecycle settings before converting account type")
-        if body.account_type=="service" and (conn.execute("SELECT 1 FROM zradius_admin_users WHERE identity_id=%s",(identity_id,)).fetchone() or conn.execute("SELECT 1 FROM zradius_directory_identities WHERE identity_id=%s",(identity_id,)).fetchone()):
-            raise HTTPException(409,"Console or directory identity cannot be converted to service account")
-        result=conn.execute("UPDATE zradius_identities SET account_type=%s,account_owner=%s,account_purpose=%s,updated_at=now() WHERE id=%s RETURNING id,account_type,account_owner,account_purpose",(body.account_type,owner,purpose,identity_id)).fetchone()
-        audit(conn,"identity.profile",row["username"])
-        return result
+        return _update_identity_profile(conn,identity_id,body,principal)
 
 class ServiceLifecycle(BaseModel):
     account_expires_at:datetime|None=None
@@ -4165,21 +4174,24 @@ def identity_membership(identity_id:int):
             raise HTTPException(404,"Identity not found")
         return {"group_ids":[r["group_id"] for r in conn.execute("SELECT group_id FROM zradius_identity_group_members WHERE identity_id=%s ORDER BY group_id",(identity_id,)).fetchall()]}
 
+def _set_identity_membership(conn,identity_id,body):
+    ids=sorted(set(body.group_ids))
+    row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
+    if not row:
+        raise HTTPException(404,"Identity not found")
+    for gid in ids:
+        if not conn.execute("SELECT id FROM zradius_identity_groups WHERE id=%s FOR KEY SHARE",(gid,)).fetchone():
+            raise HTTPException(404,"Identity group not found")
+    conn.execute("DELETE FROM zradius_identity_group_members WHERE identity_id=%s",(identity_id,))
+    for gid in ids:
+        conn.execute("INSERT INTO zradius_identity_group_members(group_id,identity_id) VALUES (%s,%s)",(gid,identity_id))
+    audit(conn,"identity.groups",row["username"])
+    return {"status":"updated"}
+
 @app.put("/api/v1/identities/{identity_id}/groups",dependencies=[Depends(auth)])
 def set_identity_membership(identity_id:int,body:IdentityGroupMembership):
-    ids=sorted(set(body.group_ids))
     with db() as conn:
-        row=conn.execute("SELECT username FROM zradius_identities WHERE id=%s FOR UPDATE",(identity_id,)).fetchone()
-        if not row:
-            raise HTTPException(404,"Identity not found")
-        for gid in ids:
-            if not conn.execute("SELECT id FROM zradius_identity_groups WHERE id=%s FOR KEY SHARE",(gid,)).fetchone():
-                raise HTTPException(404,"Identity group not found")
-        conn.execute("DELETE FROM zradius_identity_group_members WHERE identity_id=%s",(identity_id,))
-        for gid in ids:
-            conn.execute("INSERT INTO zradius_identity_group_members(group_id,identity_id) VALUES (%s,%s)",(gid,identity_id))
-        audit(conn,"identity.groups",row["username"])
-    return {"status":"updated"}
+        return _set_identity_membership(conn,identity_id,body)
 
 @app.get("/api/v1/identities/{identity_id}/effective-device-grants",dependencies=[Depends(auth)])
 def identity_effective_device_grants(identity_id:int):
@@ -4493,6 +4505,10 @@ def revoke_identity_web_sessions(identity_id:int,principal=Depends(auth)):
 
 
 class IdentityWorkspaceUpdate(BaseModel):
+    metadata: IdentityMetadata | None = None
+    profile: IdentityProfile | None = None
+    groups: IdentityGroupMembership | None = None
+    access_profile: ProfileAssignment | None = None
     password: PppPassword | None = None
     services: IdentityServices | None = None
     pppoe: IdentityPppoeUpdate | None = None
@@ -4511,6 +4527,18 @@ def update_identity_workspace(identity_id:int,body:IdentityWorkspaceUpdate,princ
             conn.execute("SELECT pg_advisory_xact_lock(7281192202)")
             if not conn.execute("SELECT id FROM zradius_identities WHERE id=%s",(identity_id,)).fetchone():
                 raise HTTPException(404,"Identity not found")
+            if body.access_profile is not None and body.access_profile.preview:
+                raise HTTPException(422,"Workspace does not accept profile preview")
+            if body.access_profile is not None and body.access_profile.template_id is None:
+                _assign_identity_access_profile(conn,identity_id,body.access_profile,principal)
+            if body.profile is not None:
+                _update_identity_profile(conn,identity_id,body.profile,principal)
+            if body.metadata is not None:
+                _identity_metadata(conn,identity_id,body.metadata)
+            if body.groups is not None:
+                _set_identity_membership(conn,identity_id,body.groups)
+            if body.access_profile is not None and body.access_profile.template_id is not None:
+                _assign_identity_access_profile(conn,identity_id,body.access_profile,principal)
             if body.password is not None:
                 _identity_password(conn,identity_id,body.password,principal)
             if body.console is not None:

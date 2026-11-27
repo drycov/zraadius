@@ -56,10 +56,8 @@ export default function UnifiedUsers({request}:{request:Request}){
  {id:'directory',label:'Active Directory',content:<IdentityDirectory request={request}/>},
  {id:'groups',label:'Глобальные группы',content:<IdentityGroups request={request}/>}
  ]}/><Modal wide title={editing?.username} open={!!editing} onCancel={()=>setEditing(undefined)} footer={null}>{editing&&<Tabs key={editing.id} label="Настройки пользователя" items={[
- {id:'profile',label:'Профиль УЗ',content:<AccountProfile key={editing.id} request={request} identity={editing} onSaved={value=>{setEditing(current=>current?.id===value.id?{...current,...value}:current);d.refresh()}}/>},
  ...(editing.account_type==='service'?[{id:'lifecycle',label:'Жизненный цикл',content:<IdentityLifecycle key={editing.id} request={request} id={editing.id} refresh={d.refresh}/>}]:[]),
- {id:'metadata',label:'Основные данные',content:<IdentityMetadata key={editing.id} request={request} identity={editing} onSaved={value=>{setEditing(current=>current?.id===value.id?{...current,...value}:current);d.refresh()}}/>},
- {id:'general',label:'Сервисы и пароль',content:<IdentityWorkspace key={editing.id} request={request} identity={editing} nas={n.data??[]} profiles={p.data??[]} roles={r.data??[]} onSaved={()=>{setEditing(undefined);d.refresh()}}/>},
+ {id:'general',label:'Профиль и сервисы',content:<IdentityWorkspace key={editing.id} request={request} identity={editing} nas={n.data??[]} profiles={p.data??[]} roles={r.data??[]} onSaved={()=>{setEditing(undefined);d.refresh()}}/>},
  {id:'access-profile',label:'Профиль доступа',content:<IdentityAccessProfile key={editing.id+'-'+editing.account_type} request={request} id={editing.id} kind={editing.account_type} onSaved={id=>{setEditing(current=>current?{...current,access_template_id:id}:current);d.refresh()}}/>},
  {id:'reconciliation',label:'Согласование профиля',content:<IdentityReconciliation key={editing.id} request={request} id={editing.id}/>},
  {id:'policy-history',label:'История политик',content:<IdentityPolicyHistory key={editing.id} request={request} id={editing.id}/>},
@@ -72,39 +70,6 @@ export default function UnifiedUsers({request}:{request:Request}){
  {id:'audit',label:'Аудит',content:<IdentityAudit key={editing.id} request={request} id={editing.id}/>}
  ]}/>}</Modal></Space>
 }
-type Metadata=Pick<Identity,'id'|'username'|'full_name'|'department'>;
-function IdentityMetadata({request,identity,onSaved}:{request:Request;identity:Identity;onSaved:(value:Metadata)=>void}){
- const [fullName,setFullName]=useState(identity.full_name);
- const [department,setDepartment]=useState(identity.department);
- const a=useAction(()=>{});
- const changed=fullName.trim()!==identity.full_name||department.trim()!==identity.department;
- return <Space direction="vertical" className="full">
-  <Alert type="info" message="Логин и сервисные привязки не изменяются."/>
-  <label>Логин<Input value={identity.username} readOnly/></label>
-  <label>ФИО<Input value={fullName} maxLength={200} onChange={e=>setFullName(e.target.value)} disabled={a.busy}/></label>
-  <label>Подразделение<Input value={department} maxLength={200} onChange={e=>setDepartment(e.target.value)} disabled={a.busy}/></label>
-  <Button type="primary" disabled={!changed||a.busy} loading={a.busy} onClick={()=>a.run(async()=>{const result=await request<Metadata>('identities/'+identity.id+'/metadata','PUT',{full_name:fullName,department});setFullName(result.full_name);setDepartment(result.department);onSaved(result)})}>Сохранить персональные данные</Button>
- </Space>
-}
-
-type ProfileUpdate=Pick<Identity,'id'|'account_type'|'account_owner'|'account_purpose'>;
-function AccountProfile({request,identity,onSaved}:{request:Request;identity:Identity;onSaved:(value:ProfileUpdate)=>void}){
- const [kind,setKind]=useState(identity.account_type);
- const [owner,setOwner]=useState(identity.account_owner);
- const [purpose,setPurpose]=useState(identity.account_purpose);
- const a=useAction(()=>{});
- const changed=kind!==identity.account_type||owner.trim()!==identity.account_owner||purpose.trim()!==identity.account_purpose;
- return <Space direction="vertical" className="full">
- <Alert type="info" message="Тип учётной записи определяет профиль управления, а не автоматически назначенные сетевые права. Настройте услуги во вкладках пользователя."/>
- <label>Логин<Input value={identity.username} readOnly/></label>
- <label>Тип учётной записи</label><Select value={kind} onChange={v=>setKind(v==='service'?'service':'person')} options={[{value:'person',label:'Персональная'},{value:'service',label:'Сервисная'}]}/>
- <label>Ответственный<Input value={owner} maxLength={200} onChange={e=>setOwner(e.target.value)}/></label>
- <label>Назначение<Input value={purpose} maxLength={500} onChange={e=>setPurpose(e.target.value)}/></label>
- {kind==='service'&&<Alert type="warning" message="Для сервисной УЗ обязательны ответственный и назначение; Web Console запрещён."/>}
- <Button type="primary" loading={a.busy} disabled={!changed||a.busy||(kind==='service'&&(!owner.trim()||!purpose.trim()))} onClick={()=>a.run(async()=>{const value=await request<ProfileUpdate>('identities/'+identity.id+'/profile','PUT',{account_type:kind,account_owner:owner,account_purpose:purpose});onSaved(value)})}>Сохранить профиль</Button>
- </Space>
-}
-
 function IdentityWorkspace({request,identity,nas,profiles,roles,onSaved}:{request:Request;identity:Identity;nas:Nas[];profiles:Profile[];roles:{name:string}[];onSaved:()=>void}){
  const [form]=Form.useForm();const a=useAction(()=>{});
  const initial={device:!!identity.device_enabled,l2tp:!!identity.l2tp_enabled,pppoe:!!identity.pppoe_enabled,hotspot:!!identity.hotspot_enabled,dot1x:!!identity.dot1x_enabled,wpa_enterprise:!!identity.wpa_enabled,console:!!identity.console_enabled};
@@ -112,23 +77,46 @@ function IdentityWorkspace({request,identity,nas,profiles,roles,onSaved}:{reques
  const [enabled,setEnabled]=useState(initial);
  const assigned:Record<Service,boolean>={device:!!identity.device_id,l2tp:!!identity.l2tp_id,pppoe:identity.pppoe_assigned,hotspot:identity.hotspot_assigned,dot1x:identity.dot1x_assigned,wpa_enterprise:identity.wpa_assigned,console:!!identity.console_id};
  const [role,setRole]=useState(identity.console_role??'auditor');
+ const [kind,setKind]=useState(identity.account_type);
+ const [fullName,setFullName]=useState(identity.full_name);
+ const [department,setDepartment]=useState(identity.department);
+ const [owner,setOwner]=useState(identity.account_owner);
+ const [purpose,setPurpose]=useState(identity.account_purpose);
+ const groupList=useData<{id:number;name:string}[]>(request,'identities/groups');
+ const membership=useData<{group_ids:number[]}>(request,'identities/'+identity.id+'/groups');
+ const [groupIds,setGroupIds]=useState<number[]|null>(null);
+ const templateList=useData<AccessTemplate[]>(request,'identities/access-templates');
+ const [template,setTemplate]=useState(String(identity.access_template_id??'none'));
  const eligible=(service:string)=>nas.filter(x=>x.type==='mikrotik'&&x.services?.includes(service)).map(x=>({value:x.id,label:x.shortname}));
- const toggle=(key:Service,label:string)=><Checkbox checked={enabled[key]} disabled={a.busy||(key==='console'&&identity.account_type==='service')} onChange={e=>setEnabled(v=>({...v,[key]:e.target.checked}))}>{label}{assigned[key]?' — назначен':''}</Checkbox>;
+ const toggle=(key:Service,label:string)=><Checkbox checked={enabled[key]} disabled={a.busy||(key==='console'&&kind==='service')} onChange={e=>setEnabled(v=>({...v,[key]:e.target.checked}))}>{label}{assigned[key]?' — назначен':''}</Checkbox>;
  const changed=(key:Service)=>enabled[key]!==initial[key];
  return <Space direction="vertical" className="full">
  <Alert type="info" message="Все изменения сохраняются одной транзакцией. Отключение сохраняет параметры назначения; активные сетевые сессии могут продолжаться."/>
  {!identity.credentials_ready&&<Alert type="warning" message="Для включения сервисов установите единый пароль."/>}
  <Form form={form} layout="vertical" disabled={a.busy} onFinish={v=>a.run(()=>{
  const payload:Record<string,unknown>={};
+ if(fullName.trim()!==identity.full_name||department.trim()!==identity.department)payload.metadata={full_name:fullName,department};
+ if(kind!==identity.account_type||owner.trim()!==identity.account_owner||purpose.trim()!==identity.account_purpose)payload.profile={account_type:kind,account_owner:owner,account_purpose:purpose};
+ if(groupIds!==null)payload.groups={group_ids:groupIds};
+ if(template!==String(identity.access_template_id??'none'))payload.access_profile={template_id:template==='none'?null:Number(template),preview:false};
  if(v.password)payload.password={password:v.password};
  if(changed('device')||changed('l2tp'))payload.services={device:enabled.device,l2tp:enabled.l2tp,device_assignment:enabled.device&&!assigned.device?{nas_id:v.device_nas,role:v.device_role,filter_id:v.filter_id||null}:null,l2tp_assignment:enabled.l2tp&&!assigned.l2tp?{nas_id:v.vpn_nas,profile_id:v.vpn_profile,static_ip:v.static_ip||null}:null};
  if(changed('pppoe'))payload.pppoe={enabled:enabled.pppoe,assignment:enabled.pppoe&&!assigned.pppoe?{nas_id:v.pppoe_nas,rate_limit:v.pppoe_rate,pool:v.pppoe_pool,interim_seconds:v.pppoe_interim??300}:null};
  if(changed('hotspot'))payload.hotspot={enabled:enabled.hotspot,assignment:enabled.hotspot&&!assigned.hotspot?{nas_id:v.hotspot_nas,rate_limit:v.hotspot_rate,session_seconds:v.hotspot_session??3600,idle_seconds:v.hotspot_idle??300}:null};
  for(const key of ['dot1x','wpa_enterprise'] as const){const field=key==='dot1x'?'dot1x':'wpa-enterprise';if(changed(key))payload[key]={enabled:enabled[key],assignment:enabled[key]&&!assigned[key]?{nas_id:v[field+'_nas'],vlan_id:v[field+'_vlan']||null}:null};}
- if(identity.account_type==='person'&&(changed('console')||(enabled.console&&role!==identity.console_role)))payload.console={enabled:enabled.console,role};
+ if(kind==='person'&&(changed('console')||(enabled.console&&role!==identity.console_role)))payload.console={enabled:enabled.console,role};
  if(!Object.keys(payload).length)return Promise.resolve();
  return request('identities/'+identity.id+'/workspace','PUT',payload);
  },onSaved)}>
+ <label>Логин<Input value={identity.username} readOnly/></label>
+ <label>Тип учётной записи<Select value={kind} onChange={v=>{setKind(v==='service'?'service':'person');setTemplate('none')}} options={[{value:'person',label:'Персональная'},{value:'service',label:'Сервисная'}]}/></label>
+ <label>ФИО<Input value={fullName} maxLength={200} onChange={e=>setFullName(e.target.value)}/></label>
+ <label>Подразделение<Input value={department} maxLength={200} onChange={e=>setDepartment(e.target.value)}/></label>
+ {kind==='service'&&<><label>Ответственный<Input value={owner} maxLength={200} onChange={e=>setOwner(e.target.value)}/></label><label>Назначение<Input value={purpose} maxLength={500} onChange={e=>setPurpose(e.target.value)}/></label></>}
+ <Fault error={groupList.error||membership.error||templateList.error}/>
+ <label>Глобальные группы<Select mode="multiple" disabled={!membership.data||!groupList.data||a.busy} value={groupIds??membership.data?.group_ids??[]} onChange={setGroupIds} options={(groupList.data??[]).map(x=>({value:x.id,label:x.name}))}/></label>
+ <label>Профиль доступа<Select value={template} disabled={!templateList.data||a.busy} onChange={v=>setTemplate(String(v))} options={[{value:'none',label:'Без профиля'},...(templateList.data??[]).filter(t=>t.enabled&&t.account_type===kind).map(t=>({value:String(t.id),label:t.name}))]}/></label>
+ <Alert type="info" message="Назначение профиля не применяет автоматически сетевые настройки. Для этого используется согласование профиля."/>
  {toggle('device','Device AAA')}
  {enabled.device&&!assigned.device&&<><Form.Item name="device_nas" label="Device NAS" rules={[{required:true}]}><Select options={eligible('device-aaa')}/></Form.Item><Form.Item name="device_role" label="RouterOS Role" rules={[{required:true}]}><Select options={roles.map(x=>({value:x.name,label:x.name}))}/></Form.Item><Form.Item name="filter_id" label="Filter-Id"><Input/></Form.Item></>}
  {toggle('l2tp','L2TP VPN')}
@@ -137,8 +125,8 @@ function IdentityWorkspace({request,identity,nas,profiles,roles,onSaved}:{reques
  {toggle('hotspot','Hotspot')}{enabled.hotspot&&!assigned.hotspot&&<HotspotFields nas={nas}/>}
  {toggle('dot1x','802.1X')}{enabled.dot1x&&!assigned.dot1x&&<EapFields nas={nas} service="dot1x"/>}
  {toggle('wpa_enterprise','WPA Enterprise')}{enabled.wpa_enterprise&&!assigned.wpa_enterprise&&<EapFields nas={nas} service="wpa-enterprise"/>}
- {toggle('console','Web Console')}{enabled.console&&identity.account_type==='person'&&<Select value={role} onChange={v=>setRole(String(v))} options={['auditor','operator','admin'].map(x=>({value:x,label:x}))}/>}
+ {toggle('console','Web Console')}{enabled.console&&kind==='person'&&<Select value={role} onChange={v=>setRole(String(v))} options={['auditor','operator','admin'].map(x=>({value:x,label:x}))}/>}
  <Form.Item name="password" label="Новый единый пароль (необязательно)" rules={[{min:16,max:128}]}><Input.Password autoComplete="new-password"/></Form.Item>
- <Button type="primary" htmlType="submit" loading={a.busy}>Сохранить все сервисы</Button>
+ <Button type="primary" htmlType="submit" loading={a.busy} disabled={kind==='service'&&(!owner.trim()||!purpose.trim()||enabled.console)}>Сохранить профиль и сервисы</Button>
  </Form></Space>
 }
