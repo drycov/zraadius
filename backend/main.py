@@ -2704,7 +2704,7 @@ def apply_profile_reconciliation(identity_id:int,body:ReconciliationApply,princi
             if not row:
                 raise HTTPException(404,"Identity not found")
             # Prevent concurrent edits of the profile inputs during this short operation.
-            conn.execute("LOCK TABLE zradius_access_templates,zradius_identity_groups,zradius_identity_group_members,zradius_profile_overrides IN SHARE MODE")
+            conn.execute("LOCK TABLE zradius_access_templates,zradius_identity_groups,zradius_identity_group_members,zradius_profile_overrides,zradius_policies,zradius_policy_assignments IN SHARE MODE")
             plan=reconciliation_snapshot(conn,identity_id)
             if plan["revision"]!=body.revision:
                 raise HTTPException(409,"Reconciliation preview changed; recalculate")
@@ -2994,6 +2994,27 @@ def delete_reusable_policy(policy_id:int,expected_revision:int,confirm:bool=Fals
         conn.execute("DELETE FROM zradius_policies WHERE id=%s",(policy_id,))
         audit(conn,"policy.catalog.delete",str(policy_id))
         return {"status":"deleted","runtime_enforced":False}
+
+@app.get("/api/v1/identities/group-migration-inventory")
+def group_migration_inventory(principal=Depends(auth)):
+    personal_admin(principal)
+    with db() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        device=conn.execute("""SELECT g.id,g.name,count(m.user_id) AS members,
+            count(u.identity_id) AS unified_members
+            FROM zradius_device_user_groups g
+            LEFT JOIN zradius_device_user_members m ON m.group_id=g.id
+            LEFT JOIN zradius_device_users u ON u.id=m.user_id
+            GROUP BY g.id,g.name ORDER BY g.id""").fetchall()
+        vpn=conn.execute("""SELECT g.id,g.name,count(u.id) AS members,count(u.identity_id) AS unified_members
+            FROM zradius_vpn_groups g LEFT JOIN zradius_l2tp_users u ON u.group_id=g.id
+            GROUP BY g.id,g.name ORDER BY g.id""").fetchall()
+        legacy=conn.execute("""SELECT g.name,count(DISTINCT m.username) AS members,
+            count(DISTINCT i.id) AS unified_members FROM zradius_groups g
+            LEFT JOIN radusergroup m ON m.groupname=g.name
+            LEFT JOIN zradius_identities i ON i.username=m.username
+            GROUP BY g.name ORDER BY g.name""").fetchall()
+        return {"device":device,"vpn":vpn,"legacy":legacy,"preview_only":True}
 
 class PolicyProfilesUpdate(BaseModel):
     person_template_id:int|None=Field(default=None,gt=0)
